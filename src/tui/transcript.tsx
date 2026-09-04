@@ -2,8 +2,9 @@
  * Transcript — a scrollable list of transcript entries.
  *
  * Each entry is a typed TranscriptItem (text delta, tool call block,
- * tool result, policy decision, error). The component takes a flat list
- * and renders it. Tool call blocks are collapsible via a `collapsed` flag.
+ * tool result, policy decision, error, file changed). The component
+ * takes a flat list and renders it. Tool blocks use a card layout
+ * (┌─ name ─┐) and show a spinner while running.
  *
  * State management: parent owns the list, passes a fresh array on every
  * update. This component is pure presentational.
@@ -11,12 +12,27 @@
 
 import React from 'react';
 import { Text, Box } from 'ink';
+import Spinner from 'ink-spinner';
+import { DiffView, type DiffHunk } from './diff.js';
 
 export type TranscriptItem =
   | { id: string; kind: 'text'; text: string; role: 'user' | 'assistant' }
-  | { id: string; kind: 'tool'; name: string; id_call: string; args: string; result?: string; isError?: boolean; latencyMs?: number; collapsed?: boolean }
+  | {
+      id: string;
+      kind: 'tool';
+      name: string;
+      id_call: string;
+      args: string;
+      result?: string;
+      isError?: boolean;
+      latencyMs?: number;
+      /** When running, no result is attached yet. */
+      status: 'running' | 'done' | 'error';
+    }
   | { id: string; kind: 'policy'; name: string; action: 'allow' | 'ask' | 'deny'; reason?: string }
-  | { id: string; kind: 'error'; message: string };
+  | { id: string; kind: 'error'; message: string }
+  | { id: string; kind: 'file_changed'; path: string; op: 'created' | 'modified' | 'deleted' }
+  | { id: string; kind: 'diff'; hunks: DiffHunk[]; summary?: string };
 
 export function Transcript({ items }: { items: TranscriptItem[] }): React.JSX.Element {
   return (
@@ -28,6 +44,33 @@ export function Transcript({ items }: { items: TranscriptItem[] }): React.JSX.El
       ))}
     </Box>
   );
+}
+
+/** Build a one-line summary of a tool call from its args JSON. */
+function summarizeTool(name: string, args: string): string {
+  if (!args || args === '{}') return '';
+  let parsed: Record<string, unknown> | null = null;
+  try { parsed = JSON.parse(args) as Record<string, unknown>; } catch { return args.slice(0, 80); }
+  switch (name) {
+    case 'read_file':
+    case 'write_file':
+    case 'edit_file':
+      return typeof parsed.path === 'string' ? parsed.path : '';
+    case 'shell_exec':
+      return typeof parsed.command === 'string' ? parsed.command : '';
+    case 'search_files':
+    case 'grep': {
+      const q = parsed.query ?? parsed.pattern;
+      return typeof q === 'string' ? `"${q}"` : '';
+    }
+    case 'list_directory':
+      return typeof parsed.path === 'string' ? parsed.path : '';
+    case 'git_status':
+    case 'git_diff':
+      return '';
+    default:
+      return '';
+  }
 }
 
 function TranscriptRow({ item }: { item: TranscriptItem }): React.JSX.Element | null {
@@ -43,27 +86,7 @@ function TranscriptRow({ item }: { item: TranscriptItem }): React.JSX.Element | 
     );
   }
   if (item.kind === 'tool') {
-    const headerColor = item.isError ? 'red' : 'yellow';
-    return (
-      <Box flexDirection="column" marginY={0} paddingLeft={2}>
-        <Text>
-          <Text color={headerColor as 'red' | 'yellow'}>[tool] {item.name}</Text>
-          {item.latencyMs !== undefined ? (
-            <Text color="gray">  ({item.latencyMs}ms)</Text>
-          ) : null}
-        </Text>
-        {item.collapsed ? (
-          <Text color="gray" dimColor>  (collapsed — {item.args.length} chars of args, {item.result?.length ?? 0} chars of result)</Text>
-        ) : (
-          <>
-            <Text color="gray">  args: {truncate(item.args, 200)}</Text>
-            {item.result !== undefined ? (
-              <Text color={item.isError ? 'red' : 'gray'}>  -&gt; {truncate(item.result, 400)}</Text>
-            ) : null}
-          </>
-        )}
-      </Box>
-    );
+    return <ToolCard item={item} />;
   }
   if (item.kind === 'policy') {
     const color = item.action === 'allow' ? 'green' : item.action === 'deny' ? 'red' : 'yellow';
@@ -76,6 +99,17 @@ function TranscriptRow({ item }: { item: TranscriptItem }): React.JSX.Element | 
       </Box>
     );
   }
+  if (item.kind === 'file_changed') {
+    const color = item.op === 'deleted' ? 'red' : item.op === 'created' ? 'green' : 'yellow';
+    const glyph = item.op === 'created' ? '+' : item.op === 'deleted' ? '-' : '~';
+    return (
+      <Box paddingLeft={2}>
+        <Text color={color as 'green' | 'red' | 'yellow'}>
+          [{glyph} {item.op}] {item.path}
+        </Text>
+      </Box>
+    );
+  }
   if (item.kind === 'error') {
     return (
       <Box paddingLeft={2}>
@@ -83,7 +117,53 @@ function TranscriptRow({ item }: { item: TranscriptItem }): React.JSX.Element | 
       </Box>
     );
   }
+  if (item.kind === 'diff') {
+    return <DiffView hunks={item.hunks} summary={item.summary} />;
+  }
   return null;
+}
+
+function ToolCard({ item }: { item: Extract<TranscriptItem, { kind: 'tool' }> }): React.JSX.Element {
+  const summary = summarizeTool(item.name, item.args);
+  const borderColor =
+    item.status === 'error' ? 'red' : item.status === 'running' ? 'cyan' : 'gray';
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={borderColor as 'red' | 'cyan' | 'gray'}
+      marginY={1}
+      paddingX={1}
+    >
+      <Box>
+        <Text color="gray">┌─ </Text>
+        <Text bold>{item.name}</Text>
+        {item.status === 'running' ? (
+          <Text color="cyan">  <Spinner type="dots" /> running</Text>
+        ) : item.status === 'error' ? (
+          <Text color="red">  ✗ error</Text>
+        ) : (
+          <Text color="green">  ✓ {item.latencyMs ?? 0}ms</Text>
+        )}
+        <Text color="gray"> ─────────────────────────────────────</Text>
+      </Box>
+      {summary ? (
+        <Box paddingLeft={2}>
+          <Text>{truncate(summary, 200)}</Text>
+        </Box>
+      ) : null}
+      {item.status !== 'running' && item.result ? (
+        <Box paddingLeft={2} flexDirection="column">
+          <Text color={item.isError ? 'red' : 'gray'}>
+            {item.isError ? '✗ ' : '→ '}{truncate(item.result, 400)}
+          </Text>
+        </Box>
+      ) : null}
+      <Box>
+        <Text color="gray">└──────────────────────────────────────────</Text>
+      </Box>
+    </Box>
+  );
 }
 
 function truncate(s: string, max: number): string {

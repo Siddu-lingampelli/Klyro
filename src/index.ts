@@ -13,12 +13,29 @@
  */
 
 import { Command } from 'commander';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { chat } from './chat.js';
 import { repl } from './repl.js';
 import { runOnce } from './cli/run.js';
 import { runEval } from './cli/eval.js';
 
-const VERSION = '0.1.0';
+// Read version from package.json so `klyro --version` always matches the
+// published version. Walks up from this file (src/index.ts) to find the
+// nearest package.json.
+function readVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkgPath = resolve(here, '..', 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: string };
+    return pkg.version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+const VERSION = readVersion();
 
 function parsePositiveInt(name: string, v: string): number {
   const n = Number(v);

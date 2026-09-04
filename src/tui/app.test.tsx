@@ -9,7 +9,7 @@ import type { SlashCommand } from '../cli/slash/parser.js';
 describe('App', () => {
   it('shows the empty-state hint and the status line', () => {
     const { lastFrame } = render(
-      <App initialModel="mock" maxSteps={10} onPrompt={async () => {}} onSlash={async () => {}} />,
+      <App initialModel="mock" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
     );
     const out = lastFrame();
     expect(out).toContain('mock');
@@ -24,6 +24,7 @@ describe('App', () => {
       <App
         initialModel="m"
         maxSteps={10}
+        cwd="/test"
         onPrompt={async () => {}}
         onSlash={async () => {}}
         initialTranscript={items}
@@ -38,6 +39,7 @@ describe('App', () => {
       <App
         initialModel="m"
         maxSteps={10}
+        cwd="/test"
         onPrompt={async () => {}}
         onSlash={async () => {}}
         initialStatus={overrides}
@@ -53,7 +55,7 @@ describe('App', () => {
   it('installs and tears down the global bridge hooks', () => {
     const g = globalThis as unknown as { __klyroAppAppend?: unknown; __klyroAppStatus?: unknown };
     const { unmount } = render(
-      <App initialModel="m" maxSteps={10} onPrompt={async () => {}} onSlash={async () => {}} />,
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
     );
     expect(g.__klyroAppAppend).toBeTypeOf('function');
     expect(g.__klyroAppStatus).toBeTypeOf('function');
@@ -65,7 +67,7 @@ describe('App', () => {
   it('submits a non-slash prompt via onPrompt', async () => {
     const onPrompt = vi.fn(async () => {});
     const { stdin } = render(
-      <App initialModel="m" maxSteps={10} onPrompt={onPrompt} onSlash={async () => {}} />,
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={onPrompt} onSlash={async () => {}} />,
     );
     stdin.write('hello world');
     await new Promise((r) => setTimeout(r, 20));
@@ -77,7 +79,7 @@ describe('App', () => {
   it('routes a slash command to onSlash', async () => {
     const onSlash = vi.fn<(cmd: SlashCommand) => Promise<void>>(async () => {});
     const { stdin } = render(
-      <App initialModel="m" maxSteps={10} onPrompt={async () => {}} onSlash={onSlash} />,
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={onSlash} />,
     );
     stdin.write('/help');
     await new Promise((r) => setTimeout(r, 20));
@@ -94,6 +96,7 @@ describe('App', () => {
       <App
         initialModel="m"
         maxSteps={10}
+        cwd="/test"
         onPrompt={onPrompt}
         onSlash={async () => {}}
         initialStatus={{ status: 'running' }}
@@ -109,7 +112,7 @@ describe('App', () => {
   it('routes /quit to onSlash as a quit command', async () => {
     const onSlash = vi.fn<(cmd: SlashCommand) => Promise<void>>(async () => {});
     const { stdin } = render(
-      <App initialModel="m" maxSteps={10} onPrompt={async () => {}} onSlash={onSlash} />,
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={onSlash} />,
     );
     stdin.write('/quit');
     await new Promise((r) => setTimeout(r, 20));

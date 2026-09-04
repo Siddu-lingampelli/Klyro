@@ -15,6 +15,8 @@ import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, DEFAULT_POLICY_CONFIG, PolicyEngine } from '../policy/engine.js';
 import { buildLevel6Context } from '../context/level6.js';
 import { DenyAllApprovalPrompt, StdinApprovalPrompt } from '../policy/approval.js';
+import { TuiApprovalBridge } from '../tui/approval.js';
+import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
 
 function readEnv(name: string, fallback?: string): string | undefined {
@@ -42,7 +44,6 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   const registry = builtinRegistry();
   const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
   const adapter = httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: 60_000 });
-  const approval = opts.nonInteractive ? new DenyAllApprovalPrompt() : new StdinApprovalPrompt();
   const ctxBlock = await buildLevel6Context({ cwd });
   const ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
   const systemPromptFn = (_ctx: { cwd: string; telemetry?: string }): string => {
@@ -54,6 +55,14 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   const ac = new AbortController();
   process.on('SIGINT', () => ac.abort());
 
+  // When the TUI is mounted, use the inline Ink prompt. Otherwise
+  // fall back to stdin readline. The bridge is shared between the
+  // App and the runtime so the modal can resolve the runtime's ask().
+  const tuiBridge = new TuiApprovalBridge();
+  const approval = opts.nonInteractive
+    ? new DenyAllApprovalPrompt()
+    : (process.stdin.isTTY ? tuiBridge : new StdinApprovalPrompt());
+
   let inflight: Promise<unknown> | null = null;
   let transcriptRef: import('../tui/transcript.js').TranscriptItem[] = [];
   let lastStatus: import('../tui/status.js').StatusSnapshot | null = null;
@@ -62,7 +71,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     React.createElement(App, {
       initialModel: model,
       maxSteps: opts.maxSteps ?? 30,
+      cwd,
       initialStatus: { status: 'idle' },
+      approvalBridge: tuiBridge,
       onPrompt: async (text: string) => {
         inflight = runWithBridge(text);
         await inflight;
@@ -80,6 +91,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   const appG = globalThis as unknown as {
     __klyroAppAppend?: (i: import('../tui/transcript.js').TranscriptItem) => void;
     __klyroAppStatus?: (s: Partial<import('../tui/status.js').StatusSnapshot>) => void;
+    __klyroAppPlan?: (p: import('../agent/runtime.js').PlanStep[]) => void;
   };
 
   async function runWithBridge(text: string): Promise<void> {
@@ -116,7 +128,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 name: ev.name,
                 id_call: ev.id,
                 args: JSON.stringify(ev.input, null, 2),
-                collapsed: true,
+                status: 'running',
               });
               activeCallId = null;
               activeCallName = null;
@@ -139,10 +151,25 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 result: typeof ev.output === 'string' ? ev.output : JSON.stringify(ev.output, null, 2),
                 isError: ev.isError,
                 latencyMs: ev.latencyMs,
-                collapsed: true,
+                status: ev.isError ? 'error' : 'done',
               });
             } else if (ev.kind === 'usage') {
               appG.__klyroAppStatus?.({ usageInput: ev.input, usageOutput: ev.output });
+            } else if (ev.kind === 'plan_update') {
+              appG.__klyroAppPlan?.(ev.plan);
+            } else if (ev.kind === 'file_changed') {
+              appG.__klyroAppAppend?.({
+                id: `fc-${ev.path}-${Date.now()}`,
+                kind: 'file_changed',
+                path: ev.path,
+                op: ev.op,
+              });
+            } else if (ev.kind === 'verification_failed') {
+              appG.__klyroAppAppend?.({
+                id: `vf-${ev.step}-${Date.now()}`,
+                kind: 'error',
+                message: `verification failed at ${ev.step}: ${ev.reason}`,
+              });
             } else if (ev.kind === 'aborted') {
               appG.__klyroAppStatus?.({ status: 'aborted' });
             }
@@ -186,8 +213,27 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         }
         return;
       }
+      case 'diff': {
+        const r = await registry.execute('git_diff', {}, { cwd, env: process.env, nonInteractive: true });
+        if (!r.ok) {
+          appG.__klyroAppAppend?.({
+            id: `diff-err-${Date.now()}`,
+            kind: 'error',
+            message: `git_diff failed: ${r.error.message ?? r.error.code}`,
+          });
+          return;
+        }
+        const out = r.value as { diff: string; stat: string; patchedFiles: string[] };
+        const hunks = parseUnifiedDiff(out.diff);
+        appG.__klyroAppAppend?.({
+          id: `diff-${Date.now()}`,
+          kind: 'diff',
+          hunks,
+          summary: `${out.patchedFiles.length} file(s) changed${out.stat ? ' — ' + out.stat.split('\n').pop() : ''}`,
+        });
+        return;
+      }
       case 'compact':
-      case 'diff':
       case 'model':
         appG.__klyroAppAppend?.({
           id: `stub-${Date.now()}`,

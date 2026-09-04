@@ -6,6 +6,7 @@
  *   /compact           — ask the agent to compact its own context
  *   /model <id>        — switch the active model mid-session
  *   /diff              — show working-tree diff (git diff)
+ *   /plan              — toggle the plan view (if a plan is loaded)
  *   /status            — show session status (model, steps, usage)
  *   /quit              — exit the REPL
  *   /help              — list available commands
@@ -19,13 +20,14 @@ export type SlashCommand =
   | { kind: 'compact' }
   | { kind: 'model'; model: string }
   | { kind: 'diff' }
+  | { kind: 'plan' }
   | { kind: 'status' }
   | { kind: 'quit' }
   | { kind: 'help' }
   | { kind: 'prompt'; text: string }
   | { kind: 'unknown'; raw: string };
 
-const KNOWN = ['clear', 'compact', 'model', 'diff', 'status', 'quit', 'help'] as const;
+const KNOWN = ['clear', 'compact', 'model', 'diff', 'plan', 'status', 'quit', 'help'] as const;
 
 export function parse(input: string): SlashCommand {
   const trimmed = input.trim();
@@ -39,6 +41,7 @@ export function parse(input: string): SlashCommand {
     case 'clear':   return { kind: 'clear' };
     case 'compact': return { kind: 'compact' };
     case 'diff':    return { kind: 'diff' };
+    case 'plan':    return { kind: 'plan' };
     case 'status':  return { kind: 'status' };
     case 'quit':
     case 'exit':
@@ -50,8 +53,7 @@ export function parse(input: string): SlashCommand {
       if (!rest) return { kind: 'unknown', raw: trimmed };
       return { kind: 'model', model: rest };
     }
-    default:
-      return { kind: 'unknown', raw: trimmed };
+    default:        return { kind: 'unknown', raw: trimmed };
   }
 }
 

@@ -66,6 +66,15 @@ export interface RunOptions {
   onEvent?: (ev: RuntimeEvent) => void;
 }
 
+/** A single plan step emitted by the agent. */
+export interface PlanStep {
+  id: string;
+  title: string;
+  status: 'pending' | 'in_progress' | 'done' | 'failed' | 'skipped';
+  /** Optional files the step will touch (for L6 diff). */
+  files?: string[];
+}
+
 /** High-level event stream the runtime emits. Safe for UI consumption. */
 export type RuntimeEvent =
   | { kind: 'step_start'; step: number }
@@ -78,7 +87,10 @@ export type RuntimeEvent =
   | { kind: 'tool_result'; id: string; name: string; output: unknown; isError: boolean; latencyMs: number }
   | { kind: 'usage'; input: number; output: number }
   | { kind: 'final_text'; text: string }
-  | { kind: 'aborted' };
+  | { kind: 'aborted' }
+  | { kind: 'plan_update'; plan: PlanStep[] }
+  | { kind: 'file_changed'; path: string; op: 'created' | 'modified' | 'deleted' }
+  | { kind: 'verification_failed'; step: string; reason: string };
 
 export interface RunResult {
   status: 'complete' | 'max_steps' | 'aborted' | 'no_final';
@@ -269,6 +281,10 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         telemetry.recordError(`${code}: ${call.name}`);
       }
       emit?.({ kind: 'tool_result', id: call.id, name: call.name, output, isError: !obs.ok, latencyMs });
+      if (obs.ok) {
+        const fileChanged = inferFileChanged(call.name, call.input, obs.value);
+        if (fileChanged) emit?.({ kind: 'file_changed', path: fileChanged.path, op: fileChanged.op });
+      }
     }
     emit?.({ kind: 'step_end', step: steps });
   }
@@ -285,6 +301,32 @@ function redactOutput(v: unknown): unknown {
   if (typeof v === 'string') return redact(v);
   if (v && typeof v === 'object') return v; // structured outputs are not redacted wholesale
   return v;
+}
+
+/**
+ * Best-effort inference of "this tool call changed a file" for the
+ * file_changed event. Returns null when we don't have a clear answer.
+ *
+ * Today: write_file, edit_file, write_file (truncate via empty content).
+ * Tomorrow: shell_exec that ran `rm` or `git mv` would need to grep
+ * the output, but that's out of scope.
+ */
+function inferFileChanged(
+  toolName: string,
+  input: Record<string, unknown>,
+  output: unknown,
+): { path: string; op: 'created' | 'modified' | 'deleted' } | null {
+  const inPath = typeof input.path === 'string' ? input.path : null;
+  if (!inPath) return null;
+  if (toolName === 'write_file' || toolName === 'edit_file') {
+    // Distinguish create vs modify by the output shape: write_file returns
+    // { path, bytesWritten }; edit_file returns { path, replacements, diff }.
+    // Both are "modified" semantically; we don't have the pre-state easily
+    // from inside the runtime. A more precise implementation would stat the
+    // file before/after the call. For now: treat both as 'modified'.
+    return { path: inPath, op: 'modified' };
+  }
+  return null;
 }
 
 export function defaultSystemPrompt(ctx: { cwd: string; telemetry?: string }): string {
