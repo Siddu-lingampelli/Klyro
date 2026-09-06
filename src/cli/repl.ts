@@ -22,6 +22,7 @@ import { TuiApprovalBridge } from '../tui/approval.js';
 import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
 import { resolveProvider, providerHelp, lastProviderError } from '../providers.js';
+import { readVersion } from '../version.js';
 import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE, createReadWrapper } from '../tui/mouse.js';
 import { inferProviderFromBaseURL } from '../agent/registry.js';
 import { getDefaultSessionStore } from '../persistence/session.js';
@@ -466,6 +467,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       initialModel: model,
       maxSteps: currentMaxSteps,
       cwd,
+      version: readVersion(),
       initialStatus: { status: 'idle' },
       approvalBridge: tuiBridge,
       isFullscreen: isAltScreen,
@@ -760,16 +762,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'version': {
-        const { readFileSync } = await import('node:fs');
-        const { resolve, dirname } = await import('node:path');
-        const { fileURLToPath } = await import('node:url');
-        try {
-          const here = dirname(fileURLToPath(import.meta.url));
-          const pkg = JSON.parse(readFileSync(resolve(here, '../../package.json'), 'utf-8')) as { version?: string };
-          queuedAppend({ id: `ver-${Date.now()}`, kind: 'text', text: `klyro ${pkg.version ?? '0.0.0'}`, role: 'assistant' });
-        } catch {
-          queuedAppend({ id: `ver-${Date.now()}`, kind: 'text', text: 'klyro (version unknown)', role: 'assistant' });
-        }
+        queuedAppend({ id: `ver-${Date.now()}`, kind: 'text', text: `klyro ${readVersion()}`, role: 'assistant' });
         return;
       }
       case 'cost': {

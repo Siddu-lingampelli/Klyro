@@ -880,6 +880,21 @@ describe('App', () => {
     expect(top).toMatch(/MSG-00-tag/);
   });
 
+  it('header shows the passed version, defaulting to package.json (never stale)', async () => {
+    const { readVersion } = await import('../version.js');
+    const { lastFrame: f1 } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} version="9.9.9-test" />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(f1() ?? '').toContain('9.9.9-test');
+    const { lastFrame: f2 } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(f2() ?? '').toContain(readVersion());
+    expect(f2() ?? '').not.toContain('0.1.27');
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App

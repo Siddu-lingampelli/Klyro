@@ -23,6 +23,7 @@ import {
 } from './scroll-model.js';
 import { buildIndex, itemAtRow, MeasureCache, type BlockDesc } from './measure.js';
 import { renderMarkdownLines } from './markdown.js';
+import { readVersion } from '../version.js';
 import {
   getTranscriptCommand,
   type TranscriptCommand,
@@ -617,7 +618,8 @@ export function App(props: AppProps): React.JSX.Element {
     if (!key.ctrl && !key.meta) { setInput((v) => v + inputStr); setHistIdx(null); }
   });
 
-  const ver = props.version ?? '0.1.27';
+  // Single source of truth: package.json via version.ts — never hardcoded.
+  const ver = props.version ?? readVersion();
   const rule = g('rule').repeat(Math.max(10, width - 2));
   // Single cost/context source: model-aware registry rates + window.
   const cost = estimateCost(status.model, status.usageInput, status.usageOutput);
