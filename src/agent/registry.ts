@@ -21,6 +21,7 @@ import * as fsSync from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { ProviderAdapter } from './provider-adapter.js';
+import { assertSafeBaseURL } from '../chat.js';
 import { httpChatAdapter } from './provider-adapter.js';
 import { anthropicAdapter } from './anthropic-adapter.js';
 import { retryingAdapter, type RetryOptions } from './retry.js';
@@ -86,7 +87,13 @@ function normalizeProviderName(name: string | undefined): ProviderName | undefin
  * Reads the files directly (no module imports) to avoid any import cycle
  * between agent/ and cli/ layers.
  */
-function persistedProviderSettings(): { baseURL?: string; apiKey?: string; provider?: string; model?: string } {
+function persistedProviderSettings(): {
+  baseURL?: string;
+  apiKey?: string;
+  provider?: string;
+  model?: string;
+  allowInsecure?: boolean;
+} {
   try {
     const home = process.env.KLYRO_CONFIG_DIR ?? (os.homedir() || process.cwd());
     const cfgPaths = process.env.KLYRO_CONFIG
@@ -114,12 +121,13 @@ function persistedProviderSettings(): { baseURL?: string; apiKey?: string; provi
     const baseURL = (cfg.baseUrl ?? cfg.baseURL) as string | undefined;
     const provider = cfg.provider as string | undefined;
     const model = (cfg.model ?? cfg['model.default']) as string | undefined;
+    const allowInsecure = cfg.allowInsecure === true;
     const apiKey =
       (cfg.apiKey ?? cfg.api_key) as string | undefined ??
       (provider ? keyOf(provider) : undefined) ??
       keyOf('openai') ??
       keyOf('anthropic');
-    return { baseURL, apiKey, provider, model };
+    return { baseURL, apiKey, provider, model, allowInsecure };
   } catch {
     return {};
   }
@@ -130,6 +138,14 @@ export function buildProvider(opts: BuildProviderOptions = {}): ProviderAdapter 
   const baseURL = opts.baseURL ?? process.env.KLYRO_BASE_URL ?? saved.baseURL;
   const apiKey = opts.apiKey ?? process.env.KLYRO_API_KEY ?? saved.apiKey;
   const timeoutMs = opts.timeoutMs ?? 60_000;
+  // Same bearer-token guard as the TUI path: refuse plaintext HTTP to remote
+  // hosts unless explicitly opted in (persisted allowInsecure or env).
+  // (chat.ts has no imports — this static import cannot cycle.)
+  if (baseURL) {
+    assertSafeBaseURL(baseURL, {
+      allowInsecure: saved.allowInsecure === true || process.env.KLYRO_ALLOW_INSECURE === '1',
+    });
+  }
 
   // Resolve provider (with aliases like 9router -> openrouter -> openai)
   let provider: ProviderName;

@@ -7,7 +7,7 @@ import { Box, Text, useInput, useStdout } from 'ink';
 import { execFileSync } from 'node:child_process';
 import type { StatusSnapshot } from './status.js';
 import type { TranscriptItem, ToolResultPatch } from './transcript.js';
-import { TuiApprovalBridge } from './approval.js';
+import { TuiApprovalBridge, ApprovalModal } from './approval.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash, suggestCommands } from '../cli/slash/parser.js';
 import { tokens, g } from './tokens.js';
@@ -27,6 +27,7 @@ import {
   type TranscriptCommand,
   type TranscriptScrollHandle,
 } from './transcript-commands.js';
+import { estimateCost, getModelInfo } from '../providers/model-info.js';
 
 export interface AppProps {
   initialModel: string;
@@ -584,9 +585,11 @@ export function App(props: AppProps): React.JSX.Element {
 
   const ver = props.version ?? '0.1.27';
   const rule = g('rule').repeat(Math.max(10, width - 2));
-  const cost = (status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015);
+  // Single cost/context source: model-aware registry rates + window.
+  const cost = estimateCost(status.model, status.usageInput, status.usageOutput);
   const totalTokens = status.usageInput + status.usageOutput;
-  const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
+  const ctxWindow = getModelInfo(status.model).contextWindow;
+  const ctxPct = totalTokens > 0 ? Math.round((totalTokens / ctxWindow) * 100) : 0;
   // Narrow terminals: compact hints so the status bar never wraps mid-word.
   const baseHints = width < 90
     ? status.status === 'running' ? 'ctrl+c stop · enter queue' : 'enter send · / commands'
@@ -716,6 +719,7 @@ export function App(props: AppProps): React.JSX.Element {
           <Text color={tokens.colors.dim as string}>  tab to complete</Text>
         </Box>
       ) : null}
+      <ApprovalModal bridge={bridge} />
       <Box flexDirection="column">
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
         <Box>

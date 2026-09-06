@@ -4,6 +4,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
+import { findBlockedReason } from './shell-exec.js';
 
 interface Job {
   id: string;
@@ -33,9 +34,32 @@ function pruneJobs(): void {
 export function startBackground(command: string, cwd: string): string {
   pruneJobs();
   if (jobs.size >= MAX_JOBS) throw new Error(`Too many background jobs (max ${MAX_JOBS}) — kill one with /jobs`);
+  // Same destructive-pattern gate as shell_exec (spawn is shell:true here too).
+  const blocked = findBlockedReason(command);
+  if (blocked) throw new Error(`Command blocked: ${blocked}`);
   const id = `job-${++counter}-${Date.now().toString(36)}`;
   const proc = spawn(command, { cwd, shell: true, windowsHide: true });
   const job: Job = { id, command, cwd, proc, output: '', start: Date.now() };
+  jobs.set(id, job);
+  proc.stdout?.on('data', (b: Buffer) => { job.output += b.toString(); if (job.output.length > 1_000_000) job.output = job.output.slice(-1_000_000); });
+  proc.stderr?.on('data', (b: Buffer) => { job.output += b.toString(); if (job.output.length > 1_000_000) job.output = job.output.slice(-1_000_000); });
+  proc.on('close', () => {
+    setTimeout(() => { if (jobs.get(id)?.proc.exitCode !== null) jobs.delete(id); }, JOB_TTL_MS);
+  });
+  return id;
+}
+
+/**
+ * argv variant (shell:false) — no shell interpolation possible. Used for
+ * constructed commands (e.g. opening an editor on a user-supplied path).
+ */
+export function startBackgroundArgv(argv: string[], cwd: string): string {
+  pruneJobs();
+  if (jobs.size >= MAX_JOBS) throw new Error(`Too many background jobs (max ${MAX_JOBS}) — kill one with /jobs`);
+  if (argv.length === 0) throw new Error('startBackgroundArgv requires argv');
+  const id = `job-${++counter}-${Date.now().toString(36)}`;
+  const proc = spawn(argv[0]!, argv.slice(1), { cwd, shell: false, windowsHide: true });
+  const job: Job = { id, command: argv.join(' '), cwd, proc, output: '', start: Date.now() };
   jobs.set(id, job);
   proc.stdout?.on('data', (b: Buffer) => { job.output += b.toString(); if (job.output.length > 1_000_000) job.output = job.output.slice(-1_000_000); });
   proc.stderr?.on('data', (b: Buffer) => { job.output += b.toString(); if (job.output.length > 1_000_000) job.output = job.output.slice(-1_000_000); });

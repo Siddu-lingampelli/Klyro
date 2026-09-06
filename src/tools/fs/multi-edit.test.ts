@@ -24,4 +24,16 @@ describe('multi_edit', () => {
     expect(r.ok).toBe(false);
     expect(await fs.readFile(p, 'utf-8')).toBe('hello');
   });
+
+  it('refuses unread large files (POLICY_DENIED)', async () => {
+    const p = path.join(tmp, 'big.txt');
+    await fs.writeFile(p, 'x'.repeat(500), 'utf-8');
+    const r = await multiEditTool.execute(
+      { path: 'big.txt', edits: [{ find: 'x', replace: 'y', replaceAll: true }] },
+      { cwd: tmp, env: {} },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe('POLICY_DENIED');
+    expect(await fs.readFile(p, 'utf-8')).toBe('x'.repeat(500));
+  });
 });

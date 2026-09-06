@@ -111,10 +111,17 @@ export function compressTranscript(
   }
 
   // Phase 3: hard cap — drop oldest messages until we fit, but always
-  // preserve the first message (the user's task).
+  // preserve the first message (the user's task). Drops keep tool_use /
+  // tool_result PAIRS intact: removing an assistant turn also removes the
+  // tool messages that answer it, and an orphaned tool message (its turn
+  // already gone) is dropped on its own. Split pairs make providers 400.
   while (totalTokens(system, result) > budget.total && result.length > 2) {
     result.splice(1, 1);
     dropped++;
+    while (result[1] && (result[1] as Message).role === 'tool') {
+      result.splice(1, 1);
+      dropped++;
+    }
   }
 
   return { system, messages: result, dropped };

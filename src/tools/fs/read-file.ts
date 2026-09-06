@@ -105,7 +105,7 @@ export const readFileTool = defineTool<z.infer<typeof InputSchema>, ReadFileOutp
         if (truncatedTokens) {
           (result as unknown as Record<string, unknown>).hint = 'Truncated to 8k tokens — use startLine/endLine to get more';
         }
-        markRead(input.path);
+        markRead(input.path, ctx.cwd);
         // 8.2 lifecycle: store large results, duplicate detection <50 tokens
         const asStr = outLines.join('\n');
         if (asStr.length > 2000) storeResult(asStr);

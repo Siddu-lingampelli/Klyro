@@ -21,4 +21,22 @@ describe('klyro-md', () => {
     const md = await loadKlyroMd(tmp);
     expect(md).toContain('imported');
   });
+
+  it('refuses @import escapes outside cwd', async () => {
+    const outside = path.join(os.tmpdir(), `klyro-escape-${Date.now()}.md`);
+    await fs.writeFile(outside, 'SECRET-ESCAPED', 'utf-8');
+    try {
+      await fs.writeFile(path.join(tmp, 'KLYRO.md'), `@import ../${path.basename(outside)}`, 'utf-8');
+      const md = await loadKlyroMd(tmp);
+      expect(md).not.toContain('SECRET-ESCAPED');
+    } finally {
+      await fs.unlink(outside).catch(() => undefined);
+    }
+  });
+
+  it('caps total output size', async () => {
+    await fs.writeFile(path.join(tmp, 'KLYRO.md'), 'x'.repeat(20000), 'utf-8');
+    const md = await loadKlyroMd(tmp);
+    expect(md.length).toBeLessThanOrEqual(9000);
+  });
 });

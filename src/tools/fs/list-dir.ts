@@ -17,6 +17,7 @@ const InputSchema = z.object({
   path: z.string().min(1).default('.').describe('Directory path relative to cwd. Defaults to cwd.'),
   maxDepth: z.number().int().min(1).max(5).optional().describe('How deep to recurse (default: 1 = top level only).'),
   skip: z.array(z.string()).optional().describe('Directory names to skip (default: node_modules, .git, etc.)'),
+  showHidden: z.boolean().optional().describe('Include dotfiles (default false — dotfiles are hidden).'),
 });
 
 export interface ListEntry {
@@ -32,7 +33,7 @@ export interface ListDirOutput {
 
 export const listDirTool = defineTool({
   name: 'list_directory',
-  description: 'List entries inside a directory. Skips node_modules, .git, and common build dirs by default.',
+  description: 'List entries inside a directory. Skips node_modules, .git, and common build dirs by default. Dotfiles hidden unless showHidden=true.',
   inputSchema: InputSchema,
   execute: async (input, ctx) => {
     return safe(async () => {
@@ -46,8 +47,9 @@ export const listDirTool = defineTool({
       }
       const skip = new Set([...DEFAULT_SKIP, ...(input.skip ?? [])]);
       const maxDepth = input.maxDepth ?? 1;
+      const showHidden = input.showHidden === true;
       const entries: ListEntry[] = [];
-      await walk(resolved, resolved, 0, maxDepth, skip, entries);
+      await walk(resolved, resolved, 0, maxDepth, skip, showHidden, entries);
       return { path: input.path, entries } satisfies ListDirOutput;
     });
   },
@@ -59,12 +61,13 @@ async function walk(
   depth: number,
   maxDepth: number,
   skip: Set<string>,
+  showHidden: boolean,
   out: ListEntry[],
 ): Promise<void> {
   const names = await fs.readdir(dir).catch(() => [] as string[]);
   for (const name of names) {
     if (skip.has(name)) continue;
-    if (name.startsWith('.') && name !== '.' && name !== '..') continue;
+    if (!showHidden && name.startsWith('.') && name !== '.' && name !== '..') continue;
     const full = path.join(dir, name);
     let entry: ListEntry;
     try {
@@ -83,7 +86,7 @@ async function walk(
     }
     out.push(entry);
     if (entry.type === 'directory' && depth + 1 < maxDepth) {
-      await walk(root, full, depth + 1, maxDepth, skip, out);
+      await walk(root, full, depth + 1, maxDepth, skip, showHidden, out);
     }
   }
 }

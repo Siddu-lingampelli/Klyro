@@ -34,7 +34,10 @@ function appendCapped(current: string, chunk: string): string {
 }
 
 // SEC-004: denylist for dangerous patterns in verify commands.
-// Reuses the same patterns as shell-exec.ts DANGEROUS_PATTERNS.
+// Destructive-only: the verify command comes from CLI flags, project config,
+// or auto-detected package scripts (never model-controlled), so shell
+// metacharacters ($(), backticks, pipes) that are legitimate in test scripts
+// are allowed here — unlike shell_exec's model-facing denylist.
 const DANGEROUS_VERIFY_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /rm\s+-rf?\s+\//, reason: 'recursive delete at filesystem root' },
   { pattern: /rm\s+-rf?\s+\/\/+/, reason: 'recursive delete at filesystem root (//)' },
@@ -55,9 +58,6 @@ const DANGEROUS_VERIFY_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /curl.*\|\s*(sh|bash|zsh|python|python3|perl|ruby|php)/i, reason: 'curl|sh to unknown host' },
   { pattern: /wget.*\|\s*(sh|bash|python|perl|ruby)/i, reason: 'wget|sh pipe' },
   { pattern: /rm\s+-rf\s+--no-preserve-root\s+\//, reason: 'recursive delete --no-preserve-root' },
-  { pattern: /\$\(/, reason: 'command substitution $()' },
-  { pattern: /`[^`]*`/, reason: 'command substitution via backticks' },
-  { pattern: /\|\s*bash\b|\|\s*sh\b/, reason: 'pipe to shell' },
   { pattern: /;\s*rm\s+-rf/, reason: 'chained rm -rf' },
   { pattern: /&&\s*rm\s+-rf/, reason: 'chained rm -rf' },
   { pattern: /\|\|\s*rm\s+-rf/, reason: 'chained rm -rf' },

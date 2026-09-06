@@ -437,11 +437,16 @@ async function main(): Promise<void> {
     .description('Show session transcript and observations')
     .option('--json', 'Output JSON')
     .action(async (id: string, opts: { json?: boolean }) => {
-      const { getDefaultSessionStore, resolveSessionId } = await import('./persistence/session.js');
+      const { getDefaultSessionStore, resolveSessionId, matchSessionIds } = await import('./persistence/session.js');
       const store = getDefaultSessionStore();
       const full = await resolveSessionId(store, id);
       if (!full) {
-        process.stderr.write(`session not found: ${id}\n`);
+        const matches = await matchSessionIds(store, id);
+        if (matches.length > 1) {
+          process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`);
+        } else {
+          process.stderr.write(`session not found: ${id}\n`);
+        }
         process.exit(2);
       }
       const rec = await store.get(full);
@@ -465,11 +470,16 @@ async function main(): Promise<void> {
     .option('--verify-command <cmd>', 'Override verification command')
     .option('--verify', 'Enable verification (default: enabled)')
     .action(async (id: string, opts: { model?: string; maxSteps?: number; verifyCommand?: string; verify?: boolean }) => {
-      const { getDefaultSessionStore, resolveSessionId } = await import('./persistence/session.js');
+      const { getDefaultSessionStore, resolveSessionId, matchSessionIds } = await import('./persistence/session.js');
       const store = getDefaultSessionStore();
       const full = await resolveSessionId(store, id);
       if (!full) {
-        process.stderr.write(`session not found: ${id}\n`);
+        const matches = await matchSessionIds(store, id);
+        if (matches.length > 1) {
+          process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`);
+        } else {
+          process.stderr.write(`session not found: ${id}\n`);
+        }
         process.exit(2);
       }
       const rec = await store.get(full);
@@ -501,11 +511,16 @@ async function main(): Promise<void> {
     .option('-m, --model <id>', 'Model')
     .option('--max-steps <n>', 'Max steps', (v) => parsePositiveInt('--max-steps', v))
     .action(async (id: string, opts: { model?: string; maxSteps?: number }) => {
-      const { getDefaultSessionStore, resolveSessionId } = await import('./persistence/session.js');
+      const { getDefaultSessionStore, resolveSessionId, matchSessionIds } = await import('./persistence/session.js');
       const store = getDefaultSessionStore();
       const full = await resolveSessionId(store, id);
       if (!full) {
-        process.stderr.write(`session not found: ${id}\n`);
+        const matches = await matchSessionIds(store, id);
+        if (matches.length > 1) {
+          process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`);
+        } else {
+          process.stderr.write(`session not found: ${id}\n`);
+        }
         process.exit(2);
       }
       const rec = await store.get(full);
@@ -548,11 +563,22 @@ async function main(): Promise<void> {
     const rec = await store.create({ cwd: data.record?.cwd ?? process.cwd(), task: data.record?.task ?? 'imported', config: data.record?.config ?? { model: 'imported', maxSteps: 30 } });
     process.stdout.write(`imported → ${rec.id}\n`);
   });
-  sessions.command('fork <id>').description('Fork session (9.4)').action(async (id: string) => {
-    const { getDefaultSessionStore, resolveSessionId } = await import('./persistence/session.js'); const store = getDefaultSessionStore(); const full = await resolveSessionId(store, id); if (!full) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
-    const rec = await store.get(full); if (!rec) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
-    const forked = await store.create({ cwd: rec.cwd, task: rec.task + ' (fork)', config: rec.config });
-    process.stdout.write(`forked ${full.slice(0,8)} → ${forked.id.slice(0,8)}\n`);
+  sessions.command('fork <id>').description('Fork session with full context (9.4)').action(async (id: string) => {
+    const { getDefaultSessionStore, matchSessionIds } = await import('./persistence/session.js'); const store = getDefaultSessionStore(); const matches = await matchSessionIds(store, id);
+    if (matches.length === 0) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
+    if (matches.length > 1) { process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`); process.exit(2); }
+    const full = matches[0]!.id;
+    const forked = await store.fork(full);
+    const msgs = await store.loadMessages(forked.id);
+    process.stdout.write(`forked ${full.slice(0, 8)} → ${forked.id.slice(0, 8)} (${msgs.length} messages carried over)\n`);
+  });
+  sessions.command('delete <id>').description('Delete a session and its artifacts').action(async (id: string) => {
+    const { getDefaultSessionStore, matchSessionIds } = await import('./persistence/session.js'); const store = getDefaultSessionStore(); const matches = await matchSessionIds(store, id);
+    if (matches.length === 0) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
+    if (matches.length > 1) { process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`); process.exit(2); }
+    const full = matches[0]!.id;
+    await store.delete(full);
+    process.stdout.write(`deleted ${full.slice(0, 8)}\n`);
   });
 
   // 10.1 — MCP

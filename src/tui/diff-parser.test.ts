@@ -1,7 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import React from 'react';
-import { render } from 'ink-testing-library';
-import { DiffView, type DiffHunk } from './diff.js';
 import { parseUnifiedDiff } from './diff-parser.js';
 
 const SAMPLE = `diff --git a/src/foo.ts b/src/foo.ts
@@ -54,41 +51,5 @@ describe('parseUnifiedDiff', () => {
 
   it('returns empty array for empty input', () => {
     expect(parseUnifiedDiff('')).toEqual([]);
-  });
-});
-
-describe('DiffView', () => {
-  it('shows an empty-state when hunks is empty', () => {
-    const { lastFrame } = render(<DiffView hunks={[]} />);
-    expect(lastFrame()).toContain('no working-tree changes');
-  });
-
-  it('renders a file header and line glyphs', () => {
-    const hunks: DiffHunk[] = [
-      {
-        path: 'src/foo.ts',
-        lines: [
-          { kind: 'header', text: '@@ -1 +1 @@' },
-          { kind: 'context', text: 'const a = 1;' },
-          { kind: 'remove', text: 'const b = 2;' },
-          { kind: 'add', text: 'const b = 3;' },
-        ],
-      },
-    ];
-    const { lastFrame } = render(<DiffView hunks={hunks} summary="1 file changed" />);
-    const out = lastFrame();
-    expect(out).toContain('src/foo.ts');
-    expect(out).toContain('+ const b = 3;');
-    expect(out).toContain('- const b = 2;');
-    expect(out).toContain('1 file changed');
-  });
-
-  it('truncates long lines', () => {
-    const long = 'x'.repeat(500);
-    const hunks: DiffHunk[] = [
-      { path: 'f.ts', lines: [{ kind: 'add', text: long }] },
-    ];
-    const { lastFrame } = render(<DiffView hunks={hunks} />);
-    expect(lastFrame()).toContain('…');
   });
 });

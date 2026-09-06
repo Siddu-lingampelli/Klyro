@@ -38,10 +38,18 @@ export async function resolveSessionId(store: SessionStore, prefix: string): Pro
     const rec = await store.get(prefix);
     return rec ? rec.id : null;
   }
-  const all = await store.list();
-  const matches = all.filter((r) => r.id.startsWith(prefix));
+  const matches = await matchSessionIds(store, prefix);
   if (matches.length === 1) return matches[0]!.id;
-  if (matches.length === 0) return null;
-  // ambiguous — return null and let caller report
+  // zero or ambiguous — null; callers use matchSessionIds for a good message
   return null;
+}
+
+/** All sessions matching an id prefix (lets callers distinguish missing vs ambiguous). */
+export async function matchSessionIds(store: SessionStore, prefix: string): Promise<SessionRecord[]> {
+  if (prefix.length >= 32) {
+    const rec = await store.get(prefix);
+    return rec ? [rec] : [];
+  }
+  const all = await store.list();
+  return all.filter((r) => r.id.startsWith(prefix));
 }

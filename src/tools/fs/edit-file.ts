@@ -62,65 +62,65 @@ export const editFileTool = defineTool<z.infer<typeof InputSchema>, EditFileOutp
       if (checkStaleness(resolved, stat.mtimeMs, currentHash)) {
         throw Object.assign(new Error(`File ${input.path} changed externally since last read — please re-read before editing`), { code: 'STALE' });
       }
-      let original = withoutBOM;
-      let findStr = input.find;
-      let count = countOccurrences(original, findStr);
-      let fuzzyTier: string | null = null;
-      // 4.2 fuzzy tiers (only after exact fails)
-      if (count === 0) {
-        const tiers: Array<{ name: string; transform: (s: string) => string }> = [
-          { name: 'trailing-whitespace', transform: (s) => s.replace(/[ \t]+$/gm, '') },
-          { name: 'indent-width', transform: (s) => s.replace(/^ {2,}/gm, (m) => '\t'.repeat(m.length / 2)) },
-          { name: 'unicode-quotes', transform: (s) => s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/—/g, '-') },
-        ];
-        for (const tier of tiers) {
-          const tFind = tier.transform(findStr);
-          const tOrig = tier.transform(original);
-          const c = countOccurrences(tOrig, tFind);
-          if (c > 0) {
-            findStr = tFind;
-            original = tOrig;
-            fuzzyTier = tier.name;
-            count = c;
-            break;
-          }
-        }
-        // Line-window similarity >=0.95
-        if (count === 0) {
-          const lines = original.split('\n');
-          let bestScore = 0;
-          let bestIdx = -1;
-          for (let i = 0; i < lines.length; i++) {
-            const line = lines[i] ?? '';
-            const score = line.length > 0 ? [...findStr].filter((ch, idx) => line[idx] === ch).length / Math.max(line.length, findStr.length) : 0;
-            if (score > bestScore) bestScore = score;
-            if (score >= 0.95) { bestIdx = i; break; }
-            if (score > bestScore) bestIdx = i;
-          }
-          if (bestScore >= 0.95 && bestIdx >= 0) {
-            findStr = lines[bestIdx] ?? findStr;
-            count = 1;
-            fuzzyTier = 'line-window-0.95';
-          }
-        }
-      }
-      if (count === 0) {
-        const closest = findClosestMatch(original, input.find);
+      // Read-before-write guard (same policy as write_file/apply_patch).
+      if (!wasRead(input.path, ctx.cwd) && withoutBOM.length > 200) {
         throw Object.assign(
-          new Error(
-            `find substring not present in ${input.path}. Closest match (similarity ${(closest.similarity * 100).toFixed(0)}%): line ${closest.lineRange[0]}-${closest.lineRange[1]} "${closest.snippet.slice(0, 80)}" — re-read and retry with exact context${fuzzyTier ? ` (tried fuzzy: ${fuzzyTier})` : ''}`,
-          ),
-          { code: 'MATCH_NOT_FOUND', details: closest },
+          new Error(`File ${input.path} was not read this session and is >200 bytes — re-read before editing (POLICY_DENIED)`),
+          { code: 'POLICY_DENIED' },
         );
       }
+      const original = withoutBOM;
+      const findStr = input.find;
       const replaceAll = input.replaceAll === true;
-      if (!replaceAll && count > 1) {
-        throw Object.assign(
-          new Error(`find substring occurs ${count} times in ${input.path}. Supply more context or pass replaceAll=true.`),
-          { code: 'MATCH_AMBIGUOUS' },
-        );
+      const exactCount = countOccurrences(original, findStr);
+      let next: string;
+      let replacements: number;
+      let fuzzyTier: string | null = null;
+      // Representative original text for the diff note below.
+      let diffNeedle = findStr;
+      if (exactCount > 0) {
+        if (!replaceAll && exactCount > 1) {
+          throw Object.assign(
+            new Error(`find substring occurs ${exactCount} times in ${input.path}. Supply more context or pass replaceAll=true.`),
+            { code: 'MATCH_AMBIGUOUS' },
+          );
+        }
+        next = replaceAll ? original.split(findStr).join(input.replace) : original.replace(findStr, input.replace);
+        replacements = replaceAll ? exactCount : 1;
+      } else {
+        // Match-only fuzzy: locate candidate line spans WITHOUT rewriting the
+        // file for matching (a whole-file transform here used to corrupt
+        // indentation/whitespace/quotes across the entire file). All tiers
+        // preserve newline positions, so a match in transformed text maps
+        // back to original coordinates by line number.
+        const spans = locateFuzzySpans(original, findStr);
+        if (spans.length === 0) {
+          const closest = findClosestMatch(original, input.find);
+          throw Object.assign(
+            new Error(
+              `find substring not present in ${input.path}. Closest match (similarity ${(closest.similarity * 100).toFixed(0)}%): line ${closest.lineRange[0]}-${closest.lineRange[1]} "${closest.snippet.slice(0, 80)}" — re-read and retry with exact context`,
+            ),
+            { code: 'MATCH_NOT_FOUND', details: closest },
+          );
+        }
+        if (!replaceAll && spans.length > 1) {
+          throw Object.assign(
+            new Error(`find substring occurs ${spans.length} times in ${input.path} (fuzzy:${spans[0]!.tier}). Supply more context or pass replaceAll=true.`),
+            { code: 'MATCH_AMBIGUOUS' },
+          );
+        }
+        const targets = replaceAll ? spans : [spans[0]!];
+        fuzzyTier = targets[0]!.tier;
+        const lines = original.split('\n');
+        const repLines = input.replace.split('\n');
+        // Last span first so earlier line numbers stay valid.
+        for (const s of [...targets].sort((a, b) => b.start - a.start)) {
+          diffNeedle = lines.slice(s.start, s.start + s.len).join('\n');
+          lines.splice(s.start, s.len, ...repLines);
+        }
+        next = lines.join('\n');
+        replacements = replaceAll ? spans.length : 1;
       }
-      let next = replaceAll ? original.split(findStr).join(input.replace) : original.replace(findStr, input.replace);
       // Preserve EOL: normalize then convert
       if (eol === '\r\n') {
         next = next.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
@@ -150,8 +150,8 @@ export const editFileTool = defineTool<z.infer<typeof InputSchema>, EditFileOutp
       const diffNote = fuzzyTier ? ` [fuzzy:${fuzzyTier}]` : '';
       return {
         path: input.path,
-        replacements: replaceAll ? count : 1,
-        diff: simpleDiff(original, findStr, input.replace, replaceAll ? count : 1) + diffNote,
+        replacements,
+        diff: simpleDiff(original, diffNeedle, input.replace, replacements) + diffNote,
       } satisfies EditFileOutput;
     });
   },
@@ -168,6 +168,63 @@ function countOccurrences(haystack: string, needle: string): number {
     from = i + needle.length;
   }
   return count;
+}
+
+export interface FuzzySpan {
+  /** 0-based start line in the ORIGINAL text. */
+  start: number;
+  /** Number of original lines the match covers. */
+  len: number;
+  tier: string;
+}
+
+/**
+ * Locate fuzzy match spans by line number. The file itself is never
+ * transformed — transforms exist only to find candidate positions, which
+ * map back 1:1 by line because every tier preserves newline positions.
+ */
+export function locateFuzzySpans(original: string, find: string): FuzzySpan[] {
+  const findLineCount = find.split('\n').length;
+  const locate = (tOrig: string, tFind: string): number[] => {
+    if (tFind.length === 0) return [];
+    const starts: number[] = [];
+    let idx = 0;
+    while (true) {
+      const at = tOrig.indexOf(tFind, idx);
+      if (at === -1) break;
+      starts.push(tOrig.slice(0, at).split('\n').length - 1);
+      idx = at + Math.max(1, tFind.length);
+    }
+    return starts;
+  };
+  const tiers: Array<{ name: string; transform: (s: string) => string }> = [
+    { name: 'trailing-whitespace', transform: (s) => s.replace(/[ \t]+$/gm, '') },
+    { name: 'indent-width', transform: (s) => s.replace(/^ {2,}/gm, (m) => '\t'.repeat(m.length / 2)) },
+    { name: 'unicode-quotes', transform: (s) => s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/—/g, '-') },
+  ];
+  for (const tier of tiers) {
+    const starts = locate(tier.transform(original), tier.transform(find));
+    if (starts.length > 0) {
+      return starts.map((start) => ({ start, len: findLineCount, tier: tier.name }));
+    }
+  }
+  // Line-window similarity >= 0.95 (single best line only).
+  const lines = original.split('\n');
+  let bestScore = 0;
+  let bestIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    if (line.length === 0) continue;
+    const score = [...find].filter((ch, idx) => line[idx] === ch).length / Math.max(line.length, find.length);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+  if (bestScore >= 0.95 && bestIdx >= 0) {
+    return [{ start: bestIdx, len: 1, tier: 'line-window-0.95' }];
+  }
+  return [];
 }
 
 function findClosestMatch(text: string, needle: string): { snippet: string; lineRange: [number, number]; similarity: number } {

@@ -16,7 +16,7 @@ import { anthropicAdapter } from '../agent/anthropic-adapter.js';
 import { run } from '../agent/runtime.js';
 import type { Message } from '../agent/message.js';
 import { builtinRegistry } from '../tools/registry.js';
-import { builtinRules, DEFAULT_POLICY_CONFIG, PolicyEngine } from '../policy/engine.js';
+import { builtinRules, clonePolicyConfig, PolicyEngine } from '../policy/engine.js';
 import { DenyAllApprovalPrompt } from '../policy/approval.js';
 import { buildLevel6Context } from '../context/level6.js';
 import { getDefaultSessionStore, resolveSessionId } from '../persistence/session.js';
@@ -86,8 +86,14 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   const output = opts.output ?? 'human';
 
   if (opts.dryRun) {
-    return dryRunReport(opts);
+    return await dryRunReport(opts);
   }
+
+  // Fresh read-guard scope per run (shared module state otherwise leaks across runs).
+  try {
+    const { clearReadHistory } = await import('../tools/fs/read-history.js');
+    clearReadHistory();
+  } catch { /* ignore */ }
 
   let adapter = opts.adapter;
   if (!adapter) {
@@ -114,7 +120,7 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     }
   }
   const registry = builtinRegistry();
-  const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+  const policy = new PolicyEngine(builtinRules(), clonePolicyConfig());
   const systemPrompt = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt);
 
   // Level 9 — session setup (create or resume)
@@ -157,12 +163,16 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   }
 
   const ac = new AbortController();
+  const onSigint = (): void => {
+    stderr.write('\nklyro: SIGINT — aborting\n');
+    ac.abort();
+  };
   if (opts.abortOnSigint !== false) {
-    process.on('SIGINT', () => {
-      stderr.write('\nklyro: SIGINT — aborting\n');
-      ac.abort();
-    });
+    process.once('SIGINT', onSigint);
   }
+  const doneSigint = (): void => {
+    process.removeListener('SIGINT', onSigint);
+  };
 
   const verifyOpts = opts.verify === false
     ? { enabled: false as const }
@@ -174,7 +184,9 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
         requireVerify: opts.requireVerify,
       };
 
-  const result = await run(
+  let result: Awaited<ReturnType<typeof run>>;
+  try {
+    result = await run(
     {
       task: opts.task,
       cwd: opts.cwd,
@@ -221,8 +233,11 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
         }
       },
     },
-    { adapter, registry, policy, approval: new DenyAllApprovalPrompt(), systemPrompt },
-  );
+      { adapter, registry, policy, approval: new DenyAllApprovalPrompt(), systemPrompt },
+    );
+  } finally {
+    doneSigint();
+  }
 
   if (store && sessionId) {
     // Finalize session status
@@ -243,7 +258,7 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     }
   }
 
-  if (output !== 'json') stdout.write('\n');
+  if (output === 'human') stdout.write('\n');
   if (result.status === 'max_steps') {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: result.status, steps: result.steps }) + '\n');
     else stderr.write(`klyro: hit max steps (${result.steps}); consider raising --max-steps\n`);
@@ -267,8 +282,8 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     else stderr.write('klyro: --require-verify: verification required but not passed\n');
     return 8;
   }
-  if (opts.requireVerify && !result.verification) {
-    // hasEdits but no verification command found
+  if (opts.requireVerify && !result.verification && result.hasEdits) {
+    // Edits were made but no verification command found
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'require_verify_missing' }) + '\n');
     else stderr.write('klyro: --require-verify: no verification command found and edits were made\n');
     return 8;
@@ -291,8 +306,11 @@ interface DryRunReport {
   policyRules: string[];
 }
 
-function dryRunReport(opts: RunCliOptions): number {
-  const systemPrompt = (opts.systemPrompt ?? defaultRunSystemPrompt)({ cwd: opts.cwd });
+async function dryRunReport(opts: RunCliOptions): Promise<number> {
+  // Assemble the REAL prompt (Level-6 context + KLYRO.md), not the bare base —
+  // otherwise dry-run shows a different prompt than production runs use.
+  const systemPromptFn = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt);
+  const systemPrompt = systemPromptFn({ cwd: opts.cwd });
   const registry = builtinRegistry();
   const rules = builtinRules();
   const report: DryRunReport = {

@@ -7,7 +7,7 @@
  * run `npm test`, which shell_exec might want approval for in some configs.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
@@ -83,7 +83,7 @@ export const runVerifyTool = defineTool({
           // Windows grandchild cleanup — see shell-exec.ts for why.
           if (process.platform === 'win32') {
             try {
-              require('node:child_process').spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true });
+              spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true });
             } catch { /* already gone */ }
           } else {
             try { child.kill('SIGKILL'); } catch { /* noop */ }

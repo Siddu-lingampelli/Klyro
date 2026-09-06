@@ -140,6 +140,8 @@ export interface RunResult {
   toolCalls: number;
   finalText: string;
   transcript: Message[];
+  /** Whether any file-mutating tool ran (drives --require-verify semantics). */
+  hasEdits: boolean;
   usage: { input: number; output: number };
   /** Number of policy-driven user prompts the user accepted. */
   repairs?: number;
@@ -304,13 +306,13 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       if (cost >= maxCost) {
         setPhase('limit');
         await closeTracer();
-        return { status: 'limit', steps, toolCalls: toolCallCount, finalText: `Stopped: max cost $${maxCost} reached (cost $${cost.toFixed(2)})`, transcript, usage, repairs, phase: 'limit' };
+        return { status: 'limit', steps, toolCalls: toolCallCount, finalText: `Stopped: max cost $${maxCost} reached (cost $${cost.toFixed(2)})`, transcript, hasEdits, usage, repairs, phase: 'limit' };
       }
     }
     if (maxTimeMs !== undefined && Date.now() - startTime >= maxTimeMs) {
       setPhase('limit');
       await closeTracer();
-      return { status: 'limit', steps, toolCalls: toolCallCount, finalText: `Stopped: max time ${maxTimeMs}ms reached`, transcript, usage, repairs, phase: 'limit' };
+      return { status: 'limit', steps, toolCalls: toolCallCount, finalText: `Stopped: max time ${maxTimeMs}ms reached`, transcript, hasEdits, usage, repairs, phase: 'limit' };
     }
     if (opts.signal?.aborted) {
       emit?.({ kind: 'aborted' });
@@ -318,7 +320,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
       await closeTracer();
-      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined, phase: 'blocked' };
+      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined, phase: 'blocked' };
     }
     steps++;
     // 5.1 phase transitions (model-narrated)
@@ -390,6 +392,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           toolCalls: toolCallCount,
           finalText: textBuf,
           transcript,
+          hasEdits,
           usage,
           repairs,
           verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined,
@@ -426,7 +429,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
       await closeTracer();
-      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
     }
     if (finalizedCalls.length === 0) {
       finalText = textBuf;
@@ -444,32 +447,35 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         const cmdToRun = scopedCmd ?? verifyCmd;
         const isScoped = !!scopedCmd;
         if (isScoped) emit?.({ kind: 'verification_started', command: cmdToRun });
-        try {
-          if (isScoped) {
-            const sr = await runScopedVerify(opts.cwd, cmdToRun, opts.verify?.timeoutMs);
-            const det = sr.ok ? undefined : (await import('../verification/detect.js')).detect(sr.stdout, sr.stderr, sr.exitCode);
-            vResult = { ok: sr.ok, exitCode: sr.exitCode, stdout: sr.stdout, stderr: sr.stderr, ...(det ? { failure: det } : {}) } as VerifyResult;
-          } else {
-            vResult = await verify({ cwd: opts.cwd, command: cmdToRun, timeoutMs: opts.verify?.timeoutMs });
+        // 6.3 — cheap sanity checks FIRST (fail fast before the suite runs).
+        // (Previously these ran after a green verify — pure waste.)
+        let sanityVResult: VerifyResult | undefined;
+        for (const f of edited.slice(-3)) {
+          const sc = await syntaxCheck(opts.cwd, f);
+          if (!sc.ok) {
+            sanityVResult = { ok: false, exitCode: 1, stdout: '', stderr: sc.error ?? `syntax error ${f}`, failure: { type: 'build', files: [{ path: f, message: sc.error ?? 'syntax error' }], raw: sc.error ?? '', exitCode: 1 } } as VerifyResult;
+            break;
           }
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          vResult = { ok: false, exitCode: -1, stdout: '', stderr: msg, failure: { type: 'unknown', files: [], raw: msg, exitCode: -1 } };
+          const ic = checkImports(opts.cwd, f);
+          if (!ic.ok) {
+            sanityVResult = { ok: false, exitCode: 1, stdout: '', stderr: `missing imports in ${f}: ${ic.missing.join(', ')}`, failure: { type: 'build', files: ic.missing.map((m) => ({ path: f, message: `missing import ${m}` })), raw: `missing imports ${ic.missing.join(', ')}`, exitCode: 1 } } as VerifyResult;
+            break;
+          }
         }
-        // 6.3 — sanity checks before full verify
-        if (vResult.ok) {
-          // quick syntax/import guard for last edited files
-          for (const f of edited.slice(-3)) {
-            const sc = await syntaxCheck(opts.cwd, f);
-            if (!sc.ok) {
-              vResult = { ok: false, exitCode: 1, stdout: '', stderr: sc.error ?? `syntax error ${f}`, failure: { type: 'build', files: [{ path: f, message: sc.error ?? 'syntax error' }], raw: sc.error ?? '', exitCode: 1 } } as VerifyResult;
-              break;
+        if (sanityVResult) {
+          vResult = sanityVResult;
+        } else {
+          try {
+            if (isScoped) {
+              const sr = await runScopedVerify(opts.cwd, cmdToRun, opts.verify?.timeoutMs);
+              const det = sr.ok ? undefined : (await import('../verification/detect.js')).detect(sr.stdout, sr.stderr, sr.exitCode);
+              vResult = { ok: sr.ok, exitCode: sr.exitCode, stdout: sr.stdout, stderr: sr.stderr, ...(det ? { failure: det } : {}) } as VerifyResult;
+            } else {
+              vResult = await verify({ cwd: opts.cwd, command: cmdToRun, timeoutMs: opts.verify?.timeoutMs });
             }
-            const ic = checkImports(opts.cwd, f);
-            if (!ic.ok) {
-              vResult = { ok: false, exitCode: 1, stdout: '', stderr: `missing imports in ${f}: ${ic.missing.join(', ')}`, failure: { type: 'build', files: ic.missing.map((m) => ({ path: f, message: `missing import ${m}` })), raw: `missing imports ${ic.missing.join(', ')}`, exitCode: 1 } } as VerifyResult;
-              break;
-            }
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            vResult = { ok: false, exitCode: -1, stdout: '', stderr: msg, failure: { type: 'unknown', files: [], raw: msg, exitCode: -1 } };
           }
         }
         // If scoped passed but full may still fail, run full before declaring success
@@ -487,7 +493,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
           }
           await closeTracer();
-          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
+          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
         }
         // 6.4 — classify
         const baseline = await getBaseline(opts.cwd, verifyCmd);
@@ -502,7 +508,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
           }
           await closeTracer();
-          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
+          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
         }
         if (cls === 'env') {
           // don't try to repair env failures with code edits
@@ -513,7 +519,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           emit?.({ kind: 'verification_failed', step: String(steps), reason: `env: ${diagnosticForModel(vResult).slice(0, 600)}` });
           if (verificationAttempts >= maxRepairs) {
             await closeTracer();
-            return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: false, command: verifyCmd, attempts: verificationAttempts, failureType: 'env' } };
+            return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: false, command: verifyCmd, attempts: verificationAttempts, failureType: 'env' } };
           }
           emit?.({ kind: 'step_end', step: steps });
           continue;
@@ -536,7 +542,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
               try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
             }
             await closeTracer();
-            return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
+            return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
           }
         }
         // Failure → repair loop (introduced)
@@ -576,7 +582,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           emit?.({ kind: 'final_text', text: finalText });
           emit?.({ kind: 'step_end', step: steps });
           await closeTracer();
-          return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: false, command: verifyCmd, attempts: verificationAttempts, failureType } };
+          return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: false, command: verifyCmd, attempts: verificationAttempts, failureType } };
         }
         emit?.({ kind: 'step_end', step: steps });
         continue; // -> next iteration lets model repair
@@ -587,7 +593,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
       }
       await closeTracer();
-      return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: true, attempts: verificationAttempts } : undefined };
+      return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: true, attempts: verificationAttempts } : undefined };
     }
 
     // 3.1 — emit turn events
@@ -743,14 +749,14 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
     }
     await closeTracer();
-    return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+    return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
   }
   emit?.({ kind: 'final_text', text: finalText });
   if (store && sessionId) {
     try { await store.setStatus(sessionId, 'max_steps', finalText); } catch { /* ignore */ }
   }
   await closeTracer();
-  return { status: 'max_steps', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+  return { status: 'max_steps', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
 }
 
 function redactOutput(v: unknown): unknown {
@@ -781,13 +787,21 @@ function inferFileChanged(
 ): { path: string; op: 'created' | 'modified' | 'deleted' } | null {
   const inPath = typeof input.path === 'string' ? input.path : null;
   if (!inPath) return null;
-  if (toolName === 'write_file' || toolName === 'edit_file') {
+  if (toolName === 'write_file' || toolName === 'edit_file' || toolName === 'multi_edit') {
     // Distinguish create vs modify by the output shape: write_file returns
     // { path, bytesWritten }; edit_file returns { path, replacements, diff }.
     // Both are "modified" semantically; we don't have the pre-state easily
     // from inside the runtime. A more precise implementation would stat the
     // file before/after the call. For now: treat both as 'modified'.
     return { path: inPath, op: 'modified' };
+  }
+  if (toolName === 'apply_patch') {
+    // apply_patch has no path input — infer from its patchedFiles output.
+    const files = (output as { patchedFiles?: unknown })?.patchedFiles;
+    if (Array.isArray(files) && typeof files[0] === 'string') {
+      return { path: files[0], op: 'modified' };
+    }
+    return null;
   }
   return null;
 }

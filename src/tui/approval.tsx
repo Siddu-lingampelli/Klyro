@@ -30,12 +30,19 @@ interface PendingPrompt {
 
 class TuiApprovalBridge implements ApprovalPrompt {
   private pending: PendingPrompt | null = null;
-  private listener: ((p: PendingPrompt | null) => void) | null = null;
+  // Fan-out set: BOTH the App (awaitingApproval gate) and the ApprovalModal
+  // subscribe. The old single slot meant the last subscriber silently
+  // unsubscribed the other — the modal never rendered and approvals hung.
+  private listeners = new Set<(p: PendingPrompt | null) => void>();
 
   ask(req: ApprovalRequest): Promise<ApprovalChoice> {
     return new Promise<ApprovalChoice>((resolve) => {
       this.pending = { req, resolve };
-      this.listener?.(this.pending);
+      for (const l of this.listeners) {
+        try {
+          l(this.pending);
+        } catch { /* ignore listener errors */ }
+      }
     });
   }
 
@@ -44,7 +51,11 @@ class TuiApprovalBridge implements ApprovalPrompt {
     if (!this.pending) return false;
     const p = this.pending;
     this.pending = null;
-    this.listener?.(null);
+    for (const l of this.listeners) {
+      try {
+        l(null);
+      } catch { /* ignore listener errors */ }
+    }
     p.resolve(choice);
     return true;
   }
@@ -55,8 +66,10 @@ class TuiApprovalBridge implements ApprovalPrompt {
 
   /** Used by useSyncExternalStore-ish wiring in <ApprovalModal/>. */
   subscribe(listener: (p: PendingPrompt | null) => void): () => void {
-    this.listener = listener;
-    return () => { this.listener = null; };
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 }
 

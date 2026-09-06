@@ -89,6 +89,28 @@ describe('edit_file core (4.1)', () => {
     expect(r.ok).toBe(true);
   });
 
+  it('fuzzy never rewrites the rest of the file', async () => {
+    await write('a.txt', 'keep  \n“quoted”\nkeep2 — dash');
+    const r = await editFileTool.execute({ path: 'a.txt', find: '"quoted"', replace: '"Q"' }, { cwd: tmp, env: {} });
+    expect(r.ok).toBe(true);
+    // Untouched lines keep trailing spaces, em-dash, everything byte-for-byte.
+    expect(await fs.readFile(path.join(tmp, 'a.txt'), 'utf-8')).toBe('keep  \n"Q"\nkeep2 — dash');
+  });
+
+  it('indent-width tier replaces only the matched span', async () => {
+    await write('a.txt', 'if x:\n  body1\n    body2\nend');
+    const r = await editFileTool.execute({ path: 'a.txt', find: 'if x:\n\tbody1', replace: 'if x:\n\tB1' }, { cwd: tmp, env: {} });
+    expect(r.ok).toBe(true);
+    expect(await fs.readFile(path.join(tmp, 'a.txt'), 'utf-8')).toBe('if x:\n\tB1\n    body2\nend');
+  });
+
+  it('line-window tier fixes a near-miss line only', async () => {
+    await write('a.txt', 'const abcdefghij = 1;\nother = 2;');
+    const r = await editFileTool.execute({ path: 'a.txt', find: 'const abcdefghix = 1;', replace: 'const FIXED = 1;' }, { cwd: tmp, env: {} });
+    expect(r.ok).toBe(true);
+    expect(await fs.readFile(path.join(tmp, 'a.txt'), 'utf-8')).toBe('const FIXED = 1;\nother = 2;');
+  });
+
   it('empty old_string fails', async () => {
     await write('a.txt', 'hello');
     const r = await editFileTool.execute({ path: 'a.txt', find: '', replace: 'x' } as unknown as { path: string; find: string; replace: string }, { cwd: tmp, env: {} });

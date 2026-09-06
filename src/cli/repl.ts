@@ -15,7 +15,7 @@ import { httpChatAdapter } from '../agent/provider-adapter.js';
 import { anthropicAdapter } from '../agent/anthropic-adapter.js';
 import { run } from '../agent/runtime.js';
 import { builtinRegistry } from '../tools/registry.js';
-import { builtinRules, DEFAULT_POLICY_CONFIG, PolicyEngine } from '../policy/engine.js';
+import { builtinRules, clonePolicyConfig, PolicyEngine } from '../policy/engine.js';
 import { buildLevel6Context } from '../context/level6.js';
 import { DenyAllApprovalPrompt, StdinApprovalPrompt } from '../policy/approval.js';
 import { TuiApprovalBridge } from '../tui/approval.js';
@@ -78,7 +78,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   let model = opts.model ?? resolved.model;
   let cwd = opts.cwd ?? process.cwd();
   const registry = builtinRegistry();
-  const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+  // Clone: /mode and /sandbox mutate this config — it must never leak into
+  // the shared DEFAULT_POLICY_CONFIG across sessions.
+  const policy = new PolicyEngine(builtinRules(), clonePolicyConfig());
   const providerKind = inferProviderFromBaseURL(baseUrl);
   // Local Ollama exposes OpenAI-compat but hostname could contain "anthropic"
   // via proxy — don't try anthropic adapter with empty key (would 401).
@@ -265,7 +267,14 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         const home = process.env.HOME ?? process.env.USERPROFILE ?? cwd;
         const dir = nodePath.join(home, '.klyro');
         fsSync.mkdirSync(dir, { recursive: true });
-        fsSync.appendFileSync(nodePath.join(dir, 'debug.log'), line + '\n');
+        const logFile = nodePath.join(dir, 'debug.log');
+        // Rotation: never let the debug log grow without bound (2 MiB cap).
+        try {
+          if (fsSync.statSync(logFile).size > 2 * 1024 * 1024) {
+            fsSync.renameSync(logFile, `${logFile}.1`);
+          }
+        } catch { /* missing — fine */ }
+        fsSync.appendFileSync(logFile, line + '\n');
       } catch { /* ignore */ }
     };
     console.log = sink;
@@ -335,6 +344,37 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       fsSync.writeFileSync(file, JSON.stringify(Object.fromEntries(m), null, 2), 'utf-8');
     } catch { /* best-effort */ }
   }
+  /** Extract display text from a read_file result ({lines[]} shape). */
+  function readFileBody(value: unknown): string {
+    const v = value as { content?: string; lines?: string[]; text?: string };
+    if (typeof v?.content === 'string') return v.content;
+    if (Array.isArray(v?.lines)) return v.lines.join('\n');
+    if (typeof v?.text === 'string') return v.text;
+    return JSON.stringify(v ?? '');
+  }
+
+  /**
+   * Build the attached-files context block (/attach, @path, /mention feed
+   * this — previously they were display-only and never reached the agent).
+   * Re-read fresh at prompt time (5 files, 2k chars each, 8k total cap).
+   */
+  async function buildAttachedBlock(): Promise<string> {
+    if (attachedFiles.size === 0) return '';
+    const parts: string[] = [];
+    let total = 0;
+    for (const file of [...attachedFiles.keys()].slice(0, 5)) {
+      try {
+        const r = await registry.execute('read_file', { path: file }, { cwd, env: process.env, nonInteractive: true });
+        if (!r.ok) continue;
+        const body = readFileBody(r.value).slice(0, 2000);
+        if (total + body.length > 8000) break;
+        total += body.length;
+        parts.push(`<attached file="${file}">\n${body}\n</attached>`);
+      } catch { /* ignore */ }
+    }
+    return parts.length > 0 ? `\n\n${parts.join('\n\n')}` : '';
+  }
+
   /** Truncation budget honoring /verbose and /raw. */
   function outCap(s: string): string {
     const cap = rawMode ? 12000 : verboseMode ? 8000 : 4000;
@@ -345,10 +385,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     if (!r.ok) throw new Error((r.error as { message?: string }).message ?? 'shell failed');
     return r.value as { exitCode: number | null; stdout: string; stderr: string };
   }
-  /** Read-only LLM answer (no tools) — powers /ask and /explain. */
-  async function answerReadOnly(question: string, context?: string): Promise<void> {
+  /** Read-only LLM answer (no tools) — powers /ask, /explain, /compact. */
+  async function answerReadOnly(question: string, context?: string): Promise<string> {
     const sys = systemPromptFn({ cwd, telemetry: '' }) + '\n\nAnswer read-only: do not call tools, do not edit files.';
-    const userText = context ? `${question}\n\n<context>\n${context.slice(0, 6000)}\n</context>` : question;
+    const attached = await buildAttachedBlock();
+    const userText = (context ? `${question}\n\n<context>\n${context.slice(0, 6000)}\n</context>` : question) + attached;
     const req = {
       model,
       system: sys,
@@ -365,10 +406,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
       lastAssistantText = text;
       queuedStatus({ status: 'done' });
+      return text;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       queuedAppend({ id: `ro-err-${Date.now()}`, kind: 'error', message: msg });
       queuedStatus({ status: 'error', errorMessage: msg });
+      return '';
     }
   }
   function queuedClear(): void {
@@ -427,9 +470,15 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       queuedStatus({ status: 'error', errorMessage: 'no model configured' });
       return;
     }
+    // Fresh read-guard scope per task: reads from a previous task must not
+    // satisfy write guards in this one (same process, shared module state).
+    try {
+      const { clearReadHistory } = await import('../tools/fs/read-history.js');
+      clearReadHistory();
+    } catch { /* ignore */ }
     // 2.3 image handling: extract @img refs
     const { text: cleanText, images } = parseImageInput(text);
-    const taskText = images.length > 0 ? `${cleanText}\n\n[images: ${images.join(', ')}]` : cleanText;
+    let taskText = images.length > 0 ? `${cleanText}\n\n[images: ${images.join(', ')}]` : cleanText;
     // Only create session for non-trivial tasks (with tools/verify) — plain chat like "hello" is not a persisted session
     const isSimpleChat = taskText.trim().split(/\s+/).length <= 5 && !taskText.toLowerCase().includes('fix') && !taskText.toLowerCase().includes('add') && !taskText.toLowerCase().includes('create');
     let sessionId: string | undefined;
@@ -445,6 +494,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
     }
     queuedStatus({ status: 'running', step: 0, model });
+    // Attached files ride along (fresh re-read, capped) on both paths.
+    taskText += await buildAttachedBlock();
     // Simple chat like "hello" must NOT trigger tool calls — direct LLM chat, no tools, no files
     if (isSimpleChat) {
       try {
@@ -805,15 +856,58 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'compact': {
+        // Real compaction (not a destructive clear): summarize the persisted
+        // session via a read-only pass, then clear the view and retain the
+        // summary as the new context anchor.
         const focus = cmd.focus?.trim();
-        queuedClear();
-        queuedAppend({
-          id: `compact-${Date.now()}`,
-          kind: 'text',
-          text: focus ? `Context compacted — transcript cleared (focus: ${focus}). Continuing fresh.` : 'Context compacted — transcript cleared. Continuing fresh.',
-          role: 'assistant',
-        });
-        queuedStatus({ status: 'done' });
+        const compactFallback = (): void => {
+          queuedClear();
+          queuedAppend({
+            id: `compact-${Date.now()}`,
+            kind: 'text',
+            text: focus ? `Context compacted — transcript cleared (focus: ${focus}). Continuing fresh.` : 'Context compacted — transcript cleared. Continuing fresh.',
+            role: 'assistant',
+          });
+          queuedStatus({ status: 'done' });
+        };
+        if (!tuiSessionId) {
+          compactFallback();
+          return;
+        }
+        try {
+          const msgs = await tuiStore.loadMessages(tuiSessionId);
+          if (msgs.length === 0) {
+            compactFallback();
+            return;
+          }
+          const excerpt = msgs
+            .slice(-60)
+            .map((m) => {
+              const c = m.content;
+              const s = typeof c === 'string' ? c : JSON.stringify(c);
+              return `[${m.role}] ${s.slice(0, 500)}`;
+            })
+            .join('\n')
+            .slice(0, 12000);
+          queuedAppend({ id: `compact-run-${Date.now()}`, kind: 'text', text: 'Compacting context (summarizing session)…', role: 'assistant' });
+          const summary = await answerReadOnly(
+            `Summarize this coding session in 10-15 lines for context retention: goal, key decisions, files changed, current state, next steps.${focus ? ` Focus on: ${focus}` : ''}\n\nSession:\n${excerpt}`,
+          );
+          if (!summary.trim()) {
+            compactFallback();
+            return;
+          }
+          queuedClear();
+          queuedAppend({
+            id: `compact-done-${Date.now()}`,
+            kind: 'text',
+            text: `Context compacted — retained summary:\n\n${summary.slice(0, 4000)}`,
+            role: 'assistant',
+          });
+          queuedStatus({ status: 'done' });
+        } catch {
+          compactFallback();
+        }
         return;
       }
       case 'model': {
@@ -1013,7 +1107,10 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         const cfg = (policy as unknown as { config: { additionalDirs?: string[] } }).config;
         const p = cmd.policy?.trim();
         if (!p) {
-          queuedAppend({ id: `sb-${Date.now()}`, kind: 'text', text: `sandbox dirs: ${JSON.stringify(cfg.additionalDirs ?? [])}\nusage: /sandbox <dir> (adds an allowed directory)`, role: 'assistant' });
+          queuedAppend({ id: `sb-${Date.now()}`, kind: 'text', text: `sandbox dirs: ${JSON.stringify(cfg.additionalDirs ?? [])}\nusage: /sandbox <dir> (add) | /sandbox reset (clear)`, role: 'assistant' });
+        } else if (p === 'reset') {
+          cfg.additionalDirs = [];
+          queuedAppend({ id: `sb3-${Date.now()}`, kind: 'text', text: 'sandbox: cleared allowed dirs', role: 'assistant' });
         } else {
           cfg.additionalDirs = [...(cfg.additionalDirs ?? []), p];
           queuedAppend({ id: `sb2-${Date.now()}`, kind: 'text', text: `sandbox: added allowed dir ${p}`, role: 'assistant' });
@@ -1032,11 +1129,22 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
       case 'resume': {
         try {
-          const { resolveSessionId } = await import('../persistence/session.js');
+          const { resolveSessionId, matchSessionIds } = await import('../persistence/session.js');
           const all = (await tuiStore.list()).filter((r) => r.cwd === cwd).sort((a, b) => b.updatedAt - a.updatedAt);
           const full = cmd.id ? await resolveSessionId(tuiStore, cmd.id) : all[0]?.id;
           if (!full) {
-            queuedAppend({ id: `resume-err-${Date.now()}`, kind: 'error', message: cmd.id ? `session not found: ${cmd.id}` : 'no previous session in this cwd' });
+            if (cmd.id) {
+              const matches = await matchSessionIds(tuiStore, cmd.id);
+              queuedAppend({
+                id: `resume-err-${Date.now()}`,
+                kind: 'error',
+                message: matches.length > 1
+                  ? `ambiguous id "${cmd.id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}`
+                  : `session not found: ${cmd.id}`,
+              });
+            } else {
+              queuedAppend({ id: `resume-err-${Date.now()}`, kind: 'error', message: 'no previous session in this cwd' });
+            }
             return;
           }
           const rec = await tuiStore.get(full);
@@ -1076,10 +1184,18 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
       case 'fork': {
         try {
-          const base = sessionLabel || 'session';
-          const rec = await tuiStore.create({ cwd, task: `${base} (fork)${cmd.prompt ? `: ${cmd.prompt}` : ''}`, config: { model, maxSteps: currentMaxSteps } });
-          tuiSessionId = rec.id;
-          queuedAppend({ id: `fork-${Date.now()}`, kind: 'text', text: `forked → session ${rec.id.slice(0, 8)}`, role: 'assistant' });
+          if (tuiSessionId) {
+            const forked = await tuiStore.fork(tuiSessionId);
+            const msgs = await tuiStore.loadMessages(forked.id);
+            tuiSessionId = forked.id;
+            sessionLabel = forked.task.slice(0, 40);
+            queuedAppend({ id: `fork-${Date.now()}`, kind: 'text', text: `forked → session ${forked.id.slice(0, 8)} (${msgs.length} messages carried over)`, role: 'assistant' });
+          } else {
+            const base = sessionLabel || 'session';
+            const rec = await tuiStore.create({ cwd, task: `${base} (fork)${cmd.prompt ? `: ${cmd.prompt}` : ''}`, config: { model, maxSteps: currentMaxSteps } });
+            tuiSessionId = rec.id;
+            queuedAppend({ id: `fork-${Date.now()}`, kind: 'text', text: `forked → session ${rec.id.slice(0, 8)}`, role: 'assistant' });
+          }
         } catch (err) {
           queuedAppend({ id: `fork-err-${Date.now()}`, kind: 'error', message: `fork failed: ${err instanceof Error ? err.message : String(err)}` });
         }
@@ -1186,7 +1302,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             queuedAppend({ id: `men-err-${Date.now()}`, kind: 'error', message: `mention failed: ${(r.error as { message?: string }).message ?? (r.error as { code?: string }).code}` });
           } else {
             const v = r.value as { path: string; content?: string; text?: string };
-            const body = String(v.content ?? v.text ?? JSON.stringify(v)).slice(0, 6000);
+            const body = readFileBody(v).slice(0, 6000);
             queuedAppend({ id: `men2-${Date.now()}`, kind: 'text', text: `attached ${cmd.path} (${body.length} chars):\n${body}`, role: 'assistant' });
           }
         } catch (err) {
@@ -1216,7 +1332,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             if (cmd.target) {
               try {
                 const fr = await registry.execute('read_file', { path: cmd.target }, { cwd, env: process.env, nonInteractive: true });
-                if (fr.ok) extra = `\n\n--- ${cmd.target} ---\n${String((fr.value as { content?: string }).content ?? '').slice(0, 2000)}`;
+                if (fr.ok) extra = `\n\n--- ${cmd.target} ---\n${readFileBody(fr.value).slice(0, 2000)}`;
               } catch { /* ignore */ }
             }
             queuedAppend({ id: `rev-${Date.now()}`, kind: 'text', text: `${head}\n${v.stat.slice(0, 1500)}${extra}\n\n${outCap(v.diff).slice(0, 3000)}`, role: 'assistant' });
@@ -1352,7 +1468,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           let ctx = '';
           try {
             const fr = await registry.execute('read_file', { path: cmd.target }, { cwd, env: process.env, nonInteractive: true });
-            if (fr.ok) ctx = `File ${cmd.target}:\n${String((fr.value as { content?: string }).content ?? '').slice(0, 6000)}`;
+            if (fr.ok) ctx = `File ${cmd.target}:\n${readFileBody(fr.value).slice(0, 6000)}`;
           } catch { /* symbol — answer without file context */ }
           await answerReadOnly(`Explain ${cmd.target}: what it does, key logic, and gotchas.`, ctx || undefined);
         }
@@ -1369,7 +1485,10 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             if (!check || check.exitCode !== 0) {
               queuedAppend({ id: `fmt2-${Date.now()}`, kind: 'text', text: 'prettier not installed — run `npm i -D prettier` first.', role: 'assistant' });
             } else {
-              const fv = await execShell(`npx prettier --write ${files.map((f) => `"${f}"`).join(' ')}`);
+              // Strip double quotes from paths (" is illegal in Windows
+              // filenames and a shell escape vector everywhere else).
+              const safeFiles = files.map((f) => f.replace(/"/g, ''));
+              const fv = await execShell(`npx prettier --write ${safeFiles.map((f) => `"${f}"`).join(' ')}`);
               queuedAppend({ id: `fmt3-${Date.now()}`, kind: 'text', text: fv.exitCode === 0 ? `[format] formatted ${files.length} file(s)` : `[format] failed:\n${outCap(fv.stderr || fv.stdout)}`, role: 'assistant' });
             }
           }
@@ -1599,7 +1718,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             queuedAppend({ id: `cd-err-${Date.now()}`, kind: 'error', message: `not a directory: ${p}` });
           } else {
             cwd = abs;
-            queuedAppend({ id: `cd2-${Date.now()}`, kind: 'text', text: `cwd → ${abs} (header refreshes on restart)`, role: 'assistant' });
+            const { resetPersistentCwd } = await import('../tools/shell/shell-exec.js');
+            resetPersistentCwd();
+            const { clearReadHistory } = await import('../tools/fs/read-history.js');
+            clearReadHistory();
+            queuedAppend({ id: `cd2-${Date.now()}`, kind: 'text', text: `cwd → ${abs} (shell cwd + read guards reset; header refreshes on restart)`, role: 'assistant' });
           }
         }
         return;
@@ -1613,7 +1736,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             if (!r.ok) {
               queuedAppend({ id: `att-err-${Date.now()}`, kind: 'error', message: `attach failed: ${(r.error as { message?: string }).message ?? 'read error'}` });
             } else {
-              const body = String((r.value as { content?: string }).content ?? '');
+              const body = readFileBody(r.value);
               attachedFiles.set(cmd.file, body.length);
               queuedAppend({ id: `att2-${Date.now()}`, kind: 'text', text: `attached ${cmd.file} (${body.length} chars) — in context for future prompts`, role: 'assistant' });
             }
@@ -1730,8 +1853,21 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             const t = setTimeout(() => ctrl.abort(), 15_000);
             const res = await fetch(cmd.url, { signal: ctrl.signal });
             clearTimeout(t);
-            const text = (await res.text()).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 6000);
-            queuedAppend({ id: `web2-${Date.now()}`, kind: 'text', text: `${cmd.url} [${res.status}]:\n${text || '(no text content)'}`, role: 'assistant' });
+            // SSRF/OOM guard: refuse huge bodies before buffering.
+            const declared = Number(res.headers.get('content-length') ?? 0);
+            if (declared > 2 * 1024 * 1024) {
+              queuedAppend({ id: `web-err-${Date.now()}`, kind: 'error', message: `refusing to fetch ${declared} byte body (2 MiB cap)` });
+              return;
+            }
+            const raw = await res.text();
+            const capped = raw.length > 256 * 1024;
+            const text = raw
+              .slice(0, 256 * 1024)
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 6000);
+            queuedAppend({ id: `web2-${Date.now()}`, kind: 'text', text: `${cmd.url} [${res.status}]${capped ? ' [body capped at 256 KiB]' : ''}:\n${text || '(no text content)'}`, role: 'assistant' });
           } catch (err) {
             queuedAppend({ id: `web-err-${Date.now()}`, kind: 'error', message: `fetch failed: ${err instanceof Error ? err.message : String(err)}` });
           }
@@ -1747,7 +1883,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             if (!r.ok) {
               queuedAppend({ id: `read-err-${Date.now()}`, kind: 'error', message: `read failed: ${(r.error as { message?: string }).message ?? 'error'}` });
             } else {
-              queuedAppend({ id: `read2-${Date.now()}`, kind: 'text', text: `${cmd.path}:\n${outCap(String((r.value as { content?: string }).content ?? ''))}`, role: 'assistant' });
+              queuedAppend({ id: `read2-${Date.now()}`, kind: 'text', text: `${cmd.path}:\n${outCap(readFileBody(r.value))}`, role: 'assistant' });
             }
           } catch (err) {
             queuedAppend({ id: `read-err2-${Date.now()}`, kind: 'error', message: String(err) });
@@ -1788,9 +1924,18 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             if (staged.length === 0) {
               queuedAppend({ id: `commit2-${Date.now()}`, kind: 'text', text: 'Nothing staged — stage changes with `git add` first.', role: 'assistant' });
             } else {
-              const safeMsg = cmd.message.replace(/"/g, "'");
-              const v = await execShell(`git commit -m "${safeMsg}"`);
-              queuedAppend({ id: `commit3-${Date.now()}`, kind: 'text', text: v.exitCode === 0 ? `committed ${staged.length} file(s):\n${outCap(v.stdout)}` : `commit failed:\n${outCap(v.stderr || v.stdout)}`, role: 'assistant' });
+              // Message via temp file (git commit -F): zero shell interpolation.
+              const { writeFile, unlink } = await import('node:fs/promises');
+              const { join } = await import('node:path');
+              const { tmpdir } = await import('node:os');
+              const msgFile = join(tmpdir(), `klyro-commit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+              await writeFile(msgFile, cmd.message, 'utf-8');
+              try {
+                const v = await execShell(`git commit -F "${msgFile}"`);
+                queuedAppend({ id: `commit3-${Date.now()}`, kind: 'text', text: v.exitCode === 0 ? `committed ${staged.length} file(s):\n${outCap(v.stdout)}` : `commit failed:\n${outCap(v.stderr || v.stdout)}`, role: 'assistant' });
+              } finally {
+                await unlink(msgFile).catch(() => undefined);
+              }
             }
           } catch (err) {
             queuedAppend({ id: `commit-err-${Date.now()}`, kind: 'error', message: String(err) });
@@ -1852,11 +1997,16 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           queuedAppend({ id: `ed-${Date.now()}`, kind: 'text', text: `editor: ${ed}\nusage: /editor <file>`, role: 'assistant' });
         } else {
           try {
-            const { startBackground } = await import('../tools/shell/background.js');
+            const { startBackgroundArgv } = await import('../tools/shell/background.js');
             const { resolve } = await import('node:path');
             const abs = resolve(cwd, file);
-            const opener = process.platform === 'win32' ? `start "" "${abs}"` : process.platform === 'darwin' ? `open "${abs}"` : `xdg-open "${abs}"`;
-            startBackground(opener, cwd);
+            // argv form (shell:false) — the user-supplied path is never interpolated.
+            const argv = process.platform === 'win32'
+              ? ['cmd', '/c', 'start', '', abs]
+              : process.platform === 'darwin'
+                ? ['open', abs]
+                : ['xdg-open', abs];
+            startBackgroundArgv(argv, cwd);
             queuedAppend({ id: `ed2-${Date.now()}`, kind: 'text', text: `opened ${abs} in background`, role: 'assistant' });
           } catch (err) {
             queuedAppend({ id: `ed-err-${Date.now()}`, kind: 'error', message: String(err) });
@@ -2035,6 +2185,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(a);
           if (!m) {
             queuedAppend({ id: `env-err-${Date.now()}`, kind: 'error', message: 'usage: /env KEY=value' });
+          } else if (['NODE_OPTIONS', 'LD_PRELOAD', 'LD_LIBRARY_PATH'].includes(m[1]!)) {
+            // Same injection-vector blocklist as shell_exec's filteredEnv.
+            queuedAppend({ id: `env-err2-${Date.now()}`, kind: 'error', message: `refusing to set ${m[1]} (process injection vector)` });
           } else {
             process.env[m[1]!] = m[2]!;
             queuedAppend({ id: `env2-${Date.now()}`, kind: 'text', text: `set ${m[1]} (session-only)`, role: 'assistant' });

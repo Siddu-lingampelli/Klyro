@@ -42,6 +42,31 @@ describe('SessionStore', () => {
     expect(obs[0]?.toolName).toBe('read_file');
   });
 
+  it('forks with copied messages and observations', async () => {
+    const r = await store.create({ cwd: '/x', task: 't', config: { model: 'm', maxSteps: 10 } });
+    await store.appendMessage(r.id, { role: 'user', content: 'hi', ts: 1 });
+    await store.appendObservation(r.id, {
+      toolCallId: 'c1', toolName: 'read_file', input: {}, output: 'x',
+      isError: false, startedAt: 1, finishedAt: 2,
+    });
+    const f = await store.fork(r.id);
+    expect(f.id).not.toBe(r.id);
+    expect(f.task).toContain('(fork)');
+    expect(await store.loadMessages(f.id)).toHaveLength(1);
+    expect(await store.loadObservations(f.id)).toHaveLength(1);
+    // original untouched
+    expect(await store.loadMessages(r.id)).toHaveLength(1);
+  });
+
+  it('deletes sessions and artifacts', async () => {
+    const r = await store.create({ cwd: '/x', task: 't', config: { model: 'm', maxSteps: 10 } });
+    await store.appendMessage(r.id, { role: 'user', content: 'hi', ts: 1 });
+    expect(await store.delete(r.id)).toBe(true);
+    expect(await store.get(r.id)).toBeNull();
+    expect(await store.delete(r.id)).toBe(false);
+    expect(await store.list()).toHaveLength(0);
+  });
+
   it('updates status', async () => {
     const r = await store.create({ cwd: '/x', task: 't', config: { model: 'm', maxSteps: 10 } });
     await store.setStatus(r.id, 'complete', 'done');

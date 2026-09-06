@@ -63,8 +63,8 @@ export function assertSafeBaseURL(url: string, opts?: { allowInsecure?: boolean 
     if (/^172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+$/.test(host)) return;
     throw new Error(
       `Refusing to send KLYRO_API_KEY over plaintext HTTP to ${host}. ` +
-        `Use https:// or a localhost/private URL, or set KLYRO_ALLOW_INSECURE=1 to allow insecure HTTP (not recommended). ` +
-        `Example: $Env:KLYRO_ALLOW_INSECURE=\"1\"; klyro`,
+        `Use https:// or a localhost/private URL, or allow once via \`klyro config set allowInsecure true\` (persisted, only for hosts you trust), ` +
+        `or set KLYRO_ALLOW_INSECURE=1 for this terminal only (not recommended).`,
     );
   }
   throw new Error(`Unsupported KLYRO_BASE_URL protocol: ${parsed.protocol}`);

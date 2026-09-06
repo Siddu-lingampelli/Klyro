@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { retryingAdapter, DEFAULT_RETRY, computeBackoff } from './retry.js';
+import { retryingAdapter, DEFAULT_RETRY, computeBackoff, sleepAbortable } from './retry.js';
 import type { ProviderAdapter, StreamEvent, CallRequest } from './provider-adapter.js';
 
 /** Test adapter that emits a scripted sequence per call. */
@@ -132,5 +132,26 @@ describe('retryingAdapter', () => {
     // surfaced (since it had retryable=true but appeared after success
     // markers, this is an edge case).
     expect(events.map((e) => e.kind)).toEqual(['message_start', 'message_end']);
+  });
+
+  it('sleepAbortable wakes early on abort (no stall)', async () => {
+    const ctrl = new AbortController();
+    let slept = 0;
+    const sleep = async (ms: number): Promise<void> => {
+      slept += ms;
+      await new Promise((r) => setTimeout(r, ms));
+    };
+    const p = sleepAbortable(5000, sleep, ctrl.signal);
+    setTimeout(() => ctrl.abort(), 20);
+    const start = Date.now();
+    await p;
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(slept).toBe(5000); // underlying sleep still ran; WE returned early
+  });
+
+  it('sleepAbortable is a no-op without signal', async () => {
+    let called = false;
+    await sleepAbortable(1, async () => { called = true; });
+    expect(called).toBe(true);
   });
 });

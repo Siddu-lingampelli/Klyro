@@ -45,7 +45,7 @@ export const writeFileTool = defineTool<z.infer<typeof InputSchema>, WriteFileOu
       let needsApproval = false;
       try {
         existing = await fs.readFile(resolved, 'utf-8');
-        if (!wasRead(input.path) && existing.length > 200) {
+        if (!wasRead(input.path, ctx.cwd) && existing.length > 200) {
           needsApproval = true;
         }
       } catch {

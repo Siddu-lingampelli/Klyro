@@ -174,6 +174,8 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
   const toolBuffers = new Map<string, { name: string; argsJson: string }>();
   // Map content_block index → tool_use id (persists after tool completes to handle late deltas)
   const indexToToolId = new Map<number, string>();
+  // message_stop already yields message_end — don't emit a second one at EOF.
+  let sawMessageEnd = false;
 
   try {
     while (true) {
@@ -205,7 +207,10 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
         let parsed: AnthropicSseEvent;
         try { parsed = JSON.parse(e.data) as AnthropicSseEvent; } catch { continue; }
         const out = translateSse(e.event, parsed, toolBuffers, indexToToolId);
-        for (const ev of out) yield ev;
+        for (const ev of out) {
+          if (ev.kind === 'message_end') sawMessageEnd = true;
+          yield ev;
+        }
       }
     }
   } catch (err) {
@@ -216,7 +221,7 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
     reader.releaseLock();
   }
 
-  yield { kind: 'message_end', finishReason: 'stop' };
+  if (!sawMessageEnd) yield { kind: 'message_end', finishReason: 'stop' };
 }
 
 function translateSse(
@@ -331,6 +336,19 @@ function toAnthropicMessages(messages: Message[]): AnthropicMessage[] {
           return { type: 'text', text: '' };
         }),
       };
+    }
+    if (m.role === 'tool') {
+      // Anthropic has no tool role: tool_result blocks ride a user message,
+      // paired with the preceding assistant tool_use by tool_use_id.
+      const content = m.content.map((b): AnthropicMessage['content'][number] => {
+        if (b.kind === 'tool_result') {
+          const out = typeof b.output === 'string' ? b.output : JSON.stringify(b.output ?? '');
+          return { type: 'tool_result', tool_use_id: b.toolCallId, content: out, is_error: b.isError };
+        }
+        if (b.kind === 'text') return { type: 'text', text: b.text };
+        return { type: 'text', text: '' };
+      });
+      return { role: 'user' as const, content };
     }
     // 'system' is hoisted to the top-level `system` field; never appears
     // in the messages array passed to the adapter.

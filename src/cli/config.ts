@@ -161,8 +161,13 @@ function getByPath(obj: Record<string, unknown>, dotted: string): unknown {
   return cur;
 }
 
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function setByPath(obj: Record<string, unknown>, dotted: string, value: unknown): void {
   const parts = dotted.split('.');
+  if (parts.some((p) => UNSAFE_KEYS.has(p))) {
+    throw new Error(`refusing to set prototype-polluting key: ${dotted}`);
+  }
   let cur: Record<string, unknown> = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const p = parts[i]!;
@@ -175,6 +180,7 @@ function setByPath(obj: Record<string, unknown>, dotted: string, value: unknown)
 
 function deleteByPath(obj: Record<string, unknown>, dotted: string): boolean {
   const parts = dotted.split('.');
+  if (parts.some((p) => UNSAFE_KEYS.has(p))) return false;
   let cur: Record<string, unknown> = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const p = parts[i]!;
@@ -288,7 +294,12 @@ export async function loadMergedConfig(cwd = process.cwd(), flags: Record<string
   const merged: Record<string, unknown> = {};
   for (const layer of layers) {
     for (const [k, v] of Object.entries(layer)) {
-      if (v !== undefined) setByPath(merged, k, v);
+      if (v === undefined) continue;
+      try {
+        setByPath(merged, k, v);
+      } catch {
+        continue; // e.g. prototype-polluting keys in a config file — skip, never crash startup
+      }
     }
   }
   return merged;

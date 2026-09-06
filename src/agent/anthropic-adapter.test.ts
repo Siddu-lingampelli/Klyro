@@ -190,6 +190,35 @@ describe('toAnthropicMessages', () => {
     ]);
   });
 
+  it('maps role=tool messages to user tool_result blocks (no data loss)', () => {
+    const out = toAnthropicMessages([
+      { role: 'assistant', content: [{ kind: 'tool_use', id: 'toolu_1', name: 'read_file', input: {} }] },
+      { role: 'tool', content: [{ kind: 'tool_result', toolCallId: 'toolu_1', name: 'read_file', output: 'file bytes', isError: false }] },
+    ]);
+    expect(out[1]?.role).toBe('user');
+    expect(out[1]?.content).toEqual([
+      { type: 'tool_result', tool_use_id: 'toolu_1', content: 'file bytes', is_error: false },
+    ]);
+  });
+
+  it('emits exactly one message_end for a normal stream', async () => {
+    const fetchImpl = makeFetch(
+      sse([
+        ['message_start', { type: 'message_start' }],
+        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } }],
+        ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+        ['message_stop', { type: 'message_stop' }],
+      ]),
+    );
+    const adapter = anthropicAdapter({ apiKey: 'k', baseURL: 'https://api.example.com', fetchImpl });
+    const req: CallRequest = { model: 'm', messages: [{ role: 'user', content: [{ kind: 'text', text: 'hi' }] }], tools: [] };
+    const kinds: string[] = [];
+    for await (const ev of adapter.stream(req)) kinds.push(ev.kind);
+    expect(kinds.filter((k) => k === 'message_end')).toHaveLength(1);
+    expect(kinds).toContain('text_delta');
+  });
+
   it('hoists role=system into top-level system (not in messages)', () => {
     const msgs: Message[] = [
       { role: 'system', content: [{ kind: 'text', text: 'sysprompt' }] },

@@ -45,6 +45,20 @@ describe('shellExecTool', () => {
     });
   });
 
+  it('caps full output of infinite emitters (no OOM/disk fill)', async () => {
+    await withTempCwd(async (_cwd, ctx) => {
+      const flood = IS_WIN
+        ? 'powershell -NoProfile -Command "while($true){ \'x\'*100 }"'
+        : `node -e "while(true) console.log('x'.repeat(100))"`;
+      const r = await shellExecTool.execute({ command: flood, timeoutMs: 3000 }, ctx);
+      assertExactOk(r);
+      // Times out (killed), output bounded, full file capped at ~512 KiB.
+      expect(r.value.timedOut).toBe(true);
+      expect(r.value.truncated).toBe(true);
+      expect(r.value.stdout.length).toBeLessThanOrEqual(40000);
+    });
+  }, 15000);
+
   it('blocks dangerous patterns', async () => {
     const ctx = makeCtx();
     const r = await shellExecTool.execute({ command: 'rm -rf /' }, ctx);

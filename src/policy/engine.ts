@@ -261,12 +261,24 @@ export const writeFileCwdRule: PolicyRule = {
   },
 };
 
-/** Reads > 5 MiB require confirmation (avoid filling the context window). */
+/**
+ * Reads > readSizeAskMiB require confirmation (avoid filling the context).
+ * Stats the file directly — the old sizeBytes input never existed in the
+ * read_file schema, so this rule never fired (dead code until now).
+ */
 export const readFileSizeRule: PolicyRule = {
   name: 'read-file-size',
   evaluate(call, ctx) {
     if (call.name !== 'read_file') return null;
-    const size = typeof call.input.sizeBytes === 'number' ? call.input.sizeBytes : 0;
+    const p = asString(call.input.path);
+    if (!p) return null;
+    let size = 0;
+    try {
+      const { resolved } = resolveWithinCwd(ctx.cwd, p);
+      size = fsSync.statSync(resolved).size;
+    } catch {
+      return null; // unreadable → other rules/tools report it
+    }
     if (size > ctx.config.readSizeAskMiB * 1024 * 1024) {
       if (ctx.nonInteractive) return { action: 'deny', reason: `file > ${ctx.config.readSizeAskMiB} MiB` };
       return { action: 'ask', reason: `file is ${(size / 1024 / 1024).toFixed(1)} MiB` };
@@ -274,6 +286,22 @@ export const readFileSizeRule: PolicyRule = {
     return null;
   },
 };
+
+/**
+ * Deep-clone a PolicyConfig so per-session tweaks (/mode, /sandbox) never
+ * leak across engines via the shared DEFAULT_POLICY_CONFIG reference.
+ */
+export function clonePolicyConfig(base: PolicyConfig = DEFAULT_POLICY_CONFIG): PolicyConfig {
+  return {
+    ...base,
+    shellAllow: [...base.shellAllow],
+    shellDeny: [...base.shellDeny],
+    allow: [...(base.allow ?? [])],
+    deny: [...(base.deny ?? [])],
+    ask: [...(base.ask ?? [])],
+    additionalDirs: [...(base.additionalDirs ?? [])],
+  };
+}
 
 /** Convenience: evaluate via safe() so a buggy rule doesn't crash the loop. */
 export async function evaluatePolicy(
@@ -290,3 +318,5 @@ export async function evaluatePolicy(
 // (path-guard is already in policy/, and tools/ depend on it. This keeps
 //  policy/ depending only on tools/normalize, no other tool code.)
 import * as path from 'node:path';
+import * as fsSync from 'node:fs';
+import { resolveWithinCwd } from './path-guard.js';

@@ -114,33 +114,81 @@ export class SessionStore {
   }
 
   async create(opts: { cwd: string; task: string; config: SessionConfig }): Promise<SessionRecord> {
-    await this.ensureDir();
-    const id = randomUUID();
-    const now = Date.now();
-    const record: SessionRecord = {
-      id,
-      cwd: opts.cwd,
-      task: opts.task,
-      status: 'open',
-      createdAt: now,
-      updatedAt: now,
-      config: opts.config,
-    };
-    (record as unknown as Record<string, unknown>).title = this.titleFor(opts.task);
-    await fs.writeFile(path.join(this.dir, `${id}.json`), JSON.stringify({ record, messages: [], observations: [] }, null, 2));
-    await this.appendJsonl(id, { type: 'session.create', record, ts: now });
-    const idx = await this.readIndex();
-    idx[id] = record;
-    await this.writeIndex(idx);
-    // per-project index
-    try {
-      const pp = this.perProjectIndexPath(opts.cwd);
-      let pIdx: Record<string, SessionRecord> = {};
-      try { pIdx = JSON.parse(await fs.readFile(pp, 'utf-8')); } catch {}
-      pIdx[id] = record;
-      await fs.writeFile(pp, JSON.stringify(pIdx, null, 2), 'utf-8');
-    } catch {}
-    return record;
+    // Locked: the index read-modify-write below races under concurrent creates.
+    return this.withLock('index', async () => {
+      await this.ensureDir();
+      const id = randomUUID();
+      const now = Date.now();
+      const record: SessionRecord = {
+        id,
+        cwd: opts.cwd,
+        task: opts.task,
+        status: 'open',
+        createdAt: now,
+        updatedAt: now,
+        config: opts.config,
+      };
+      (record as unknown as Record<string, unknown>).title = this.titleFor(opts.task);
+      await fs.writeFile(path.join(this.dir, `${id}.json`), JSON.stringify({ record, messages: [], observations: [] }, null, 2));
+      await this.appendJsonl(id, { type: 'session.create', record, ts: now });
+      const idx = await this.readIndex();
+      idx[id] = record;
+      await this.writeIndex(idx);
+      // per-project index
+      try {
+        const pp = this.perProjectIndexPath(opts.cwd);
+        let pIdx: Record<string, SessionRecord> = {};
+        try { pIdx = JSON.parse(await fs.readFile(pp, 'utf-8')); } catch {}
+        pIdx[id] = record;
+        await fs.writeFile(pp, JSON.stringify(pIdx, null, 2), 'utf-8');
+      } catch {}
+      return record;
+    });
+  }
+
+  /**
+   * Fork a session: new id + copied messages/observations so the fork
+   * continues with full context instead of starting blank.
+   */
+  async fork(id: string, taskSuffix = ' (fork)'): Promise<SessionRecord> {
+    const data = await this.readSession(id);
+    const forked = await this.create({
+      cwd: data.record.cwd,
+      task: `${data.record.task}${taskSuffix}`,
+      config: data.record.config,
+    });
+    await this.withLock(forked.id, async () => {
+      const fresh = await this.readSession(forked.id);
+      fresh.messages = data.messages.map((m) => ({ ...m }));
+      fresh.observations = data.observations.map((o) => ({ ...o }));
+      await this.writeSession(forked.id, fresh);
+    });
+    await this.appendJsonl(forked.id, { type: 'session.fork', from: id, ts: Date.now() });
+    return forked;
+  }
+
+  /** Delete a session and all its artifacts (record, transcript, jsonl, indexes). */
+  async delete(id: string): Promise<boolean> {
+    return this.withLock('index', async () => {
+      const rec = await this.get(id);
+      if (!rec) return false;
+      for (const f of [`${id}.json`, `${id}.jsonl`]) {
+        try {
+          await fs.unlink(path.join(this.dir, f));
+        } catch { /* ignore */ }
+      }
+      const idx = await this.readIndex();
+      delete idx[id];
+      await this.writeIndex(idx);
+      try {
+        const pp = this.perProjectIndexPath(rec.cwd);
+        const raw = await fs.readFile(pp, 'utf-8');
+        const pIdx = JSON.parse(raw) as Record<string, SessionRecord>;
+        delete pIdx[id];
+        await fs.writeFile(pp, JSON.stringify(pIdx, null, 2), 'utf-8');
+      } catch { /* ignore */ }
+      return true;
+    });
   }
 
   private jsonlPath(id: string): string { return path.join(this.dir, `${id}.jsonl`); }

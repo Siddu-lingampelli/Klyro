@@ -36,6 +36,10 @@ const FULL_OUTPUT_DIR = (() => {
 
 // Persistent cwd across calls (3.3)
 let persistentCwd: string | null = null;
+/** Reset the sticky cwd (e.g. after /cd changes the session directory). */
+export function resetPersistentCwd(): void {
+  persistentCwd = null;
+}
 
 // Filtered env — only safe vars, secrets stripped
 const ALLOWED_ENV_PREFIXES = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'NODE_', 'NPM_', 'PNPM_', 'YARN_'];
@@ -96,6 +100,19 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /\|\|\s*rm\s+-rf/, reason: 'chained rm -rf' },
 ];
 
+/**
+ * Shared dangerous-command check (also used by background shells).
+ * Returns the block reason, or null when the command is not hard-blocked.
+ * NOTE: this covers destructive patterns only — it is NOT an allowlist.
+ * Interactive/user-typed commands intentionally bypass it.
+ */
+export function findBlockedReason(command: string): string | null {
+  for (const { pattern, reason } of DANGEROUS_PATTERNS) {
+    if (pattern.test(command)) return reason;
+  }
+  return null;
+}
+
 export interface ShellOutput {
   command: string;
   exitCode: number | null;
@@ -124,10 +141,9 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
           throw Object.assign(new Error(`Interactive command blocked: ${input.command.split(' ')[0]} — hint: use non-interactive mode or run in background`), { code: TOOL_ERROR_CODES.COMMAND_DENIED });
         }
       }
-      for (const { pattern, reason } of DANGEROUS_PATTERNS) {
-        if (pattern.test(input.command)) {
-          throw Object.assign(new Error(`Command blocked: ${reason}`), { code: TOOL_ERROR_CODES.COMMAND_DENIED });
-        }
+      const blocked = findBlockedReason(input.command);
+      if (blocked) {
+        throw Object.assign(new Error(`Command blocked: ${blocked}`), { code: TOOL_ERROR_CODES.COMMAND_DENIED });
       }
       // Persistent cwd
       let cwd = persistentCwd ?? ctx.cwd;
@@ -148,6 +164,8 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
       const env = filteredEnv(input.env);
       const start = Date.now();
 
+      // Detached on POSIX so timeout kills the whole process GROUP
+      // (child.kill alone orphans grandchildren holding the pipes).
       const child = spawn(input.command, {
         cwd,
         env: env as NodeJS.ProcessEnv,
@@ -155,6 +173,7 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         signal: ctx.signal,
+        detached: process.platform !== 'win32',
       });
 
       const stdoutChunks: Buffer[] = [];
@@ -163,10 +182,20 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
       const fullStderr: Buffer[] = [];
       let totalOut = 0;
       let totalErr = 0;
+      // Full-output caps: an infinite emitter (e.g. `yes`) must not OOM the
+      // process or fill the disk. Past the cap we keep counting but drop bytes.
+      let fullOutBytes = 0;
+      let fullErrBytes = 0;
+      const MAX_FULL_BYTES = 512 * 1024;
       let truncated = false;
 
       child.stdout?.on('data', (chunk: Buffer) => {
-        fullStdout.push(chunk);
+        if (fullOutBytes + chunk.length <= MAX_FULL_BYTES) {
+          fullStdout.push(chunk);
+          fullOutBytes += chunk.length;
+        } else {
+          truncated = true;
+        }
         if (totalOut + chunk.length > MAX_OUTPUT_CHARS) {
           truncated = true;
           // Keep head+tail: drop middle, keep first half and last half later
@@ -177,7 +206,12 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
         totalOut += chunk.length;
       });
       child.stderr?.on('data', (chunk: Buffer) => {
-        fullStderr.push(chunk);
+        if (fullErrBytes + chunk.length <= MAX_FULL_BYTES) {
+          fullStderr.push(chunk);
+          fullErrBytes += chunk.length;
+        } else {
+          truncated = true;
+        }
         if (totalErr + chunk.length > MAX_OUTPUT_CHARS) {
           truncated = true;
           if (stderrChunks.length < 10) stderrChunks.push(chunk);
@@ -209,7 +243,14 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
               spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true });
             } catch { /* already gone */ }
           } else {
-            try { child.kill('SIGKILL'); } catch { /* already dead */ }
+            // Kill the whole process group (spawned detached); fall back to
+            // the direct child if the group signal fails.
+            try {
+              if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
+              else child.kill('SIGKILL');
+            } catch {
+              try { child.kill('SIGKILL'); } catch { /* already dead */ }
+            }
           }
           finish({ code: null, signal: 'SIGKILL', timedOut: true });
         }, timeoutMs);

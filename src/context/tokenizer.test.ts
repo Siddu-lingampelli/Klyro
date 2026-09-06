@@ -34,4 +34,27 @@ describe('tokenizer', () => {
     // Last message preserved.
     expect((out[out.length - 1].content[0] as { text: string }).text).toBe('done');
   });
+
+  it('Phase-3 drops keep tool_use/tool_result pairs intact', () => {
+    const messages: Message[] = [{ role: 'user', content: [text('task')] }];
+    for (let i = 0; i < 8; i++) {
+      messages.push({ role: 'assistant', content: [toolUse(`c${i}`, 'read_file', { path: 'f' })] });
+      messages.push({ role: 'tool', content: [toolResult(`c${i}`, 'read_file', 'y'.repeat(300))] });
+    }
+    messages.push({ role: 'assistant', content: [text('done')] });
+    const { messages: out } = compressTranscript(undefined, messages, { total: 150, reservedOutput: 20 });
+    // Every remaining tool message must still have its assistant turn (no orphans).
+    const useIds = new Set<string>();
+    for (const m of out) {
+      if (m.role === 'assistant') {
+        for (const b of m.content) if (b.kind === 'tool_use') useIds.add(b.id);
+      }
+    }
+    for (const m of out) {
+      if (m.role !== 'tool') continue;
+      for (const b of m.content) {
+        if (b.kind === 'tool_result') expect(useIds.has(b.toolCallId)).toBe(true);
+      }
+    }
+  });
 });

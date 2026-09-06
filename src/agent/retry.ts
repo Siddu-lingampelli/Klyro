@@ -69,6 +69,32 @@ async function* streamWithAbort(
   }
 }
 
+/**
+ * Sleep that resolves early when `signal` aborts (never rejects — callers
+ * check `signal.aborted` themselves after waking).
+ */
+export function sleepAbortable(
+  ms: number,
+  sleep: (ms: number) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  // No signal: plain sleep (identical to the old behavior).
+  if (!signal) return sleep(ms);
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      signal.removeEventListener('abort', finish);
+      resolve();
+    };
+    signal.addEventListener('abort', finish, { once: true });
+    void sleep(ms).then(finish);
+  });
+}
+
 export function computeBackoff(attempt: number, baseMs: number, maxMs: number): number {
   const exp = Math.min(maxMs, baseMs * 2 ** attempt);
   // Jitter: ±25% to spread thundering herds.
@@ -129,7 +155,9 @@ export function retryingAdapter(inner: ProviderAdapter, opts: Partial<RetryOptio
           return;
         }
         const delay = computeBackoff(attempt, cfg.baseMs, cfg.maxMs);
-        if (delay > 0) await sleep(delay);
+        // Abort-aware backoff: Ctrl+C during the sleep must stop promptly
+        // instead of stalling up to maxMs before noticing.
+        if (delay > 0) await sleepAbortable(delay, sleep, effectiveSignal);
       }
     },
   };

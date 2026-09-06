@@ -57,8 +57,19 @@ export function toToolError(err: unknown, fallbackCode: ToolErrorCode = TOOL_ERR
   return { code: fallbackCode, message: String(err) };
 }
 
+const CUSTOM_TOOL_CODES = new Set([
+  'MATCH_NOT_FOUND',
+  'MATCH_AMBIGUOUS',
+  'UNKNOWN_TOOL',
+  'INVALID_INPUT',
+  'INVALID_PATCH',
+  'HUNK_MISMATCH',
+  'POLICY_DENIED',
+  'STALE',
+]);
+
 function isToolErrorCode(code: string): boolean {
-  return (Object.values(TOOL_ERROR_CODES) as string[]).includes(code) || code === 'MATCH_NOT_FOUND' || code === 'MATCH_AMBIGUOUS' || code === 'UNKNOWN_TOOL' || code === 'INVALID_INPUT';
+  return (Object.values(TOOL_ERROR_CODES) as string[]).includes(code) || CUSTOM_TOOL_CODES.has(code);
 }
 
 function mapNodeErrorCode(code: string | undefined): ToolErrorCode {

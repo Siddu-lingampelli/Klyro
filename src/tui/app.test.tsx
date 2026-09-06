@@ -615,6 +615,35 @@ describe('App', () => {
     expect(frame).not.toContain('user message number 0');
   });
 
+  it('renders the approval modal when a prompt is pending (no deadlock)', async () => {
+    const { TuiApprovalBridge } = await import('./approval.js');
+    const bridge = new TuiApprovalBridge();
+    const { lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        approvalBridge={bridge}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    let choice: unknown;
+    const pending = bridge
+      .ask({ toolName: 'shell_exec', reason: 'not in allowlist', summary: 'echo hi' })
+      .then((c) => {
+        choice = c;
+      });
+    await new Promise((r) => setTimeout(r, 80));
+    // The modal must actually render — previously it never mounted, so every
+    // policy 'ask' hung the runtime forever.
+    expect(lastFrame() ?? '').toMatch(/approval needed/i);
+    expect(bridge.resolve('deny')).toBe(true);
+    await pending;
+    expect(choice).toBe('deny');
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App
