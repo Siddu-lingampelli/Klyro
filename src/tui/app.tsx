@@ -260,17 +260,17 @@ export function App(props: AppProps): React.JSX.Element {
             })();
             const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? '✗' : `${gr.totalMs}ms`;
             return (
-              <Box key={gr.id} flexDirection="column" marginBottom={0}>
+              <Box key={gr.id} flexDirection="column" marginBottom={1}>
                 <Box>
                   <Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text>
                   <Text color={gr.status === 'running' ? tokens.ansi.warn as string : undefined}>{isExpanded ? g('expanded') : g('collapsed')} {verbLine}</Text>
                   <Text color={tokens.ansi.dim as string}>  {right}</Text>
                 </Box>
                 {isExpanded ? gr.items.map((it) => (
-                  <Box key={it.id} paddingLeft={2}>
-                    <Text color={tokens.ansi.guide as string}>    {g('end')} </Text>
-                    <Text color={it.isError ? tokens.ansi.err as string : tokens.ansi.dim as string}>{it.name} {it.args.slice(0, 80)}</Text>
-                    {it.result ? <Text color={tokens.ansi.dim as string}> · {String(it.result).slice(0, 80)}</Text> : null}
+                  <Box key={it.id} paddingLeft={4} marginTop={0}>
+                    <Text color={tokens.ansi.guide as string}>{g('end')} </Text>
+                    <Text color={it.isError ? tokens.ansi.err as string : undefined}>{it.name}</Text>
+                    <Text color={tokens.ansi.dim as string}> {it.args.slice(0, 60)}</Text>
                   </Box>
                 )) : null}
               </Box>
@@ -278,29 +278,28 @@ export function App(props: AppProps): React.JSX.Element {
           }
           const it = item as TranscriptItem;
           if (it.kind === 'text' && it.role === 'user') {
-            return <Box key={it.id}><Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text><Text>{it.text}</Text></Box>;
+            return <Box key={it.id} marginBottom={1}><Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text><Text>{it.text}</Text></Box>;
           }
           if (it.kind === 'text') {
-            // Check if it's queued indicator
-            if (it.text.startsWith('queued:')) return <Box key={it.id} paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {it.text}  esc to drop</Text></Box>;
+            if (it.text.startsWith('queued:')) return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {it.text}  esc to drop</Text></Box>;
             return (
-              <Box key={it.id} flexDirection="column">
+              <Box key={it.id} flexDirection="column" marginBottom={1}>
                 <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.accent as string}>{g('agentBullet')} Klyro</Text></Box>
-                <Box paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   </Text><Text>{it.text}</Text></Box>
+                <Box paddingLeft={2} marginTop={0}><Text color={tokens.ansi.dim as string}>  {g('guide')}   </Text><Text wrap="wrap">{it.text}</Text></Box>
               </Box>
             );
           }
-          if (it.kind === 'error') return <Box key={it.id} paddingLeft={2}><Text color={tokens.ansi.err as string}>  {g('guide')}   ✗ {it.message}</Text></Box>;
-          if (it.kind === 'policy') return <Box key={it.id} paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   [policy] {it.action} {it.name}</Text></Box>;
-          if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
+          if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.err as string}>  {g('guide')}   ✗ {it.message}</Text></Box>;
+          if (it.kind === 'policy') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   [policy] {it.action} {it.name}</Text></Box>;
+          if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
           if (it.kind === 'diff') return (
-            <Box key={it.id} flexDirection="column" paddingLeft={2}>
-              <Text bold>{it.summary ?? 'Diff'}</Text>
+            <Box key={it.id} flexDirection="column" paddingLeft={2} marginBottom={1}>
+              <Text bold color={tokens.ansi.soft as string}>{it.summary ?? 'Diff'}</Text>
               {it.hunks.map((h, i) => (
-                <Box key={i} flexDirection="column" marginTop={1}>
+                <Box key={i} flexDirection="column" marginTop={0}>
                   <Text color={tokens.ansi.soft as string}>{h.path}</Text>
                   {h.lines.map((l, j) => (
-                    <Text key={j} color={l.kind === 'add' ? tokens.ansi.ok as string : l.kind === 'remove' ? tokens.ansi.err as string : tokens.ansi.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}</Text>
+                    <Text key={j} wrap="wrap" color={l.kind === 'add' ? tokens.ansi.ok as string : l.kind === 'remove' ? tokens.ansi.err as string : tokens.ansi.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}</Text>
                   ))}
                 </Box>
               ))}
@@ -309,11 +308,10 @@ export function App(props: AppProps): React.JSX.Element {
           return null;
         })}
         {status.status === 'running' && !streamingIdRef.current ? (
-          <Box paddingLeft={2}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.dim as string}>Thinking...</Text><Text color={tokens.ansi.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
+          <Box paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.dim as string}>Thinking...</Text><Text color={tokens.ansi.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
         ) : null}
-        {/* Phase rule §11.1 and Plan §11.2 */}
         {plan.length > 0 ? (
-          <Box flexDirection="column" paddingLeft={2} marginTop={1}>
+          <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
             <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
             {plan.slice(0, 8).map((p) => (
               <Box key={p.id}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.ansi.ok as string : p.status === 'in_progress' ? tokens.ansi.accent as string : tokens.ansi.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {p.title}</Text></Box>
@@ -322,7 +320,7 @@ export function App(props: AppProps): React.JSX.Element {
           </Box>
         ) : null}
         {status.status === 'done' && transcript.some((x) => x.kind === 'file_changed') ? (
-          <Box paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {transcript.filter((x) => x.kind === 'file_changed').length} files · /diff</Text></Box>
+          <Box paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {transcript.filter((x) => x.kind === 'file_changed').length} files · /diff</Text></Box>
         ) : null}
         </Box>
         {/* Slider — vertical line + dot for chat scroll */}
