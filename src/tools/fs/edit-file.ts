@@ -121,8 +121,12 @@ export const editFileTool = defineTool<z.infer<typeof InputSchema>, EditFileOutp
         );
       }
       let next = replaceAll ? original.split(findStr).join(input.replace) : original.replace(findStr, input.replace);
-      // Preserve EOL
-      if (eol === '\r\n') next = next.replace(/\n/g, '\r\n');
+      // Preserve EOL: normalize then convert
+      if (eol === '\r\n') {
+        next = next.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+      } else {
+        next = next.replace(/\r\n/g, '\n');
+      }
       // Preserve trailing newline
       if (hasTrailingNewline && !next.endsWith('\n')) next += eol;
       else if (!hasTrailingNewline && next.endsWith(eol)) next = next.slice(0, -eol.length);

@@ -78,7 +78,11 @@ export function compressTranscript(
   messages: Message[],
   budget: TokenBudget,
 ): { system: string | undefined; messages: Message[]; dropped: number } {
-  const result = messages.slice();
+  // Deep copy to avoid mutating original messages (which are also stored in transcript/persistence)
+  const result: Message[] = messages.map((m) => ({
+    role: m.role,
+    content: m.content.map((b) => ({ ...b, output: (b as { output?: unknown }).output } as ContentBlock)),
+  }));
   let dropped = 0;
 
   // Phase 1: find tool_call_ids referenced in any later assistant message.
@@ -95,12 +99,13 @@ export function compressTranscript(
     if (!m || m.role !== 'tool') continue;
     for (const b of m.content) {
       if (b.kind !== 'tool_result') continue;
-      if (!consumed.has(b.toolCallId)) {
+      const block = b as { toolCallId: string; output: unknown };
+      if (!consumed.has(block.toolCallId)) {
         // Drop the observation entirely.
-        b.output = '[earlier observation removed to fit context]';
+        (b as { output: unknown }).output = '[earlier observation removed to fit context]';
         dropped++;
-      } else if (typeof b.output === 'string' && b.output.length > 400) {
-        b.output = b.output.slice(0, 400) + '... [truncated]';
+      } else if (typeof block.output === 'string' && block.output.length > 400) {
+        (b as { output: unknown }).output = block.output.slice(0, 400) + '... [truncated]';
       }
     }
   }

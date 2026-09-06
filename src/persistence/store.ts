@@ -72,7 +72,18 @@ export class SessionStore {
   }
 
   private async writeIndex(idx: Record<string, SessionRecord>): Promise<void> {
-    await fs.writeFile(this.indexPath, JSON.stringify(idx, null, 2));
+    const tmp = `${this.indexPath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    await fs.writeFile(tmp, JSON.stringify(idx, null, 2), 'utf-8');
+    try {
+      const fh = await fs.open(tmp, 'r+');
+      try { await fh.sync(); } finally { await fh.close(); }
+    } catch { /* ignore on Windows */ }
+    try {
+      await fs.rename(tmp, this.indexPath);
+    } catch {
+      await fs.unlink(tmp).catch(() => undefined);
+      throw new Error('Failed to write sessions index');
+    }
   }
 
   async create(opts: { cwd: string; task: string; config: SessionConfig }): Promise<SessionRecord> {
@@ -102,10 +113,31 @@ export class SessionStore {
 
   private async writeSession(id: string, data: { record: SessionRecord; messages: StoredMessage[]; observations: StoredObservation[] }): Promise<void> {
     data.record.updatedAt = Date.now();
-    await fs.writeFile(path.join(this.dir, `${id}.json`), JSON.stringify(data, null, 2));
-    const idx = await this.readIndex();
-    idx[id] = data.record;
-    await this.writeIndex(idx);
+    const target = path.join(this.dir, `${id}.json`);
+    const tmp = `${target}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8');
+    try {
+      const fh = await fs.open(tmp, 'r+');
+      try { await fh.sync(); } finally { await fh.close(); }
+    } catch { /* ignore */ }
+    try {
+      await fs.rename(tmp, target);
+    } catch {
+      await fs.unlink(tmp).catch(() => undefined);
+      throw new Error(`Failed to write session ${id}`);
+    }
+    // Update index with simple retry for concurrent writers (optimistic)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const idx = await this.readIndex();
+        idx[id] = data.record;
+        await this.writeIndex(idx);
+        return;
+      } catch (err) {
+        if (attempt === 2) throw err;
+        await new Promise((r) => setTimeout(r, 10 * (attempt + 1)));
+      }
+    }
   }
 
   async appendMessage(id: string, message: StoredMessage): Promise<void> {

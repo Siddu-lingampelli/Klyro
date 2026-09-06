@@ -65,6 +65,9 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /rm\s+-rf?\s+\.\s*($|[;&|])/, reason: 'recursive delete current directory' },
   { pattern: /rm\s+-rf?\s+\*\s*($|[;&|])/, reason: 'recursive delete all files via *' },
   { pattern: /rm\s+-rf?\s+\.\/\*\s*($|[;&|])/, reason: 'recursive delete all files' },
+  { pattern: /rm\s+-rf?\s+~(\/|$)/, reason: 'recursive delete home directory via ~' },
+  { pattern: /rm\s+-rf?\s+\$HOME\b/, reason: 'recursive delete home via $HOME' },
+  { pattern: /rm\s+-rf?\s+\$PWD\b/, reason: 'recursive delete via $PWD' },
   { pattern: /del\s+\/s\s+\/q\s+[a-z]:\\/i, reason: 'recursive delete on Windows drive root' },
   { pattern: /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/, reason: 'fork bomb' },
   { pattern: /bomb\(\)\s*\{\s*bomb\|bomb/, reason: 'fork bomb variant' },
@@ -72,7 +75,8 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /mkfs(\.|\s)/, reason: 'format filesystem' },
   { pattern: /dd\s+.*of=\/dev\//, reason: 'dd write to device' },
   { pattern: /chmod\s+-R\s+777\s+\//, reason: 'chmod 777 on root' },
-  { pattern: /curl.*\|\s*(sh|bash|python|perl|ruby)/i, reason: 'curl|sh to unknown host' },
+  { pattern: /curl.*\|\s*(sh|bash|zsh|python|python3|perl|ruby|php)/i, reason: 'curl|sh to unknown host' },
+  { pattern: /wget.*\|\s*(sh|bash|python|perl|ruby)/i, reason: 'wget|sh pipe' },
   { pattern: /rm\s+-rf\s+--no-preserve-root\s+\//, reason: 'recursive delete --no-preserve-root' },
 ];
 

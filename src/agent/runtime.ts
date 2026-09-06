@@ -515,7 +515,14 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
 
 function redactOutput(v: unknown): unknown {
   if (typeof v === 'string') return redact(v);
-  if (v && typeof v === 'object') return v; // structured outputs are not redacted wholesale
+  if (Array.isArray(v)) return v.map((e) => redactOutput(e));
+  if (v && typeof v === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      out[k] = redactOutput(val);
+    }
+    return out;
+  }
   return v;
 }
 
