@@ -1,6 +1,6 @@
 /**
- * Klyro TUI — opencode-perfect — TUI_DESIGN.md §2-7 + user request: no clumsy words, smooth scroll like opencode
- * Full-screen alt takeover when supported, inline degrade otherwise. Clean wrap at word boundaries, slider │●.
+ * Klyro TUI — opencode-clean — no clumsy words, correct wrap, markdown, scroll
+ * Header 3 rows, guide │ at col2, ● Klyro accent, prose wrapped at word boundaries
  */
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
@@ -42,7 +42,7 @@ function Header({ cwd, model, version, width }: { cwd: string; model: string; ve
   );
 }
 
-type Verb = 'Read' | 'Listed' | 'Searched' | 'Ran' | 'Started' | 'Edited' | 'Created' | 'Checked git' | 'Fetched' | 'Searched web' | 'Mapped' | 'Called';
+type Verb = 'Read' | 'Listed' | 'Searched' | 'Ran' | 'Edited' | 'Created' | 'Checked git' | 'Fetched' | 'Searched web' | 'Called';
 function verbForTool(name: string): Verb {
   if (name === 'read_file') return 'Read' as Verb;
   if (name === 'list_directory') return 'Listed' as Verb;
@@ -73,6 +73,25 @@ function groupTools(items: TranscriptItem[]): Array<TranscriptItem | Group> {
   flush(); return out;
 }
 
+// Simple markdown: **bold** → bold, keep lists/tables, wrap at word boundaries
+function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width?: number }) {
+  // Split by **bold** segments
+  const parts: React.ReactNode[] = [];
+  let last = 0;
+  const re = /\*\*(.+?)\*\*/g;
+  let m: RegExpExecArray | null;
+  let idx = 0;
+  while ((m = re.exec(text))) {
+    if (m.index > last) parts.push(<Text key={`t-${idx++}`} color={dim ? tokens.ansi.dim as string : undefined} wrap="wrap">{text.slice(last, m.index)}</Text>);
+    parts.push(<Text key={`b-${idx++}`} bold color={dim ? undefined : tokens.ansi.soft as string} wrap="wrap">{m[1]}</Text>);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push(<Text key={`t-${idx++}`} color={dim ? tokens.ansi.dim as string : undefined} wrap="wrap">{text.slice(last)}</Text>);
+  if (parts.length === 0) return <Text color={dim ? tokens.ansi.dim as string : undefined} wrap="wrap">{text}</Text>;
+  // Render as single line with bold segments — Ink will wrap the parent Box
+  return <Text wrap="wrap">{parts}</Text>;
+}
+
 export function App(props: AppProps): React.JSX.Element {
   const { stdout } = useStdout();
   const [transcript, setTranscript] = useState<TranscriptItem[]>(props.initialTranscript ?? []);
@@ -86,13 +105,12 @@ export function App(props: AppProps): React.JSX.Element {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [scrollOffset, setScrollOffset] = useState(0);
   const streamingIdRef = useRef<string | null>(null);
-  const placeholder = 'Message Klyro…';
 
   const width = stdout?.columns ?? 100;
   const height = stdout?.rows ?? 30;
   const isFullscreen = props.isFullscreen ?? false;
-  const viewportH = Math.max(5, height - 10);
   const grouped = groupTools(transcript);
+  const viewportH = Math.max(5, height - 10);
   const totalRows = grouped.length + (plan.length > 0 ? 1 : 0) + 2;
   const maxOffset = Math.max(0, totalRows - viewportH);
   const isAtBottom = scrollOffset >= maxOffset;
@@ -141,13 +159,7 @@ export function App(props: AppProps): React.JSX.Element {
     if (key.ctrl && inputStr === 'o') { const groups = grouped.filter((x): x is Group => typeof (x as Group).verb === 'string'); const last = groups[groups.length - 1]; if (last) toggleGroup(last.id); return; }
     if (status.status === 'running') {
       if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
-      if (key.return) {
-        const v = input.trim(); if (!v) return;
-        if (queuedInputs.length >= 3) return; // max 3 queued per §6.6
-        setQueuedInputs((prev) => [...prev, v]);
-        setInput('');
-        return;
-      }
+      if (key.return) { const v = input.trim(); if (!v) return; if (queuedInputs.length >= 3) return; setQueuedInputs((prev) => [...prev, v]); setInput(''); return; }
       if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
       if (!key.ctrl && !key.meta) setInput((v) => v + inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
       return;
@@ -164,8 +176,6 @@ export function App(props: AppProps): React.JSX.Element {
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
   const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
   const hints = maxOffset > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
-  // wrap width: leave 6 cells for guide+indent+scrollbar so words never clump
-  const wrapW = Math.max(20, width - 6);
 
   return (
     <Box flexDirection="column" width={width} height={isFullscreen ? height - 1 : undefined}>
@@ -173,7 +183,7 @@ export function App(props: AppProps): React.JSX.Element {
       <Box flexDirection="row" flexGrow={isFullscreen ? 1 : 0} overflow={isFullscreen ? 'hidden' : undefined}>
         <Box flexDirection="column" flexGrow={1} overflow={isFullscreen ? 'hidden' : undefined} paddingX={0}>
           {grouped.length === 0 ? (
-            <Text color={tokens.ansi.dim as string}>{placeholder}</Text>
+            <Text color={tokens.ansi.dim as string}>Message Klyro…</Text>
           ) : visibleGrouped.map((item) => {
             if ((item as Group).verb) {
               const gr = item as Group;
@@ -198,22 +208,8 @@ export function App(props: AppProps): React.JSX.Element {
                   </Box>
                   {isExpanded ? gr.items.map((it) => {
                     let friendly = '';
-                    try {
-                      const a = JSON.parse(it.args) as Record<string, unknown>;
-                      const p = (a.path as string) ?? (a.pattern as string) ?? (a.command as string) ?? '';
-                      const short = p ? String(p).split('/').pop()?.slice(0, 40) ?? p : '';
-                      if (it.name === 'read_file' && short) friendly = `${short}  ${it.result ? String(it.result).split('\n').length + ' lines' : ''}`.trim();
-                      else if (it.name === 'shell_exec' && p) friendly = `$ ${String(p).slice(0, 40)}`;
-                      else if (short) friendly = short;
-                      else friendly = it.args.slice(0, 40);
-                    } catch { friendly = it.args.slice(0, 40); }
-                    return (
-                      <Box key={it.id} paddingLeft={4}>
-                        <Text color={tokens.ansi.guide as string}>{g('end')} </Text>
-                        <Text color={tokens.ansi.dim as string}>{friendly}</Text>
-                        {it.isError ? <Text color={tokens.ansi.err as string}>  ✗</Text> : null}
-                      </Box>
-                    );
+                    try { const a = JSON.parse(it.args) as Record<string, unknown>; const p = (a.path as string) ?? (a.pattern as string) ?? (a.command as string) ?? ''; const short = p ? String(p).split('/').pop()?.slice(0, 40) ?? p : ''; if (it.name === 'read_file' && short) friendly = `${short}`; else if (it.name === 'shell_exec' && p) friendly = `$ ${String(p).slice(0, 40)}`; else if (short) friendly = short; else friendly = it.args.slice(0, 40); } catch { friendly = it.args.slice(0, 40); }
+                    return (<Box key={it.id} paddingLeft={4}><Text color={tokens.ansi.guide as string}>{g('end')} </Text><Text color={tokens.ansi.dim as string}>{friendly}</Text></Box>);
                   }) : null}
                 </Box>
               );
@@ -223,11 +219,13 @@ export function App(props: AppProps): React.JSX.Element {
               return <Box key={it.id} marginBottom={1}><Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text><Text wrap="wrap">{it.text}</Text></Box>;
             }
             if (it.kind === 'text') {
-              if (it.text.startsWith('queued:')) return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {it.text}  esc to drop</Text></Box>;
+              // prose — render markdown, not raw **, with proper wrap and guide
               return (
                 <Box key={it.id} flexDirection="column" marginBottom={1}>
                   <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.accent as string}>{g('agentBullet')} Klyro</Text></Box>
-                  <Box paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   </Text><Text wrap="wrap">{it.text}</Text></Box>
+                  <Box paddingLeft={2} flexDirection="column">
+                    <Box><Text color={tokens.ansi.dim as string}>  {g('guide')}   </Text><Box flexGrow={1}><MarkdownText text={it.text} /></Box></Box>
+                  </Box>
                 </Box>
               );
             }
@@ -277,15 +275,15 @@ export function App(props: AppProps): React.JSX.Element {
         ) : null}
       </Box>
       <Box flexDirection="column">
-        <Text color={tokens.ansi.guide as string}>{rule}</Text>
+        <Text color={tokens.ansi.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
         <Box>
           <Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text>
-          <Text wrap="wrap">{input || <Text color={tokens.ansi.dim as string}>{placeholder}</Text> as unknown as string}▏</Text>
+          <Text wrap="wrap">{input || <Text color={tokens.ansi.dim as string}>Message Klyro…</Text> as unknown as string}▏</Text>
         </Box>
-        <Text color={tokens.ansi.guide as string}>{rule}</Text>
+        <Text color={tokens.ansi.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
       </Box>
       <Box justifyContent="space-between">
-        <Text color={tokens.ansi.dim as string}>{hints}</Text>
+        <Text color={tokens.ansi.dim as string}>{baseHints}{maxOffset > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
         <Text color={tokens.ansi.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct > 0 ? `${ctxPct}% ctx · ` : ''}{status.status === 'running' ? 'auto mode on ●' : ''}</Text>
       </Box>
     </Box>
