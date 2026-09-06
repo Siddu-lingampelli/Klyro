@@ -1,6 +1,6 @@
-/**
- * Klyro TUI G�� opencode-clean G�� no clumsy words, correct wrap, markdown, scroll
- * Header 3 rows, guide G�� at col2, G�� Klyro accent, prose wrapped at word boundaries
+﻿/**
+ * Klyro TUI â€” opencode-clean â€” no clumsy words, correct wrap, markdown, scroll
+ * Header 3 rows, guide â”‚ at col2, â— Klyro accent, prose wrapped at word boundaries
  */
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
@@ -34,10 +34,10 @@ function Header({ cwd, model, version, width }: { cwd: string; model: string; ve
     <Box flexDirection="column" marginBottom={1}>
       <Box justifyContent="space-between">
         <Text bold color={tokens.colors.accent as string}>KLYRO  v{version}</Text>
-        {showLinks ? <Text color={tokens.colors.dim as string}>G��  /help   /config   /clear   /exit</Text> : null}
+        {showLinks ? <Text color={tokens.colors.dim as string}>â”‚  /help   /config   /clear   /exit</Text> : null}
       </Box>
-      <Text color={tokens.colors.dim as string}>{model}[200k]  -+  API Usage Billing</Text>
-      <Text color={tokens.colors.dim as string}>{cwd}{branch ? `  -+  ${branch}` : ''}</Text>
+      <Text color={tokens.colors.dim as string}>{model}[200k]  Â·  API Usage Billing</Text>
+      <Text color={tokens.colors.dim as string}>{cwd}{branch ? `  Â·  ${branch}` : ''}</Text>
     </Box>
   );
 }
@@ -73,7 +73,7 @@ function groupTools(items: TranscriptItem[]): Array<TranscriptItem | Group> {
   flush(); return out;
 }
 
-// Simple markdown: **bold** G�� bold, keep lists/tables, wrap at word boundaries
+// Simple markdown: **bold** â†’ bold, keep lists/tables, wrap at word boundaries
 function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width?: number }) {
   // Split by **bold** segments
   const parts: React.ReactNode[] = [];
@@ -88,7 +88,7 @@ function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width
   }
   if (last < text.length) parts.push(<Text key={`t-${idx++}`} color={dim ? tokens.colors.dim as string : undefined} wrap="wrap">{text.slice(last)}</Text>);
   if (parts.length === 0) return <Text color={dim ? tokens.colors.dim as string : undefined} wrap="wrap">{text}</Text>;
-  // Render as single line with bold segments G�� Ink will wrap the parent Box
+  // Render as single line with bold segments â€” Ink will wrap the parent Box
   return <Text wrap="wrap">{parts}</Text>;
 }
 
@@ -174,8 +174,8 @@ export function App(props: AppProps): React.JSX.Element {
   const cost = (status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015);
   const totalTokens = status.usageInput + status.usageOutput;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
-  const baseHints = status.status === 'running' ? 'ctrl+c to stop  -+  enter to queue  -+  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  -+  G��G�� for history  -+  / for commands' : 'enter to send  -+  shift+enter newline  -+  @ to attach';
-  const hints = maxOffset > 0 && isFullscreen ? `${baseHints}  -+  PgUp/Dn scroll` : baseHints;
+  const baseHints = status.status === 'running' ? 'ctrl+c to stop  Â·  enter to queue  Â·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  Â·  â†‘â†“ for history  Â·  / for commands' : 'enter to send  Â·  shift+enter newline  Â·  @ to attach';
+  const hints = maxOffset > 0 && isFullscreen ? `${baseHints}  Â·  PgUp/Dn scroll` : baseHints;
 
   return (
     <Box flexDirection="column" width={width} height={isFullscreen ? height - 1 : undefined}>
@@ -183,7 +183,7 @@ export function App(props: AppProps): React.JSX.Element {
       <Box flexDirection="row" flexGrow={isFullscreen ? 1 : 0} overflow={isFullscreen ? 'hidden' : undefined}>
         <Box flexDirection="column" flexGrow={1} overflow={isFullscreen ? 'hidden' : undefined} paddingX={0}>
           {grouped.length === 0 ? (
-            <Text color={tokens.colors.dim as string}>Message KlyroGǪ</Text>
+            <Text color={tokens.colors.dim as string}>Message Klyroâ€¦</Text>
           ) : visibleGrouped.map((item) => {
             if ((item as Group).verb) {
               const gr = item as Group;
@@ -196,8 +196,8 @@ export function App(props: AppProps): React.JSX.Element {
                 if (gr.verb === 'Edited') return `Edited ${gr.items.length} files`;
                 return `${gr.verb} ${gr.items.length} items`;
               })();
-              const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? 'G��' : `${gr.totalMs}ms`;
-              const marker = isExpanded ? 'G�+' : 'G��';
+              const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? 'âœ—' : `${gr.totalMs}ms`;
+              const marker = isExpanded ? 'â–¼' : 'âœ“';
               const markerColor = gr.status === 'error' ? tokens.colors.err as string : gr.status === 'running' ? tokens.colors.warn as string : tokens.colors.ok as string;
               return (
                 <Box key={gr.id} flexDirection="column" marginBottom={1}>
@@ -219,7 +219,7 @@ export function App(props: AppProps): React.JSX.Element {
               return <Box key={it.id} marginBottom={1}><Text color={tokens.colors.accent as string} bold>{g('prompt')} </Text><Text wrap="wrap">{it.text}</Text></Box>;
             }
             if (it.kind === 'text') {
-              // prose G�� render markdown, not raw **, with proper wrap and guide
+              // prose â€” render markdown, not raw **, with proper wrap and guide
               return (
                 <Box key={it.id} flexDirection="column" marginBottom={1}>
                   <Box><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.accent as string}>{g('agentBullet')} Klyro</Text></Box>
@@ -229,7 +229,7 @@ export function App(props: AppProps): React.JSX.Element {
                 </Box>
               );
             }
-            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.err as string}>  {g('guide')}   G�� {it.message}</Text></Box>;
+            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.err as string}>  {g('guide')}   âœ— {it.message}</Text></Box>;
             if (it.kind === 'policy') return null;
             if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
             if (it.kind === 'diff') return (
@@ -269,7 +269,7 @@ export function App(props: AppProps): React.JSX.Element {
         {isFullscreen ? (
           <Box flexDirection="column" width={1} marginLeft={1}>
             {Array.from({ length: trackH }).map((_, i) => (
-              <Text key={i} color={i === thumbPos ? (tokens.colors.accent as string) : (tokens.colors.guide as string)}>{i === thumbPos ? 'G��' : 'G��'}</Text>
+              <Text key={i} color={i === thumbPos ? (tokens.colors.accent as string) : (tokens.colors.guide as string)}>{i === thumbPos ? 'â—' : 'â”‚'}</Text>
             ))}
           </Box>
         ) : null}
@@ -278,13 +278,13 @@ export function App(props: AppProps): React.JSX.Element {
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
         <Box>
           <Text color={tokens.colors.accent as string} bold>{g('prompt')} </Text>
-          <Text wrap="wrap">{input || <Text color={tokens.colors.dim as string}>Message KlyroGǪ</Text> as unknown as string}G��</Text>
+          <Text wrap="wrap">{input || <Text color={tokens.colors.dim as string}>Message Klyroâ€¦</Text> as unknown as string}â–</Text>
         </Box>
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
       </Box>
       <Box justifyContent="space-between">
-        <Text color={tokens.colors.dim as string}>{baseHints}{maxOffset > 0 && isFullscreen ? '  -+  PgUp/Dn scroll' : ''}</Text>
-        <Text color={tokens.colors.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} -+ ` : ''}{ctxPct > 0 ? `${ctxPct}% ctx -+ ` : ''}{status.status === 'running' ? 'auto mode on G��' : ''}</Text>
+        <Text color={tokens.colors.dim as string}>{baseHints}{maxOffset > 0 && isFullscreen ? '  Â·  PgUp/Dn scroll' : ''}</Text>
+        <Text color={tokens.colors.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} Â· ` : ''}{ctxPct > 0 ? `${ctxPct}% ctx Â· ` : ''}{status.status === 'running' ? 'auto mode on â—' : ''}</Text>
       </Box>
     </Box>
   );
