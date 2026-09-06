@@ -617,7 +617,7 @@ Append to: › ./KLYRO.md
 **Success:** Subsequent sessions load the file (visible in `/memory`); instructions influence behavior (e.g., the agent runs `pnpm codegen`).
 
 **Edge cases**
-- Existing `AGENTS.md` / `CLAUDE.md`: read as fallback; `/init` offers to import.
+- Existing `AGENTS.md`: read as fallback; `/init` offers to import.
 - Subdirectory `packages/api/KLYRO.md`: loaded lazily on first read in that directory.
 
 **Requirements:** FR-PROJ-01/02/03.

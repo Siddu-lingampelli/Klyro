@@ -39,7 +39,7 @@ export async function loadKlyroMd(cwd: string): Promise<string> {
     }
   }
   // Root (imports resolved relative to each file, contained to cwd)
-  for (const name of ['KLYRO.md', 'KLYRO.local.md', 'AGENTS.md', 'CLAUDE.md', '.cursorrules']) {
+  for (const name of ['KLYRO.md', 'KLYRO.local.md', 'AGENTS.md', '.cursorrules']) {
     const p = path.join(cwd, name);
     try {
       const t = await fs.readFile(p, 'utf-8');

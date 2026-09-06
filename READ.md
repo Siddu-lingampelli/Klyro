@@ -22,7 +22,7 @@
 |-------|--------|-----|
 | Language | TypeScript 5.5, Node 20+ | Strict, `NodeNext`, `tsc` → `dist/` |
 | CLI | `commander 12.1` | Stable, `InvalidArgumentError` for `exit 2` |
-| TUI | `ink 7.1` + `react 19` + `ink-spinner 5` | React for terminal, proven by Claude Code/Gemini |
+| TUI | `ink 7.1` + `react 19` + `ink-spinner 5` | React renderer for the terminal |
 | Schema | `zod 4.5` | Tool input validation + config schema |
 | Test | `vitest 4.1` `fileParallelism:false` `10s timeout` | `node` env, deterministic mocks |
 | Build | `tsc` (not `tsup`) | `tsc --noEmit` `typecheck`, `tsc` `build` |

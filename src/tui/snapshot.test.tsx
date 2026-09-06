@@ -26,11 +26,11 @@ describe('App visual snapshot', () => {
       />
     );
     const frame = lastFrame();
-    // design.md: top bar shows ▌ claude-code, not KLYRO, and sessions/files
-    expect(frame).toMatch(/claude-code|KLYRO/i);
+    // Top bar shows KLYRO, transcript shows sessions/files context
+    expect(frame).toMatch(/KLYRO/i);
     expect(frame).toMatch(/demo|Sessions|Files/i);
     expect(frame).toMatch(/shift\+tab|for history|Message Klyro|Type a message/i);
-    expect(frame).toMatch(/Message Klyro|claude-code|>/i);
+    expect(frame).toMatch(/Message Klyro|>/i);
   });
 
   it('renders a transcript with assistant text', () => {

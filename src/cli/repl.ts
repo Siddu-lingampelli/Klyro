@@ -529,7 +529,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         const rec = await tuiStore.create({ cwd, task: taskText, config: { model, maxSteps: currentMaxSteps } });
         sessionId = rec.id;
         tuiSessionId = rec.id;
-        // Session info goes to status bar, not transcript (clean like Claude Code)
+        // Session info goes to status bar, not transcript (clean Klyro transcript)
         queuedStatus({ status: 'running', step: 0, model });
       } catch {
         // best-effort

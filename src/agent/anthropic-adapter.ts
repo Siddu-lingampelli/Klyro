@@ -165,7 +165,7 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
   yield { kind: 'message_start' };
 
   // Stream SSE: lines are `event: <type>\ndata: <json>\n\n`.
-  // We use a simple incremental parser; Claude's API guarantees
+  // We use a simple incremental parser; Anthropic's API guarantees
   // well-formed SSE.
   const reader = resp.body.getReader();
   const decoder = new TextDecoder('utf-8');

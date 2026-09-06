@@ -12,8 +12,8 @@ describe('App', () => {
       <App initialModel="mock" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
     );
     const out = lastFrame();
-    // design.md: top bar shows claude-code + sessions, center shows Message Klyro placeholder
-    expect(out).toMatch(/claude-code|Sessions|Message Klyro/i);
+    // Top bar shows KLYRO + sessions, center shows Message Klyro placeholder
+    expect(out).toMatch(/Sessions|Message Klyro/i);
     expect(out).toMatch(/Message Klyro|Type a message/i);
   });
 
