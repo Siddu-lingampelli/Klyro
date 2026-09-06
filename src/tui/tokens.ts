@@ -18,21 +18,21 @@ export const tokens = {
     diffDelBg: '#2A1212',
   },
   ansi: {
-    accent: 'yellow' as const, // #E8843C → 209 → yellow
+    accent: 'yellowBright' as const, // #E8843C → vivid orange
     accentBold: 'yellowBright' as const,
-    fg: 'white' as const, // #FFFFFF
-    soft: 'whiteBright' as const, // #F5F5F5
-    dim: 'gray' as const, // #9A9A9A
+    fg: 'whiteBright' as const, // #FFFFFF — pure white
+    soft: 'white' as const,
+    dim: 'gray' as const,
     guide: 'gray' as const,
-    ok: 'yellow' as const, // orange for ✓ in white/orange theme
+    ok: 'yellowBright' as const, // ✓ orange vivid
     err: 'red' as const,
-    warn: 'yellow' as const, // orange
+    warn: 'yellowBright' as const, // spinner orange vivid
     info: 'white' as const,
     border: 'gray' as const,
     muted: 'gray' as const,
-    success: 'yellow' as const,
+    success: 'yellowBright' as const,
     error: 'red' as const,
-    warning: 'yellow' as const,
+    warning: 'yellowBright' as const,
   },
 } as const;
 

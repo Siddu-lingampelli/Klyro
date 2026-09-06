@@ -111,7 +111,13 @@ export function App(props: AppProps): React.JSX.Element {
   const isFullscreen = props.isFullscreen ?? false;
   const grouped = groupTools(transcript);
   const viewportH = Math.max(5, height - 10);
-  const totalRows = grouped.length + (plan.length > 0 ? 1 : 0) + 2;
+  const estLines = (s: string) => Math.max(1, Math.ceil(s.length / Math.max(20, width - 6)));
+  const totalRows = grouped.reduce((sum, it) => {
+    if ((it as Group).verb) return sum + 1 + (((it as Group).items.length > 1 && expandedGroups.has((it as Group).id)) ? (it as Group).items.length : 0);
+    const t = it as TranscriptItem;
+    if (t.kind === 'text') return sum + estLines(t.text) + 1;
+    return sum + 2;
+  }, 0) + (plan.length > 0 ? plan.length + 1 : 0) + 2;
   const maxOffset = Math.max(0, totalRows - viewportH);
   const isAtBottom = scrollOffset >= maxOffset;
   const trackH = viewportH;

@@ -128,12 +128,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     else pendingQueue.push({ kind: 'plan', plan: p });
   }
 
-  // ── Full-screen takeover like OpenCode/Claude Code (§3) ──
-  // Detect alt-screen support (§19.5): Windows Terminal (WT_SESSION), VS Code, xterm, or non-Windows.
-  // Fallback to inline (native scroll) on conhost/mintty so text isn't clipped — degrade don't break (§1.8).
-  const supportsAlt = !!process.env.WT_SESSION || process.env.TERM_PROGRAM === 'vscode' || (process.env.TERM ?? '').includes('xterm') || process.platform !== 'win32' || process.env.KLYRO_ALT_SCREEN === '1';
-  const noAlt = process.env.KLYRO_NO_ALT === '1' || process.env.NO_ALT === '1';
-  const isAltScreen = useTui && !!process.stdout.isTTY && supportsAlt && !noAlt;
+  // ── Full-screen takeover like OpenCode — always when klyro in TTY (user explicitly wants it)
+  // Scroll now works correctly via internal viewport, not native terminal scroll
+  const isAltScreen = useTui && !!process.stdout.isTTY && process.env.KLYRO_NO_ALT !== '1';
   const enterAlt = () => {
     if (!isAltScreen) return;
     try {
