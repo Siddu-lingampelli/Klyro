@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 6.4 — Repair classifier + context gather + guard
  */
 import * as fs from 'node:fs';
@@ -17,7 +17,7 @@ export function classifyFailure(
 ): FailureClass {
   const combined = (current.stderr + '\n' + current.stdout).toLowerCase();
   // env: missing binary, network, permission, no such file, EACCES etc
-  if (/enoent|command not found|no such file|network|econn|etimedout|eacces|permission denied|env/.test(combined) && /error/i.test(combined)) {
+  if (/enoent|command not found|no such file|network|econn|etimedout|eacces|permission denied|environment variable/.test(combined) && /error/i.test(combined)) {
     // only if not a real test failure but env
     if (!current.failure || current.failure.type === 'unknown') return 'env';
     // even test failures can be env if message hints
@@ -44,7 +44,7 @@ export async function rerunOnce(cwd: string, command: string, timeoutMs = 45_000
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, shell: true, env: process.env });
     let done = false;
-    const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, timeoutMs);
+    const t = setTimeout(() => { if (!done) { done = true; try { child.kill('SIGKILL'); } catch {} resolve(false); } }, timeoutMs);
     child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
     child.on('error', () => { if (done) return; done = true; clearTimeout(t); resolve(false); });
   });
@@ -73,20 +73,32 @@ export async function gatherRepairContext(cwd: string, failure: Failure | undefi
     }
   }
   // hunks: git diff --stat + --unified=2 for changed files
-  const hunks = await execCapture(cwd, 'git diff --stat && echo "---" && git diff -U2 2>&1 | head -n 300');
-  const blame = failure?.files[0]?.path
-    ? await execCapture(cwd, `git blame "${failure.files[0].path}" 2>&1 | head -n 20`)
+  const hunks = await execCapturePipe(cwd, 'git diff --stat && echo "---" && git diff -U2 2>&1 | head -n 300');
+  const blamePath = failure?.files[0]?.path;
+  const blame = blamePath && /^[\w./-]+$/.test(blamePath) && !blamePath.includes('..')
+    ? await execCaptureArgv(cwd, blamePath, ['--no-pager', 'blame', '--'])
     : '';
   return { failingTests, hunks, blame };
 }
 
-function execCapture(cwd: string, cmd: string): Promise<string> {
+function execCapturePipe(cwd: string, cmd: string): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn(cmd, { cwd, shell: true, env: process.env });
-    let out = '';
-    child.stdout.on('data', (b: Buffer) => { out += b.toString(); });
-    child.stderr.on('data', (b: Buffer) => { out += b.toString(); });
-    child.on('close', () => resolve(out.slice(0, 4000)));
+    const chunks: Buffer[] = [];
+    child.stdout.on('data', (b: Buffer) => { chunks.push(b); });
+    child.stderr.on('data', (b: Buffer) => { chunks.push(b); });
+    child.on('close', () => resolve(Buffer.concat(chunks).toString().slice(0, 4000)));
+    child.on('error', () => resolve(''));
+  });
+}
+
+function execCaptureArgv(cwd: string, file: string, args: string[]): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn('git', [...args, file], { cwd, shell: false, env: process.env });
+    const chunks: Buffer[] = [];
+    child.stdout.on('data', (b: Buffer) => { chunks.push(b); });
+    child.stderr.on('data', (b: Buffer) => { chunks.push(b); });
+    child.on('close', () => resolve(Buffer.concat(chunks).toString().split('\n').slice(0, 20).join('\n')));
     child.on('error', () => resolve(''));
   });
 }

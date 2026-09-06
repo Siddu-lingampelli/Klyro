@@ -77,37 +77,37 @@ export async function runBaseline(cwd: string, command?: string, timeoutMs = 90_
 }
 
 const MAX_BASELINE_BYTES = 256 * 1024;
-function cap(cur: string, chunk: string): string {
-  if (cur.length >= MAX_BASELINE_BYTES) return cur;
-  const n = cur + chunk;
-  return n.length > MAX_BASELINE_BYTES ? n.slice(0, MAX_BASELINE_BYTES) + '\n... [truncated]' : n;
-}
 function runCmd(cwd: string, command: string, timeoutMs: number): Promise<{ ok: boolean; exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, shell: true, env: process.env });
-    let stdout = '';
-    let stderr = '';
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
     let done = false;
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
       try { child.kill(); } catch { /* ignore */ }
-      resolve({ ok: false, exitCode: -1, stdout, stderr: stderr + '\n[baseline timeout]' });
+      const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_BASELINE_BYTES);
+      const se = Buffer.concat(errChunks).toString('utf-8').slice(0, MAX_BASELINE_BYTES);
+      resolve({ ok: false, exitCode: -1, stdout: so, stderr: se + '\n[baseline timeout]' });
     }, timeoutMs);
-    child.stdout.on('data', (b: Buffer) => { stdout = cap(stdout, b.toString()); });
-    child.stderr.on('data', (b: Buffer) => { stderr = cap(stderr, b.toString()); });
+    child.stdout.on('data', (b: Buffer) => { if (Buffer.concat(outChunks).length < MAX_BASELINE_BYTES) outChunks.push(b); });
+    child.stderr.on('data', (b: Buffer) => { if (Buffer.concat(errChunks).length < MAX_BASELINE_BYTES) errChunks.push(b); });
     child.on('close', (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       const exit = typeof code === 'number' ? code : -1;
-      resolve({ ok: exit === 0, exitCode: exit, stdout, stderr });
+      const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_BASELINE_BYTES);
+      const se = Buffer.concat(errChunks).toString('utf-8').slice(0, MAX_BASELINE_BYTES);
+      resolve({ ok: exit === 0, exitCode: exit, stdout: so, stderr: se });
     });
     child.on('error', (err) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve({ ok: false, exitCode: -1, stdout, stderr: String(err) });
+      const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_BASELINE_BYTES);
+      resolve({ ok: false, exitCode: -1, stdout: so, stderr: String(err) });
     });
   });
 }

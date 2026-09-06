@@ -160,6 +160,40 @@ export function toolDefinitions(registry: ToolRegistry): ToolDefinition[] {
   }));
 }
 
+// BUG-005: Model-aware cost estimation with sensible defaults.
+// Rates are per-1K tokens (input / output). Local models are $0.
+const MODEL_RATES: ReadonlyArray<{ test: (model: string) => boolean; input: number; output: number }> = [
+  { test: (m) => /gpt-4/i.test(m), input: 0.003, output: 0.015 },
+  { test: (m) => /gpt-3\.5/i.test(m), input: 0.0005, output: 0.0015 },
+  { test: (m) => /claude|anthropic/i.test(m), input: 0.003, output: 0.015 },
+  { test: (m) => /gemini/i.test(m), input: 0.00075, output: 0.003 },
+  { test: (m) => /o1/i.test(m), input: 0.015, output: 0.06 },
+];
+
+/** Estimate USD cost of a usage block given the model name. */
+export function estimateCost(model: string, usage: { input: number; output: number }): number {
+  const match = MODEL_RATES.find((r) => r.test(model));
+  const { input: inRate, output: outRate } = match ?? { input: 0.003, output: 0.015 };
+  return (usage.input / 1000) * inRate + (usage.output / 1000) * outRate;
+}
+
+// PERF-002: Memoized token counting cache.
+let tokenCache: { lastRef: Message[] | null; lastSystem: string | undefined; lastCount: number } = {
+  lastRef: null,
+  lastSystem: undefined,
+  lastCount: 0,
+};
+
+/** Memoized totalTokens � only recomputes when transcript ref or system changes. */
+function cachedTotalTokens(system: string | undefined, messages: Message[]): number {
+  if (tokenCache.lastRef === messages && tokenCache.lastSystem === system) {
+    return tokenCache.lastCount;
+  }
+  const count = totalTokens(system, messages);
+  tokenCache = { lastRef: messages, lastSystem: system, lastCount: count };
+  return count;
+}
+
 /** Run the autonomous loop. */
 export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResult> {
   const maxSteps = opts.maxTurns ?? opts.maxSteps ?? DEFAULT_MAX_STEPS;
@@ -262,13 +296,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   // 5.2 — stuck detection state
   const callHistory: string[] = [];
   const fileEditCounts = new Map<string, number>();
-  let stuckCount = 0;
-  let lastSignal: AbortSignal | undefined;
 
   outer: while (steps < maxSteps) {
     // 5.1 limits: max-cost, max-time
     if (maxCost !== undefined) {
-      const cost = (usage.input / 1000) * 0.003 + (usage.output / 1000) * 0.015;
+      const cost = estimateCost(opts.model, usage);
       if (cost >= maxCost) {
         setPhase('limit');
         await closeTracer();
@@ -302,10 +334,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     const BUDGET = { total: 120_000, reservedOutput: 4000 };
     let reqMessages = transcript;
     let reqSystem: string | undefined = systemPrompt;
-    if (totalTokens(systemPrompt, transcript) > BUDGET.total) {
+    if (cachedTotalTokens(systemPrompt, transcript) > BUDGET.total) {
       const c = compressTranscript(systemPrompt, transcript, BUDGET);
       reqSystem = c.system;
       reqMessages = c.messages;
+      tokenCache = { lastRef: null, lastSystem: undefined, lastCount: 0 };
       if (c.dropped > 0) emitKlyro({ type: 'context.compacted', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', dropped: c.dropped } as unknown as import('../events/catalog.js').KlyroEvent);
     }
     const req = {
@@ -382,6 +415,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     const assistantMsg: Message = { role: 'assistant', content: assistantContent };
     transcript.push(assistantMsg);
     await checkpoint(assistantMsg);
+    // Invalidate token cache since transcript changed
+    tokenCache = { lastRef: null, lastSystem: undefined, lastCount: 0 };
 
     // No tool calls → potential completion (Level 8 verify gate)
     if (opts.signal?.aborted) {
@@ -456,7 +491,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         }
         // 6.4 — classify
         const baseline = await getBaseline(opts.cwd, verifyCmd);
-        const isFlaky = await rerunOnce(opts.cwd, cmdToRun, 30_000);
+        const isFlaky = await rerunOnce(opts.cwd, cmdToRun, opts.verify?.timeoutMs ?? 45_000);
         const cls = classifyFailure({ failure: vResult.failure, stdout: vResult.stdout, stderr: vResult.stderr }, baseline, isFlaky);
         if (cls === 'flaky') {
           // rerun succeeded on second try — treat as flaky, don't count as repair
@@ -679,16 +714,14 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     };
 
     // 3.5 — parallel if all concurrencySafe, sequential otherwise
-    // For parallel, execute concurrently but commit transcript in original call order to preserve determinism
+    // BUG-002: preserve call order — run sequentially even when allSafe to avoid out-of-order transcript
+    // Parallel execution previously pushed tool_results out of order via Promise.all
     if (allSafe) {
-      toolCallCount += finalizedCalls.length;
-      // runOne internally pushes to transcript — we need ordered commits, so we serialize the push phase
-      // Collect via a temporary queue: run all, but gather transcript deltas and replay in order
-      const pending: Array<() => Promise<void>> = [];
-      // Wrap runOne to capture its pushes without interleaving: we monkey-patch transcript push via staging
-      // Simpler: just run sequentially when deterministic order matters — parallel benefit is limited for <4 tools
-      // So we run Promise.all for execution but checkpoint writes are already serialized via store mutex
-      await Promise.all(finalizedCalls.map((c) => runOne(c)));
+      for (const call of finalizedCalls) {
+        toolCallCount++;
+        await runOne(call);
+        if (opts.signal?.aborted) break;
+      }
     } else {
       for (const call of finalizedCalls) {
         toolCallCount++;

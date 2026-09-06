@@ -48,9 +48,18 @@ function filteredEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
       out[k] = v;
     }
   }
-  // Always allow basic
+  // Merge user extra AFTER filtering — but only allowed prefixes, block injection vectors
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      if (k === 'NODE_OPTIONS' || k === 'LD_PRELOAD' || k === 'LD_LIBRARY_PATH') continue;
+      if (k.includes('SECRET') || k.includes('TOKEN') || k === 'ANTHROPIC_API_KEY' || k === 'OPENAI_API_KEY') continue;
+      if (ALLOWED_ENV_PREFIXES.some((p) => k.startsWith(p)) || k === 'PATH' || k === 'PWD' || k === 'TMPDIR' || k === 'TEMP') {
+        out[k] = v;
+      }
+    }
+  }
   out.PATH = process.env.PATH;
-  if (extra) Object.assign(out, extra);
+  if (out.NODE_OPTIONS) delete out.NODE_OPTIONS;
   return out;
 }
 

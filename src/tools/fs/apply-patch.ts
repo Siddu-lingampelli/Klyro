@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 4.2 — apply_patch: Codex-style unified patch, tolerant hunks
  */
 
@@ -7,7 +7,8 @@ import * as path from 'node:path';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
-import { safe } from '../normalize.js';
+import { safe, TOOL_ERROR_CODES } from '../normalize.js';
+import { wasRead } from './read-history.js';
 
 const InputSchema = z.object({
   patch: z.string().min(1).describe('Unified diff patch text'),
@@ -32,6 +33,15 @@ export const applyPatchTool = defineTool({
           // Flush previous
           if (currentFile && fileContent !== null) {
             const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, currentFile);
+            if (fileContent === null) throw Object.assign(new Error('fileContent is null — cannot write'), { code: TOOL_ERROR_CODES.INTERNAL });
+            try {
+              const existing = await fs.readFile(resolved, 'utf-8');
+              if (!wasRead(currentFile) && existing.length > 200) {
+                throw Object.assign(new Error('File was not read this session and is >200 bytes — re-read before writing (POLICY_DENIED)'), { code: 'POLICY_DENIED' });
+              }
+            } catch (e: unknown) {
+              if (e && typeof e === 'object' && (e as { code?: string }).code === 'POLICY_DENIED') throw e;
+            }
             await fs.mkdir(path.dirname(resolved), { recursive: true });
             await fs.writeFile(resolved, fileContent, 'utf-8');
             patchedFiles.push(currentFile);
@@ -48,6 +58,15 @@ export const applyPatchTool = defineTool({
         if (line.startsWith('*** Add File:')) {
           if (currentFile && fileContent !== null) {
             const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, currentFile);
+            if (fileContent === null) throw Object.assign(new Error('fileContent is null — cannot write'), { code: TOOL_ERROR_CODES.INTERNAL });
+            try {
+              const existing = await fs.readFile(resolved, 'utf-8');
+              if (!wasRead(currentFile) && existing.length > 200) {
+                throw Object.assign(new Error('File was not read this session and is >200 bytes — re-read before writing (POLICY_DENIED)'), { code: 'POLICY_DENIED' });
+              }
+            } catch (e: unknown) {
+              if (e && typeof e === 'object' && (e as { code?: string }).code === 'POLICY_DENIED') throw e;
+            }
             await fs.mkdir(path.dirname(resolved), { recursive: true });
             await fs.writeFile(resolved, fileContent, 'utf-8');
             patchedFiles.push(currentFile);
@@ -65,6 +84,15 @@ export const applyPatchTool = defineTool({
       }
       if (currentFile && fileContent !== null) {
         const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, currentFile);
+        if (fileContent === null) throw Object.assign(new Error('fileContent is null — cannot write'), { code: TOOL_ERROR_CODES.INTERNAL });
+        try {
+          const existing = await fs.readFile(resolved, 'utf-8');
+          if (!wasRead(currentFile) && existing.length > 200) {
+            throw Object.assign(new Error('File was not read this session and is >200 bytes — re-read before writing (POLICY_DENIED)'), { code: 'POLICY_DENIED' });
+          }
+        } catch (e: unknown) {
+          if (e && typeof e === 'object' && (e as { code?: string }).code === 'POLICY_DENIED') throw e;
+        }
         await fs.mkdir(path.dirname(resolved), { recursive: true });
         await fs.writeFile(resolved, fileContent, 'utf-8');
         patchedFiles.push(currentFile);
