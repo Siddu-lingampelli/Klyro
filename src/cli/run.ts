@@ -18,7 +18,8 @@ import type { Message } from '../agent/message.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, DEFAULT_POLICY_CONFIG, PolicyEngine } from '../policy/engine.js';
 import { DenyAllApprovalPrompt } from '../policy/approval.js';
-import { buildLevel6Context } from '../context/level6.js';;
+import { buildLevel6Context } from '../context/level6.js';
+import { getDefaultSessionStore, resolveSessionId } from '../persistence/session.js';
 import * as fs from 'node:fs';
 
 export interface RunCliOptions {
@@ -64,6 +65,15 @@ export interface RunCliOptions {
    * turn; if absent, `opts.task` is appended.
    */
   resumePath?: string;
+  /** Level 8 — verification */
+  verify?: boolean;
+  verifyCommand?: string;
+  maxRepairAttempts?: number;
+  verifyTimeoutMs?: number;
+  /** Level 9 — persistence */
+  persist?: boolean;
+  sessionId?: string;
+  sessionsDir?: string;
 }
 
 function readEnv(name: string, fallback?: string): string | undefined {
@@ -106,6 +116,45 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
   const systemPrompt = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt);
 
+  // Level 9 — session setup (create or resume)
+  const persistEnabled = opts.persist !== false;
+  let store: import('../persistence/store.js').SessionStore | undefined;
+  let sessionId: string | undefined;
+  let initialTranscript: Message[] | undefined;
+  if (persistEnabled) {
+    const { SessionStore } = await import('../persistence/store.js');
+    const { getDefaultSessionStore } = await import('../persistence/session.js');
+    store = opts.sessionsDir ? new SessionStore(opts.sessionsDir) : getDefaultSessionStore();
+    if (opts.resumePath) {
+      initialTranscript = loadTranscript(opts.resumePath);
+    } else if (opts.sessionId) {
+      const full = await resolveSessionId(store, opts.sessionId);
+      if (!full) {
+        stderr.write(`klyro: session not found: ${opts.sessionId}\n`);
+        return 2;
+      }
+      sessionId = full;
+      const msgs = await store.loadMessages(sessionId);
+      // Convert StoredMessage to Message
+      initialTranscript = msgs.map((m) => ({ role: m.role as Message['role'], content: m.content as Message['content'] }));
+      const rec = await store.get(sessionId);
+      if (rec) {
+        stderr.write(`klyro: resuming session ${sessionId.slice(0, 8)} — task: "${rec.task}"\n`);
+      }
+    } else if (opts.resumePath) {
+      // already handled
+    } else {
+      // Create new session
+      const rec = await store.create({ cwd: opts.cwd, task: opts.task, config: { model: opts.model, maxSteps: opts.maxSteps ?? 30 } });
+      sessionId = rec.id;
+      if (output !== 'silent' && output !== 'json') {
+        stderr.write(`klyro: session ${sessionId.slice(0, 8)} created\n`);
+      }
+    }
+  } else if (opts.resumePath) {
+    initialTranscript = loadTranscript(opts.resumePath);
+  }
+
   const ac = new AbortController();
   if (opts.abortOnSigint !== false) {
     process.on('SIGINT', () => {
@@ -113,6 +162,15 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       ac.abort();
     });
   }
+
+  const verifyOpts = opts.verify === false
+    ? { enabled: false as const }
+    : {
+        enabled: true as const,
+        command: opts.verifyCommand,
+        maxRepairAttempts: opts.maxRepairAttempts ?? 3,
+        timeoutMs: opts.verifyTimeoutMs,
+      };
 
   const result = await run(
     {
@@ -124,7 +182,9 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       temperature: opts.temperature,
       signal: ac.signal,
       nonInteractive: true,
-      initialTranscript: opts.resumePath ? loadTranscript(opts.resumePath) : undefined,
+      initialTranscript,
+      verify: verifyOpts,
+      persist: store && sessionId ? { store, sessionId } : undefined,
       onEvent: (ev) => {
         if (output === 'json') {
           stdout.write(JSON.stringify(ev) + '\n');
@@ -146,11 +206,40 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
           stderr.write(`  policy: ${ev.action}${ev.reason ? ` — ${ev.reason}` : ''}\n`);
         } else if (ev.kind === 'step_start') {
           stderr.write(`\n[step ${ev.step}]\n`);
+        } else if (ev.kind === 'verification_started') {
+          stderr.write(`\n[verify] running \`${ev.command}\`\n`);
+        } else if (ev.kind === 'verification_succeeded') {
+          stderr.write(`[verify] passed\n`);
+        } else if (ev.kind === 'verification_failed') {
+          stderr.write(`[verify] failed — ${ev.reason.slice(0, 200)}\n`);
+        } else if (ev.kind === 'repair_started') {
+          stderr.write(`[repair] attempt ${ev.attempt}/${ev.maxAttempts}\n`);
+        } else if (ev.kind === 'checkpoint_saved') {
+          if (output === 'human') stderr.write(`[session ${ev.sessionId.slice(0, 8)} checkpoint]\n`);
         }
       },
     },
     { adapter, registry, policy, approval: new DenyAllApprovalPrompt(), systemPrompt },
   );
+
+  if (store && sessionId) {
+    // Finalize session status
+    const statusMap: Record<string, import('../persistence/store.js').SessionStatus> = {
+      complete: 'complete',
+      max_steps: 'max_steps',
+      aborted: 'aborted',
+      no_final: 'aborted',
+      verify_failed: 'verify_failed',
+    };
+    try {
+      await store.setStatus(sessionId, statusMap[result.status] ?? 'complete', result.finalText);
+    } catch { /* ignore */ }
+    if (output !== 'json' && output !== 'silent') {
+      stderr.write(`klyro: session ${sessionId.slice(0, 8)} ${result.status}`);
+      if (result.verification) stderr.write(`  verify: ${result.verification.ok ? 'ok' : 'failed'} (${result.verification.attempts} attempts)`);
+      stderr.write('\n');
+    }
+  }
 
   if (output !== 'json') stdout.write('\n');
   if (result.status === 'max_steps') {
@@ -164,6 +253,11 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   if (result.status === 'no_final') {
     if (output !== 'json') stderr.write('klyro: provider error — no final answer\n');
     return 4;
+  }
+  if (result.status === 'verify_failed') {
+    if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'verify_failed', failureType: result.verification?.failureType }) + '\n');
+    else stderr.write(`klyro: verification failed after ${result.verification?.attempts ?? 3} repairs — see output above\n`);
+    return 5;
   }
   if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'ok', text: result.finalText }) + '\n');
   return 0;

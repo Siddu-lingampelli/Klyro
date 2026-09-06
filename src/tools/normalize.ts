@@ -86,7 +86,7 @@ function mapNodeErrorCode(code: string | undefined): ToolErrorCode {
  *  If the function returns a ToolResult (already-shaped), it is passed through
  *  unwrapped. Otherwise the function's return value becomes `value` on success.
  */
-export async function safe<T>(fn: () => Promise<T>): Promise<ToolResult<T>> {
+export async function safe<T>(fn: () => Promise<T | ToolResult<T>>): Promise<ToolResult<T>> {
   try {
     const result = await fn();
     // Only pass through true tool-level errors: ok:false WITH an error
@@ -101,7 +101,7 @@ export async function safe<T>(fn: () => Promise<T>): Promise<ToolResult<T>> {
     ) {
       return result as unknown as ToolResult<T>;
     }
-    return { ok: true, value: result };
+    return { ok: true, value: result as T };
   } catch (err) {
     return { ok: false, error: toToolError(err) };
   }

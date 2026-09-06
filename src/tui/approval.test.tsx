@@ -53,7 +53,7 @@ describe('ApprovalModal', () => {
     expect(out).toContain('shell_exec');
     expect(out).toContain('destructive');
     expect(out).toContain('rm -rf /');
-    expect(out).toContain('allow');
+    expect(out).toContain('once');
     expect(out).toContain('deny');
     bridge.resolve('deny');
     await promise;

@@ -28,6 +28,14 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** True when running headless (CI, pipe). Tools should avoid prompts. */
   nonInteractive?: boolean;
+  /** Current session id (for tracing). */
+  sessionId?: string;
+  /** Permissions snapshot for this turn. */
+  permissions?: { mode?: string; allow?: string[]; deny?: string[] };
+  /** Logger (pino-like) */
+  logger?: { debug: (msg: string, data?: unknown) => void; info: (msg: string, data?: unknown) => void };
+  /** Emit KlyroEvent */
+  emit?: (ev: import('../events/catalog.js').KlyroEvent) => void;
 }
 
 /**
@@ -41,6 +49,16 @@ export interface Tool<TInput, TOutput> {
   description: string;
   /** Zod schema for runtime validation. */
   inputSchema: z.ZodType<TInput>;
+  /** Permission class: read | edit | execute | admin */
+  permission?: 'read' | 'edit' | 'execute' | 'admin';
+  /** True if tool is safe to run in parallel with others */
+  isConcurrencySafe?: boolean;
+  /** Render call for approval UI */
+  renderCall?: (input: TInput) => string;
+  /** Render result for UI */
+  renderResult?: (output: TOutput) => string;
+  /** Truncate large results to maxResultTokens (default 8k) */
+  truncate?: (output: TOutput, maxTokens: number) => TOutput | string;
   /** Execute the tool. Must never throw — return a ToolResult instead. */
   execute(input: TInput, ctx: ToolContext): Promise<ToolResult<TOutput>>;
 }

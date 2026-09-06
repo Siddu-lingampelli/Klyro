@@ -70,12 +70,21 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
     return bridge.subscribe((p) => setPending(p?.req ?? null));
   }, [bridge]);
 
+  const [explain, setExplain] = useState(false);
   useInput((inputStr, key) => {
     if (!pending) return;
     const c = inputStr.toLowerCase();
-    if (c === 'y' || c === 'a' || c === 'd' || c === 'n') {
-      const choice: ApprovalChoice = (c === 'y' || c === 'a') ? (c === 'a' ? 'always' : 'allow') : 'deny';
-      bridge.resolve(choice);
+    if (c === 'y') { bridge.resolve('allow'); return; }
+    if (c === 'a') { bridge.resolve('always'); return; }
+    if (c === 'A') { bridge.resolve('always'); return; }
+    if (c === 'd' || c === 'n') { bridge.resolve('deny'); return; }
+    if (c === 'e') {
+      // Edit: for MVP, treat as deny with edit hint — model will be told to re-read and retry
+      bridge.resolve('deny');
+      return;
+    }
+    if (c === '?') {
+      setExplain((v) => !v);
       return;
     }
     if (key.return) {
@@ -96,12 +105,19 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
       <Text color="yellow" bold>⚠ approval needed — {pending.toolName}</Text>
       <Text color="gray">  reason: {pending.reason}</Text>
       {pending.summary ? <Text>  {pending.summary}</Text> : null}
+      {explain ? <Text color="cyan">  Explain: This tool will {pending.toolName} with the shown args. [y] once, [a] session, [A] always→settings, [n] deny, [e] edit, [?] toggle help.</Text> : null}
       <Box marginTop={1}>
-        <Text color="green">[y] allow</Text>
+        <Text color="green">[y] once</Text>
         <Text color="gray">  </Text>
-        <Text color="green">[a] always allow</Text>
+        <Text color="green">[a] session</Text>
         <Text color="gray">  </Text>
-        <Text color="red">[d] deny</Text>
+        <Text color="green">[A] always</Text>
+        <Text color="gray">  </Text>
+        <Text color="red">[n] deny</Text>
+        <Text color="gray">  </Text>
+        <Text color="yellow">[e] edit</Text>
+        <Text color="gray">  </Text>
+        <Text color="cyan">[?] explain</Text>
         <Text color="gray">  (Enter = deny)</Text>
       </Box>
     </Box>

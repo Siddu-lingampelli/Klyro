@@ -69,9 +69,9 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
 
 /** Hit a cheap endpoint to check if a local server is up. */
 async function probeLocal(baseURL: string): Promise<boolean> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 600);
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 600);
     // Try the OpenAI-style /models endpoint; some servers (Ollama before load)
     // answer /, others only /v1/models.
     const res = await fetch(`${baseURL.replace(/\/+$/, '')}/models`, {
@@ -81,6 +81,7 @@ async function probeLocal(baseURL: string): Promise<boolean> {
     clearTimeout(t);
     return res.ok;
   } catch {
+    clearTimeout(t);
     return false;
   }
 }

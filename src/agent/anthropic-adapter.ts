@@ -17,6 +17,7 @@
 
 import type { Message } from './message.js';
 import type { CallRequest, ProviderAdapter, StreamEvent, ToolDefinition } from './provider-adapter.js';
+import { assertSafeBaseURL } from '../chat.js';
 
 export interface AnthropicAdapterOptions {
   baseURL?: string;
@@ -74,7 +75,9 @@ export class AnthropicApiError extends Error {
 }
 
 export function anthropicAdapter(opts: AnthropicAdapterOptions): ProviderAdapter {
-  const baseURL = (opts.baseURL ?? 'https://api.anthropic.com').replace(/\/+$/, '');
+  const rawBase = opts.baseURL ?? 'https://api.anthropic.com';
+  assertSafeBaseURL(rawBase);
+  const baseURL = rawBase.replace(/\/+$/, '');
   const version = opts.anthropicVersion ?? DEFAULT_VERSION;
   const authHeader = opts.authHeader ?? 'x-api-key';
   const betas = opts.betas ?? [];
@@ -169,6 +172,8 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
   let buf = '';
   // Track in-progress tool calls so we can emit start/delta/end.
   const toolBuffers = new Map<string, { name: string; argsJson: string }>();
+  // Map content_block index → tool_use id (persists after tool completes to handle late deltas)
+  const indexToToolId = new Map<number, string>();
 
   try {
     while (true) {
@@ -199,7 +204,7 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
       for (const e of events) {
         let parsed: AnthropicSseEvent;
         try { parsed = JSON.parse(e.data) as AnthropicSseEvent; } catch { continue; }
-        const out = translateSse(e.event, parsed, toolBuffers);
+        const out = translateSse(e.event, parsed, toolBuffers, indexToToolId);
         for (const ev of out) yield ev;
       }
     }
@@ -218,13 +223,16 @@ function translateSse(
   event: string,
   parsed: AnthropicSseEvent,
   toolBuffers: Map<string, { name: string; argsJson: string }>,
+  indexToToolId: Map<number, string>,
 ): StreamEvent[] {
   const out: StreamEvent[] = [];
   switch (event) {
     case 'content_block_start': {
       const block = parsed.content_block as { type: string; id?: string; name?: string; input?: unknown } | undefined;
+      const idx = parsed.index as number | undefined;
       if (block?.type === 'tool_use' && block.id && block.name) {
         toolBuffers.set(block.id, { name: block.name, argsJson: '' });
+        if (idx !== undefined) indexToToolId.set(idx, block.id);
         out.push({ kind: 'tool_call_start', id: block.id, name: block.name });
       }
       return out;
@@ -232,15 +240,10 @@ function translateSse(
     case 'content_block_delta': {
       const delta = parsed.delta as { type?: string; text?: string; partial_json?: string } | undefined;
       const index = parsed.index as number | undefined;
-      // We need the id to know which tool buffer to update. Anthropic sends
-      // index but not id on delta events. Match by name+index pair.
       if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
         out.push({ kind: 'text_delta', text: delta.text });
       } else if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
-        // Find the tool buffer whose index matches this delta.
-        // We map by index order: the i-th tool_use block corresponds to the
-        // i-th tool_start we've emitted. Track that counter separately.
-        const id = findToolIdByIndex(index, toolBuffers);
+        const id = findToolIdByIndex(index, toolBuffers, indexToToolId);
         if (id) {
           const buf = toolBuffers.get(id);
           if (buf) {
@@ -252,12 +255,11 @@ function translateSse(
       return out;
     }
     case 'content_block_stop': {
-      // The 'index' of the stopped block tells us which tool finished.
-      // We track tool starts in order and match by index.
       const index = parsed.index as number | undefined;
-      const id = findToolIdByIndex(index, toolBuffers);
+      const id = findToolIdByIndex(index, toolBuffers, indexToToolId);
       if (id) {
         toolBuffers.delete(id);
+        // Keep index mapping for late deltas that may arrive after stop (rare)
         out.push({ kind: 'tool_call_end', id });
       }
       return out;
@@ -282,20 +284,23 @@ function translateSse(
 }
 
 /** Match an Anthropic content_block index to the tool_use id we emitted. */
-function findToolIdByIndex(index: number | undefined, buffers: Map<string, { name: string; argsJson: string }>): string | undefined {
+function findToolIdByIndex(
+  index: number | undefined,
+  buffers: Map<string, { name: string; argsJson: string }>,
+  indexToToolId?: Map<number, string>,
+): string | undefined {
   if (index === undefined) return undefined;
-  // buffers is a Map preserving insertion order. The index of a tool_use
-  // block is its position among all content blocks, not just tool_use
-  // blocks. We don't know about non-tool blocks, so we use a simpler
-  // heuristic: the index matches the i-th tool_use that has been started
-  // since message_start. This is good enough for streamed responses where
-  // tool blocks are typically 0,1,2...
+  // Preferred: direct index → id mapping from content_block_start
+  if (indexToToolId) {
+    const direct = indexToToolId.get(index);
+    if (direct) return direct;
+  }
+  // Fallback heuristic for older streams without index on start
   let i = 0;
   for (const id of buffers.keys()) {
     if (i === index) return id;
     i++;
   }
-  // Fallback: if there's exactly one tool in flight, it's almost certainly it.
   if (buffers.size === 1) return buffers.keys().next().value;
   return undefined;
 }

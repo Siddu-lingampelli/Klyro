@@ -32,9 +32,10 @@ export interface BuildProviderOptions {
   retry?: Partial<RetryOptions> | false;
 }
 
-/** Heuristic: hosts that look like Anthropic's API. */
+/** Heuristic: hosts that look like Anthropic's API. Only matches anthropic.com and subdomains, not substring. */
 function looksLikeAnthropic(host: string): boolean {
-  return /(^|\.)anthropic\.com$/i.test(host) || /anthropic/i.test(host);
+  const h = host.toLowerCase();
+  return h === 'anthropic.com' || h.endsWith('.anthropic.com');
 }
 
 export function inferProviderFromBaseURL(baseURL: string | undefined): ProviderName {
@@ -44,6 +45,17 @@ export function inferProviderFromBaseURL(baseURL: string | undefined): ProviderN
     return looksLikeAnthropic(u.hostname) ? 'anthropic' : 'openai';
   } catch {
     return 'openai';
+  }
+}
+
+function isLoopbackBaseURL(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    const h = u.hostname.toLowerCase();
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0' || h === '::' || h.startsWith('127.');
+  } catch {
+    return false;
   }
 }
 
@@ -65,14 +77,18 @@ export function buildProvider(opts: BuildProviderOptions = {}): ProviderAdapter 
   let inner: ProviderAdapter;
   if (provider === 'anthropic') {
     if (!apiKey) {
-      throw new Error('buildProvider: anthropic provider requires an apiKey (or KLYRO_API_KEY).');
+      throw new Error('klyro: invalid --provider: anthropic requires an API key (set KLYRO_API_KEY or pass --api-key)');
     }
     inner = anthropicAdapter({ baseURL, apiKey, timeoutMs });
   } else {
-    if (!baseURL || !apiKey) {
-      throw new Error('buildProvider: openai provider requires baseURL and apiKey (or KLYRO_BASE_URL + KLYRO_API_KEY).');
+    if (!baseURL) {
+      throw new Error('klyro: invalid --provider: openai requires --base-url or KLYRO_BASE_URL');
     }
-    inner = httpChatAdapter({ baseURL, apiKey, timeoutMs });
+    // Allow empty apiKey for loopback local servers (Ollama etc.)
+    if (!apiKey && !isLoopbackBaseURL(baseURL)) {
+      throw new Error('klyro: invalid --provider: openai requires --api-key or KLYRO_API_KEY (or use a localhost URL for local models)');
+    }
+    inner = httpChatAdapter({ baseURL, apiKey: apiKey ?? '', timeoutMs });
   }
 
   if (opts.retry === false) return inner;
@@ -93,7 +109,7 @@ export function buildProviderFromCli(args: {
 }): ProviderAdapter {
   const provider = args.provider as ProviderName | undefined;
   if (provider && provider !== 'openai' && provider !== 'anthropic') {
-    throw new Error(`unknown provider: ${provider}`);
+    throw new Error(`klyro: invalid --provider: ${provider} (expected openai|anthropic)`);
   }
   return buildProvider({
     provider,

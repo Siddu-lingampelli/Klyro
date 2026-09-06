@@ -52,11 +52,20 @@ async function* streamWithAbort(
     return;
   }
   const it = source[Symbol.asyncIterator]();
-  while (true) {
-    if (signal.aborted) return;
-    const next = await it.next();
-    if (next.done) return;
-    yield next.value;
+  try {
+    while (true) {
+      if (signal.aborted) {
+        try { await it.return?.(); } catch { /* ignore */ }
+        return;
+      }
+      const next = await it.next();
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally {
+    if (signal.aborted) {
+      try { await it.return?.(); } catch { /* ignore */ }
+    }
   }
 }
 
@@ -74,13 +83,34 @@ export function retryingAdapter(inner: ProviderAdapter, opts: Partial<RetryOptio
   return {
     id: `${inner.id}+retry`,
     async *stream(req: CallRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
-      const effectiveSignal = signal ?? opts.signal;
+      // Support both calling conventions: stream(req) where req.signal is set, and legacy stream(req, signal)
+      // Combine per-request signal (req.signal), legacy second-arg signal, and adapter-level opts.signal
+      const getEffectiveSignal = (legacySignal?: AbortSignal): AbortSignal | undefined => {
+        const sigs = [req.signal, legacySignal, opts.signal].filter(Boolean) as AbortSignal[];
+        if (sigs.length === 0) return undefined;
+        if (sigs.length === 1) return sigs[0];
+        // If any aborts, effective aborts — create a combined controller
+        const ctrl = new AbortController();
+        const onAbort = () => {
+          const reason = sigs.find((s) => s.aborted)?.reason ?? (sigs[0]?.reason as Error);
+          try { ctrl.abort(reason as Error); } catch { ctrl.abort(); }
+        };
+        if (sigs.some((s) => s.aborted)) {
+          onAbort();
+        } else {
+          for (const s of sigs) s.addEventListener('abort', onAbort, { once: true });
+        }
+        return ctrl.signal;
+      };
       for (let attempt = 0; attempt < cfg.maxAttempts; attempt++) {
+        const effectiveSignal = getEffectiveSignal(signal);
+        // Clone req per attempt to avoid reusing aborted signal
+        const attemptReq: CallRequest = effectiveSignal ? { ...req, signal: effectiveSignal } : req;
         opts.onAttempt?.(attempt);
         if (effectiveSignal?.aborted) return;
         let sawRetryable = false;
         let lastError: StreamEvent | null = null;
-        for await (const ev of streamWithAbort(inner.stream(req), effectiveSignal)) {
+        for await (const ev of streamWithAbort(inner.stream(attemptReq), effectiveSignal)) {
           if (effectiveSignal?.aborted) return;
           if (ev.kind === 'error' && ev.retryable) {
             // Buffer the retryable error; don't yield it yet. We'll either

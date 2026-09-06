@@ -13,6 +13,7 @@
 
 import { z } from 'zod';
 import type { Message, ToolUseBlock } from './message.js';
+import { redact } from '../policy/secret-redactor.js';
 
 export type StreamEvent =
   | { kind: 'text_delta'; text: string }
@@ -65,7 +66,7 @@ export function zodToJsonSchema(schema: z.ZodType<unknown>): Record<string, unkn
   const def = (schema as unknown as { _def?: unknown })._def as
     | { typeName?: string; schema?: { _def?: unknown }; shape?: () => Record<string, z.ZodType<unknown>> }
     | undefined;
-  if (!def) return { type: 'object', properties: {}, additionalProperties: true };
+  if (!def) return { type: 'object', properties: {}, additionalProperties: false };
   if (def.typeName === 'ZodObject' && def.shape) {
     const props: Record<string, unknown> = {};
     const required: string[] = [];
@@ -78,7 +79,7 @@ export function zodToJsonSchema(schema: z.ZodType<unknown>): Record<string, unkn
     out.additionalProperties = false;
     return out;
   }
-  return { type: 'object', properties: {}, additionalProperties: true };
+  return { type: 'object', properties: {}, additionalProperties: false };
 }
 
 function zodFieldSchema(s: z.ZodType<unknown>): Record<string, unknown> {
@@ -189,7 +190,7 @@ export function buildChatCompletionsBody(req: CallRequest): ChatCompletionsReque
 
 export function httpChatAdapter(opts: HttpAdapterOptions): ProviderAdapter {
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const url = `${opts.baseURL.replace(/\/$/, '')}/chat/completions`;
+  const url = `${opts.baseURL.replace(/\/+$/, '')}/chat/completions`;
   return {
     id: 'http-chat',
     stream(req: CallRequest): AsyncIterable<StreamEvent> {
@@ -231,11 +232,12 @@ async function* streamChatCompletions(
   if (!res.ok || !res.body) {
     clearTimeout(timer);
     req.signal?.removeEventListener('abort', onAbort);
-    const errText = await res.text().catch(() => '');
+    const rawErr = await res.text().catch(() => '');
+    const errText = redact(rawErr).slice(0, 500);
     yield {
       kind: 'error',
       code: `HTTP_${res.status}`,
-      message: `provider returned ${res.status}: ${errText.slice(0, 500)}`,
+      message: `provider returned ${res.status}: ${errText}`,
       retryable: res.status >= 500 || res.status === 429,
     };
     return;
@@ -247,6 +249,7 @@ async function* streamChatCompletions(
   // Track per-tool-call id by index.
   const toolIds = new Map<number, string>();
   const toolNames = new Map<number, string>();
+  let pendingUsage: { input: number; output: number } | undefined;
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -270,6 +273,10 @@ async function* streamChatCompletions(
           } catch {
             continue;
           }
+          // Capture usage even when finish_reason is null (Ollama/vLLM style)
+          if (chunk.usage) {
+            pendingUsage = { input: chunk.usage.prompt_tokens, output: chunk.usage.completion_tokens };
+          }
           for (const choice of chunk.choices) {
             if (choice.delta.content) {
               yield { kind: 'text_delta', text: choice.delta.content };
@@ -288,9 +295,15 @@ async function* streamChatCompletions(
               }
             }
             if (choice.finish_reason) {
-              const usage = chunk.usage
+              const usage = pendingUsage ?? (chunk.usage
                 ? { input: chunk.usage.prompt_tokens, output: chunk.usage.completion_tokens }
-                : undefined;
+                : undefined);
+              pendingUsage = undefined;
+              // Clear tool tracking per message to avoid stale ids on next turn
+              const ids = [...toolIds.values()];
+              toolIds.clear();
+              toolNames.clear();
+              for (const id of ids) yield { kind: 'tool_call_end', id };
               yield { kind: 'message_end', finishReason: choice.finish_reason, usage };
             }
           }
@@ -299,6 +312,13 @@ async function* streamChatCompletions(
     }
     if (toolIds.size) {
       for (const id of toolIds.values()) yield { kind: 'tool_call_end', id };
+      if (pendingUsage) {
+        yield { kind: 'message_end', usage: pendingUsage };
+      } else {
+        yield { kind: 'message_end' };
+      }
+    } else if (pendingUsage) {
+      yield { kind: 'message_end', usage: pendingUsage };
     } else {
       yield { kind: 'message_end' };
     }

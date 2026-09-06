@@ -8,6 +8,7 @@
 
 import React from 'react';
 import { Text, Box } from 'ink';
+import { estimateCost } from '../providers/model-info.js';
 
 export interface StatusSnapshot {
   model: string;
@@ -30,6 +31,9 @@ export function StatusLine({ snapshot }: { snapshot: StatusSnapshot }): React.JS
     'gray';
   const usageKbIn = (usageInput / 1024).toFixed(1);
   const usageKbOut = (usageOutput / 1024).toFixed(1);
+  const cost = estimateCost(model, usageInput, usageOutput);
+  const costStr = cost > 0 ? `$${cost.toFixed(3)}` : `$0.000`;
+  const ctxPct = Math.min(99, Math.round(((usageInput + usageOutput) / 128000) * 100));
   return (
     <Box borderStyle="round" borderColor="gray" paddingX={1} justifyContent="space-between">
       <Text>
@@ -46,7 +50,9 @@ export function StatusLine({ snapshot }: { snapshot: StatusSnapshot }): React.JS
         <Text color="cyan">{usageKbIn}K</Text>
         <Text color="gray"> in / </Text>
         <Text color="cyan">{usageKbOut}K</Text>
-        <Text color="gray"> out</Text>
+        <Text color="gray"> · </Text>
+        <Text color="green">{costStr}</Text>
+        <Text color="gray"> · {ctxPct}% ctx</Text>
       </Text>
       <Text>
         <Text color={statusColor as 'cyan' | 'green' | 'red' | 'yellow' | 'gray'}>● {status}</Text>

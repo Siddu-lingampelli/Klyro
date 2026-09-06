@@ -33,11 +33,11 @@ describe('buildProvider', () => {
   });
 
   it('throws when openai adapter lacks credentials', () => {
-    expect(() => buildProvider({ provider: 'openai' })).toThrow(/baseURL and apiKey/);
+    expect(() => buildProvider({ provider: 'openai' })).toThrow(/invalid --provider/);
   });
 
   it('throws when anthropic adapter lacks apiKey', () => {
-    expect(() => buildProvider({ provider: 'anthropic' })).toThrow(/requires an apiKey/);
+    expect(() => buildProvider({ provider: 'anthropic' })).toThrow(/invalid --provider/);
   });
 
   it('builds openai adapter when explicitly requested', () => {
@@ -90,7 +90,7 @@ describe('buildProvider', () => {
   });
 
   it('buildProviderFromCli rejects unknown provider', () => {
-    expect(() => buildProviderFromCli({ provider: 'grok' })).toThrow(/unknown provider/);
+    expect(() => buildProviderFromCli({ provider: 'grok' })).toThrow(/invalid --provider/);
   });
 
   it('buildProviderFromCli passes through openai', () => {

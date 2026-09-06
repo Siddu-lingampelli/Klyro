@@ -1,14 +1,6 @@
 /**
  * Ink app root — status line + scrollable transcript + input box.
- *
- * Owns the session state machine:
- *   - transcript: array of TranscriptItem (rendered by <Transcript/>)
- *   - status: snapshot for the <StatusLine/>
- *   - input: the current input-box buffer
- *
- * The actual agent loop runs externally; the app just listens for
- * RuntimeEvents via the onEvent callback wired by cli/repl.ts and
- * translates them into transcript/status updates.
+ * 1.4: history per project, multiline, Ctrl+C double, slash registry, Windows handling
  */
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
@@ -20,22 +12,20 @@ import { ApprovalModal, TuiApprovalBridge } from './approval.js';
 import { PlanView } from './plan.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash, type SlashCommand } from '../cli/slash/parser.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
 
 export interface AppProps {
   initialModel: string;
   maxSteps: number;
-  /** Working directory to display in the header. */
   cwd: string;
-  /** Called when the user submits a non-slash prompt. */
   onPrompt: (text: string) => void | Promise<void>;
-  /** Called when the user types a slash command. */
   onSlash: (cmd: import('../cli/slash/parser.js').SlashCommand) => void | Promise<void>;
-  /** Initial state (e.g. when resuming a session). */
   initialTranscript?: TranscriptItem[];
   initialStatus?: Partial<StatusSnapshot>;
-  /** Optional approval bridge — when set, the modal prompts inline. */
   approvalBridge?: TuiApprovalBridge;
-  /** Called once after mount with direct hooks; also installs global compat hooks. */
   onMounted?: (hooks: {
     append: (i: TranscriptItem) => void;
     updateStatus: (s: Partial<StatusSnapshot>) => void;
@@ -47,6 +37,48 @@ let _itemCounter = 0;
 function nextId(prefix: string): string {
   _itemCounter += 1;
   return `${prefix}-${_itemCounter}`;
+}
+
+function getGitBranch(cwd: string): string {
+  try {
+    const r = spawnSync('git', ['branch', '--show-current'], { cwd, encoding: 'utf-8', timeout: 800, windowsHide: true });
+    if (r.status === 0 && r.stdout) return r.stdout.trim().slice(0, 40);
+  } catch { /* ignore */ }
+  return '';
+}
+
+function getHistoryPath(): string {
+  const home = os.homedir() || process.cwd();
+  return path.join(home, '.klyro', 'history');
+}
+
+function loadHistory(cwd: string): string[] {
+  try {
+    const raw = fs.readFileSync(getHistoryPath(), 'utf-8');
+    const lines = raw.split('\n').filter(Boolean);
+    const out: string[] = [];
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as { cwd?: string; text?: string };
+        if (obj.cwd === cwd && typeof obj.text === 'string') out.push(obj.text);
+      } catch {
+        // legacy plain text per line
+        if (line.trim()) out.push(line.trim());
+      }
+    }
+    return out.slice(-200);
+  } catch {
+    return [];
+  }
+}
+
+function appendHistory(cwd: string, text: string): void {
+  try {
+    const p = getHistoryPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const entry = JSON.stringify({ cwd, text, ts: Date.now() });
+    fs.appendFileSync(p, entry + '\n', 'utf-8');
+  } catch { /* ignore */ }
 }
 
 export function App(props: AppProps): React.JSX.Element {
@@ -66,8 +98,17 @@ export function App(props: AppProps): React.JSX.Element {
     status: 'idle',
     ...props.initialStatus,
   });
+  const [history, setHistory] = useState<string[]>(() => loadHistory(props.cwd));
+  const historyIndexRef = useRef<number>(-1);
+  const lastCtrlCRef = useRef<number>(0);
+  const [gitBranch, setGitBranch] = useState<string>(() => getGitBranch(props.cwd));
+  const [queued, setQueued] = useState<string | null>(null);
 
-  // Track bridge state to disable the input box while a prompt is up.
+  useEffect(() => {
+    const t = setInterval(() => setGitBranch(getGitBranch(props.cwd)), 5000);
+    return () => clearInterval(t);
+  }, [props.cwd]);
+
   useEffect(() => {
     return bridge.subscribe((p) => setAwaitingApproval(p !== null));
   }, [bridge]);
@@ -75,7 +116,6 @@ export function App(props: AppProps): React.JSX.Element {
   const append = useCallback((item: TranscriptItem) => {
     setTranscript((prev) => {
       const last = prev[prev.length - 1];
-      // Only coalesce when IDs match — separate turns have different IDs
       if (
         last?.kind === 'text' &&
         item.kind === 'text' &&
@@ -98,14 +138,11 @@ export function App(props: AppProps): React.JSX.Element {
     setPlanExpanded(true);
   }, []);
 
-  // Stabilize onMounted to avoid re-installing hooks on every parent re-render
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
 
   useEffect(() => {
-    // Instance-local hooks via callback (preferred)
     onMountedRef.current?.({ append, updateStatus, updatePlan });
-    // Global compat hooks for tests / legacy callers (single instance at a time)
     (globalThis as { __klyroAppAppend?: (i: TranscriptItem) => void }).__klyroAppAppend = append;
     (globalThis as { __klyroAppStatus?: (s: Partial<StatusSnapshot>) => void }).__klyroAppStatus = updateStatus;
     (globalThis as { __klyroAppPlan?: (p: PlanStep[]) => void }).__klyroAppPlan = updatePlan;
@@ -116,18 +153,117 @@ export function App(props: AppProps): React.JSX.Element {
     };
   }, [append, updateStatus, updatePlan]);
 
+  // Handle Windows raw-mode fallback warning
+  const [rawModeWarning, setRawModeWarning] = useState<string | null>(null);
+  useEffect(() => {
+    try {
+      const stdin = process.stdin as unknown as { isTTY?: boolean; setRawMode?: (b: boolean) => void };
+      if (stdin.isTTY && typeof stdin.setRawMode !== 'function') {
+        setRawModeWarning('Raw mode not available (mintty) — input may be limited');
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  // Queue next message if typed during stream (2.4)
+  useEffect(() => {
+    if (queued && status.status !== 'running' && !awaitingApproval) {
+      const toSend = queued;
+      setQueued(null);
+      const trimmed = toSend.trim();
+      if (!trimmed) return;
+      append({ id: nextId('text'), kind: 'text', text: toSend, role: 'user' });
+      const cmd = parseSlash(trimmed);
+      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text);
+      else if (cmd.kind === 'plan') {
+        if (plan.length > 0) setPlanExpanded((v) => !v);
+      } else void props.onSlash(cmd);
+    }
+  }, [queued, status.status, awaitingApproval, plan.length, append]);
+
   useInput((inputStr, key) => {
-    if (status.status === 'running' || awaitingApproval) return;
+    if (awaitingApproval) return;
+    if (status.status === 'running') {
+      if (key.ctrl && inputStr === 'c') {
+        void props.onSlash({ kind: 'quit' });
+        return;
+      }
+      if (key.return) {
+        const value = input.trim();
+        if (!value) return;
+        setQueued(value);
+        setInput('');
+        append({ id: nextId('text'), kind: 'text', text: `queued: ${value.slice(0, 80)}`, role: 'assistant' });
+        return;
+      }
+      if (!key.ctrl && !key.meta) {
+        // Show typing indicator but don't change input (queued mode)
+        return;
+      }
+      return;
+    }
+
+    // History navigation
+    if (key.upArrow) {
+      if (history.length === 0) return;
+      if (historyIndexRef.current === -1) historyIndexRef.current = history.length - 1;
+      else if (historyIndexRef.current > 0) historyIndexRef.current--;
+      setInput(history[historyIndexRef.current] ?? '');
+      return;
+    }
+    if (key.downArrow) {
+      if (historyIndexRef.current === -1) return;
+      historyIndexRef.current++;
+      if (historyIndexRef.current >= history.length) {
+        historyIndexRef.current = -1;
+        setInput('');
+      } else {
+        setInput(history[historyIndexRef.current] ?? '');
+      }
+      return;
+    }
+    // Ctrl+R search — simple: cycle history
+    if (key.ctrl && inputStr === 'r') {
+      if (history.length === 0) return;
+      const term = input.toLowerCase();
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i]!.toLowerCase().includes(term)) {
+          setInput(history[i]!);
+          return;
+        }
+      }
+      return;
+    }
     if (key.return) {
-      const value = input.trim();
+      // Multiline: trailing \ or Shift+Enter (where supported, key.shift is true)
+      // Ink's key object has `shift` for Shift+Enter on some terminals
+      const isShiftEnter = (key as unknown as { shift?: boolean }).shift === true;
+      if (isShiftEnter || input.endsWith('\\')) {
+        // Replace trailing \ with newline, or just add newline for Shift+Enter
+        if (input.endsWith('\\')) setInput((v) => v.slice(0, -1) + '\n');
+        else setInput((v) => v + '\n');
+        return;
+      }
+      const value = input;
+      // Preserve newlines for bracketed paste — don't trim inner newlines, only outer
+      const trimmedOuter = value.replace(/^\s+|\s+$/g, '');
+      if (!trimmedOuter) {
+        setInput('');
+        return;
+      }
+      // Check for Ctrl+C double at empty prompt handled below, but here handle submit
       setInput('');
-      if (!value) return;
+      historyIndexRef.current = -1;
+      // Save to history
+      setHistory((prev) => {
+        const next = [...prev, value];
+        appendHistory(props.cwd, value);
+        return next.slice(-200);
+      });
       append({ id: nextId('text'), kind: 'text', text: value, role: 'user' });
-      const cmd: SlashCommand = parseSlash(value);
+      const cmd = parseSlash(trimmedOuter);
       if (cmd.kind === 'prompt') {
         void props.onPrompt(cmd.text);
       } else if (cmd.kind === 'plan') {
-        // Local UI command — toggle the plan view inline.
         if (plan.length > 0) setPlanExpanded((v) => !v);
       } else {
         void props.onSlash(cmd);
@@ -138,18 +274,46 @@ export function App(props: AppProps): React.JSX.Element {
       setInput((v) => v.slice(0, -1));
       return;
     }
+    // Ctrl+C double at empty prompt exits
     if (key.ctrl && inputStr === 'c') {
+      if (input === '') {
+        const now = Date.now();
+        if (now - lastCtrlCRef.current < 1500) {
+          void props.onSlash({ kind: 'quit' });
+          return;
+        }
+        lastCtrlCRef.current = now;
+        append({ id: nextId('text'), kind: 'text', text: '(press Ctrl+C again to exit)', role: 'assistant' });
+        return;
+      }
+      // Single Ctrl+C cancels input
+      setInput('');
+      return;
+    }
+    if (key.ctrl && inputStr === 'd') {
       void props.onSlash({ kind: 'quit' });
       return;
     }
+    if (key.ctrl && inputStr === 'l') {
+      // Clear — keep session but clear transcript marker
+      append({ id: nextId('text'), kind: 'text', text: '(cleared)', role: 'assistant' });
+      return;
+    }
+    // Handle bracketed paste: inputStr may contain \r\n or multiple lines
     if (!key.ctrl && !key.meta) {
-      setInput((v) => v + inputStr);
+      // Preserve all characters including newlines from paste
+      // Normalize \r\n to \n
+      const normalized = inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      setInput((v) => v + normalized);
     }
   });
+
+  const promptStr = `klyro › ${path.basename(props.cwd)}${gitBranch ? ` (${gitBranch})` : ''}`;
 
   return (
     <Box flexDirection="column" width="100%" height="100%">
       <Header cwd={props.cwd} model={status.model} step={status.step} maxSteps={status.maxSteps} />
+      {rawModeWarning ? <Box><Text color="yellow">{rawModeWarning}</Text></Box> : null}
       <StatusLine snapshot={status} />
       {plan.length > 0 ? (
         <PlanView steps={plan} expanded={planExpanded} onToggle={() => setPlanExpanded((v) => !v)} />
@@ -157,10 +321,11 @@ export function App(props: AppProps): React.JSX.Element {
       <Transcript items={transcript} />
       {awaitingApproval ? <ApprovalModal bridge={bridge} /> : null}
       <Box borderStyle="single" borderColor={awaitingApproval ? 'yellow' : 'gray'} paddingX={1}>
-        <Text color="gray">{awaitingApproval ? '! ' : '> '}</Text>
+        <Text color="gray">{awaitingApproval ? '! ' : `${promptStr} `}</Text>
         <Text>{awaitingApproval ? '(awaiting approval — see above)' : input}</Text>
         {status.status === 'running' ? <Text color="cyan"> ▍</Text> : <Text>▍</Text>}
       </Box>
+      <Box paddingX={1}><Text dimColor>Tab: slash completion · Shift+Enter: newline · Ctrl+C twice: exit · Ctrl+R: history</Text></Box>
     </Box>
   );
 }

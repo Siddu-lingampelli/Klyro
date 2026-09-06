@@ -9,7 +9,9 @@
  *     the output). The agent reads exitCode to decide what to do next.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { resolveWithinCwd } from '../../policy/path-guard.js';
@@ -22,17 +24,56 @@ const InputSchema = z.object({
   env: z.record(z.string(), z.string()).optional().describe('Extra env vars merged onto process.env'),
 });
 
-const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_OUTPUT_BYTES = 128 * 1024;
+const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_TIMEOUT_MS = 600_000;
+const MAX_OUTPUT_CHARS = 30_000; // head+tail cap per 3.3
+const FULL_OUTPUT_DIR = (() => {
+  try {
+    const home = os.homedir() || process.cwd();
+    return path.join(home, '.klyro', 'tool-output');
+  } catch { return path.join(process.cwd(), '.klyro', 'tool-output'); }
+})();
 
-// Hard-coded dangerous patterns. These are non-overridable in MVP.
+// Persistent cwd across calls (3.3)
+let persistentCwd: string | null = null;
+
+// Filtered env — only safe vars, secrets stripped
+const ALLOWED_ENV_PREFIXES = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'NODE_', 'NPM_', 'PNPM_', 'YARN_'];
+function filteredEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith('KLYRO_') && k.includes('API_KEY')) continue;
+    if (k.includes('SECRET') || k.includes('TOKEN') || k === 'ANTHROPIC_API_KEY' || k === 'OPENAI_API_KEY') continue;
+    if (ALLOWED_ENV_PREFIXES.some((p) => k.startsWith(p)) || k === 'PWD' || k === 'TMPDIR' || k === 'TEMP') {
+      out[k] = v;
+    }
+  }
+  // Always allow basic
+  out.PATH = process.env.PATH;
+  if (extra) Object.assign(out, extra);
+  return out;
+}
+
+// Interactive command detection (3.3)
+const INTERACTIVE_PATTERNS = [/^\s*vim\b/, /^\s*nano\b/, /^\s*htop\b/, /^\s*less\b/, /^\s*more\b/, /^\s*ssh\b/, /^\s*tmux\b/];
+
+// Hard-coded dangerous patterns. These are non-overridable, configurable via --yolo only.
 const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /rm\s+-rf?\s+\//, reason: 'recursive delete at filesystem root' },
+  { pattern: /rm\s+-rf?\s+\/\/+/, reason: 'recursive delete at filesystem root (//)' },
+  { pattern: /rm\s+-rf?\s+\/\*/, reason: 'recursive delete at filesystem root (/*)' },
+  { pattern: /rm\s+-rf?\s+\.\s*($|[;&|])/, reason: 'recursive delete current directory' },
+  { pattern: /rm\s+-rf?\s+\*\s*($|[;&|])/, reason: 'recursive delete all files via *' },
+  { pattern: /rm\s+-rf?\s+\.\/\*\s*($|[;&|])/, reason: 'recursive delete all files' },
   { pattern: /del\s+\/s\s+\/q\s+[a-z]:\\/i, reason: 'recursive delete on Windows drive root' },
   { pattern: /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/, reason: 'fork bomb' },
+  { pattern: /bomb\(\)\s*\{\s*bomb\|bomb/, reason: 'fork bomb variant' },
   { pattern: />\s*\/dev\/sd[a-z]/, reason: 'overwrite raw block device' },
   { pattern: /mkfs(\.|\s)/, reason: 'format filesystem' },
   { pattern: /dd\s+.*of=\/dev\//, reason: 'dd write to device' },
+  { pattern: /chmod\s+-R\s+777\s+\//, reason: 'chmod 777 on root' },
+  { pattern: /curl.*\|\s*(sh|bash|python|perl|ruby)/i, reason: 'curl|sh to unknown host' },
+  { pattern: /rm\s+-rf\s+--no-preserve-root\s+\//, reason: 'recursive delete --no-preserve-root' },
 ];
 
 export interface ShellOutput {
@@ -46,27 +87,45 @@ export interface ShellOutput {
   truncated: boolean;
 }
 
-export const shellExecTool = defineTool({
+export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput>({
   name: 'shell_exec',
   description:
-    'Execute a shell command. Default timeout 30s. Output is truncated at 128 KiB. Returns exitCode (or null if killed by signal). Non-zero exit code is NOT a tool error — the tool succeeds and the agent sees the exit code in the output.',
+    'Execute a shell command. Default timeout 120s (max 600s). Output head+tail 30k chars, full to ~/.klyro/tool-output/<id>.txt. Persistent cwd, filtered env, tree-kill on timeout.',
   inputSchema: InputSchema,
+  permission: 'execute',
+  isConcurrencySafe: false,
+  renderCall: (input) => `$ ${input.command.slice(0, 80)}`,
+  renderResult: (output) => `exit ${output.exitCode} (${output.durationMs}ms${output.timedOut ? ' timedOut' : ''})`,
   execute: async (input, ctx) => {
     return safe(async () => {
-      for (const { pattern, reason } of DANGEROUS_PATTERNS) {
-        if (pattern.test(input.command)) {
-          return {
-            ok: false,
-            error: { code: TOOL_ERROR_CODES.COMMAND_DENIED, message: `Command blocked: ${reason}` },
-          } as const;
+      // Interactive detection
+      for (const pat of INTERACTIVE_PATTERNS) {
+        if (pat.test(input.command)) {
+          throw Object.assign(new Error(`Interactive command blocked: ${input.command.split(' ')[0]} — hint: use non-interactive mode or run in background`), { code: TOOL_ERROR_CODES.COMMAND_DENIED });
         }
       }
-      let cwd = ctx.cwd;
+      for (const { pattern, reason } of DANGEROUS_PATTERNS) {
+        if (pattern.test(input.command)) {
+          throw Object.assign(new Error(`Command blocked: ${reason}`), { code: TOOL_ERROR_CODES.COMMAND_DENIED });
+        }
+      }
+      // Persistent cwd
+      let cwd = persistentCwd ?? ctx.cwd;
       if (input.cwd) {
         cwd = resolveWithinCwd(ctx.cwd, input.cwd).resolved;
+        persistentCwd = cwd;
+      } else if (input.command.trim().startsWith('cd ')) {
+        const m = /^\s*cd\s+(.+?)\s*(?:&&|;|$)/.exec(input.command);
+        if (m?.[1]) {
+          try {
+            const target = m[1].replace(/^["']|["']$/g, '');
+            const resolved = resolveWithinCwd(cwd, target).resolved;
+            persistentCwd = resolved;
+          } catch { /* ignore */ }
+        }
       }
-      const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-      const env = { ...process.env, ...(input.env ?? {}) };
+      const timeoutMs = Math.min(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+      const env = filteredEnv(input.env);
       const start = Date.now();
 
       const child = spawn(input.command, {
@@ -80,21 +139,28 @@ export const shellExecTool = defineTool({
 
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
+      const fullStdout: Buffer[] = [];
+      const fullStderr: Buffer[] = [];
       let totalOut = 0;
       let totalErr = 0;
       let truncated = false;
 
       child.stdout?.on('data', (chunk: Buffer) => {
-        if (totalOut + chunk.length > MAX_OUTPUT_BYTES) {
+        fullStdout.push(chunk);
+        if (totalOut + chunk.length > MAX_OUTPUT_CHARS) {
           truncated = true;
+          // Keep head+tail: drop middle, keep first half and last half later
+          if (stdoutChunks.length < 10) stdoutChunks.push(chunk);
           return;
         }
         stdoutChunks.push(chunk);
         totalOut += chunk.length;
       });
       child.stderr?.on('data', (chunk: Buffer) => {
-        if (totalErr + chunk.length > MAX_OUTPUT_BYTES) {
+        fullStderr.push(chunk);
+        if (totalErr + chunk.length > MAX_OUTPUT_CHARS) {
           truncated = true;
+          if (stderrChunks.length < 10) stderrChunks.push(chunk);
           return;
         }
         stderrChunks.push(chunk);
@@ -120,7 +186,7 @@ export const shellExecTool = defineTool({
           // -SIGKILL signals the group so children go too.
           if (process.platform === 'win32') {
             try {
-              require('node:child_process').spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true });
+              spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true });
             } catch { /* already gone */ }
           } else {
             try { child.kill('SIGKILL'); } catch { /* already dead */ }
@@ -132,8 +198,37 @@ export const shellExecTool = defineTool({
       });
       const { code: exitCode, signal, timedOut } = outcome;
 
-      const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
-      const stderr = Buffer.concat(stderrChunks).toString('utf-8');
+      const fullOutBuf = Buffer.concat(fullStdout);
+      const fullErrBuf = Buffer.concat(fullStderr);
+      // Write full output to ~/.klyro/tool-output/<id>.txt for 3.3
+      const outId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      try {
+        const fs = await import('node:fs/promises');
+        const path = await import('node:path');
+        await fs.mkdir(FULL_OUTPUT_DIR, { recursive: true });
+        const fullPath = path.join(FULL_OUTPUT_DIR, `${outId}.txt`);
+        const fullContent = `STDOUT:\n${fullOutBuf.toString('utf-8')}\n\nSTDERR:\n${fullErrBuf.toString('utf-8')}\n`;
+        await fs.writeFile(fullPath, fullContent, 'utf-8');
+      } catch { /* ignore */ }
+
+      // Head+tail truncation: keep first 15k and last 15k chars
+      let stdout: string;
+      let stderr: string;
+      if (truncated) {
+        const fullOutStr = fullOutBuf.toString('utf-8');
+        const fullErrStr = fullErrBuf.toString('utf-8');
+        const headTail = (s: string): string => {
+          if (s.length <= MAX_OUTPUT_CHARS) return s;
+          const head = s.slice(0, 15000);
+          const tail = s.slice(-15000);
+          return head + `\n... [truncated ${s.length - 30000} chars, full at ~/.klyro/tool-output/${outId}.txt]\n` + tail;
+        };
+        stdout = headTail(fullOutStr);
+        stderr = headTail(fullErrStr);
+      } else {
+        stdout = Buffer.concat(stdoutChunks).toString('utf-8');
+        stderr = Buffer.concat(stderrChunks).toString('utf-8');
+      }
 
       return {
         command: input.command,

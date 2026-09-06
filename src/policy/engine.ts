@@ -31,13 +31,23 @@ export interface PolicyContext {
   config: PolicyConfig;
 }
 
+export type PermissionMode = 'default' | 'accept-edits' | 'plan' | 'auto';
+
 export interface PolicyConfig {
+  /** Permission mode */
+  mode?: PermissionMode;
   /** Shell commands that are pre-approved (prefix match). */
   shellAllow: string[];
   /** Hard-deny shell commands (prefix or full match). */
   shellDeny: string[];
   /** File size limit in MiB for reads without confirmation. */
   readSizeAskMiB: number;
+  /** Glob rules: e.g. "write_file", "write_file(.env)", "shell_exec(npm *)" */
+  allow?: string[];
+  deny?: string[];
+  ask?: string[];
+  /** Additional allowed directories (sandbox) */
+  additionalDirs?: string[];
 }
 
 export interface PolicyRule {
@@ -47,6 +57,7 @@ export interface PolicyRule {
 }
 
 export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
+  mode: 'default',
   shellAllow: [
     'git',
     'ls',
@@ -75,6 +86,10 @@ export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
     'bcdedit',
   ],
   readSizeAskMiB: 5,
+  allow: [],
+  deny: [],
+  ask: [],
+  additionalDirs: [],
 };
 
 /**
@@ -94,11 +109,59 @@ export class PolicyEngine {
       nonInteractive: base.nonInteractive,
       config: this.config,
     };
+
+    // 3.4 — Permission modes
+    if (ctx.config.mode === 'auto') {
+      // auto / --yolo: allow everything (except hard deny already handled)
+    } else if (ctx.config.mode === 'plan') {
+      // plan mode: block all writes (edit)
+      if (call.name === 'write_file' || call.name === 'edit_file') {
+        return { action: 'deny', reason: 'plan mode: writes blocked — use /permissions to allow or switch mode' };
+      }
+    } else if (ctx.config.mode === 'accept-edits') {
+      // accept-edits: auto-allow edit tools
+      if (call.name === 'write_file' || call.name === 'edit_file') {
+        // fall through to allow, but still check .env below
+      }
+    }
+
+    // 3.4 — Glob rules allow/deny/ask with precedence deny → allow → ask
+    const globDecision = this.evaluateGlobRules(call);
+    if (globDecision) return globDecision;
+
+    // 3.4 — .env guard: deny writes to .env files unless explicitly allowed
+    if ((call.name === 'write_file' || call.name === 'edit_file') && typeof call.input.path === 'string') {
+      const p = String(call.input.path);
+      if (/(^|\/)\.env(\.|$)/.test(p) || p.endsWith('.env')) {
+        // Check if explicitly allowed via allow list
+        const allowed = (ctx.config.allow ?? []).some((r) => r.includes('.env'));
+        if (!allowed) {
+          return { action: 'deny', reason: 'write to .env denied by policy — add to allow list or use --yolo' };
+        }
+      }
+    }
+
     for (const rule of this.rules) {
       const d = rule.evaluate(call, ctx);
       if (d) return d;
     }
     return { action: 'allow' };
+  }
+
+  private evaluateGlobRules(call: ToolCallLike): Decision | null {
+    const check = (list: string[] | undefined, action: Decision['action']): Decision | null => {
+      if (!list || list.length === 0) return null;
+      for (const rule of list) {
+        if (matchesGlobRule(call, rule)) {
+          if (action === 'allow') return { action: 'allow' };
+          if (action === 'deny') return { action: 'deny', reason: `denied by rule: ${rule}` };
+          return { action: 'ask', reason: `requires approval per rule: ${rule}` };
+        }
+      }
+      return null;
+    };
+    // Precedence: deny → allow → ask
+    return check(this.config.deny, 'deny') ?? check(this.config.allow, 'allow') ?? check(this.config.ask, 'ask') ?? null;
   }
 }
 
@@ -114,6 +177,24 @@ export function builtinRules(): PolicyRule[] {
 
 function asString(v: unknown): string {
   return typeof v === 'string' ? v : '';
+}
+
+function matchesGlobRule(call: ToolCallLike, rule: string): boolean {
+  // Rule grammar: tool or tool(glob). e.g. "write_file", "write_file(.env)", "shell_exec(npm *)"
+  const m = /^([a-z_]+)(?:\((.*)\))?$/.exec(rule.trim());
+  if (!m) return false;
+  const tool = m[1]!;
+  const glob = m[2];
+  if (tool !== call.name) return false;
+  if (glob === undefined) return true; // any input for that tool
+  // For shell, match command; for file tools, match path
+  const target = typeof call.input.command === 'string' ? String(call.input.command)
+    : typeof call.input.path === 'string' ? String(call.input.path)
+    : JSON.stringify(call.input);
+  // Simple glob: * matches any, ? matches single, otherwise substring
+  const regexStr = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  const re = new RegExp(`^${regexStr}$`, 'i');
+  return re.test(target);
 }
 
 function startsWithAny(haystack: string, needles: string[]): boolean {
@@ -158,14 +239,22 @@ export const shellAllowRule: PolicyRule = {
   },
 };
 
-/** Writes are auto-allowed if path resolves inside cwd (path-guard throws otherwise). */
+/** Writes are auto-allowed if path resolves inside cwd or --add-dir (path-guard throws otherwise). */
 export const writeFileCwdRule: PolicyRule = {
   name: 'write-file-cwd',
-  evaluate(call) {
+  evaluate(call, ctx) {
     if (call.name !== 'write_file' && call.name !== 'edit_file') return null;
     const p = asString(call.input.path);
     if (!p) return null;
     if (p.includes('..') || path.isAbsolute(p)) {
+      // Check if absolute is inside additionalDirs
+      if (path.isAbsolute(p)) {
+        const allowed = (ctx.config.additionalDirs ?? []).some((dir) => {
+          const rel = path.relative(path.resolve(dir), path.resolve(p));
+          return !rel.startsWith('..') && !path.isAbsolute(rel);
+        });
+        if (allowed) return null;
+      }
       return { action: 'deny', reason: 'path traversal or absolute path not allowed' };
     }
     return null;

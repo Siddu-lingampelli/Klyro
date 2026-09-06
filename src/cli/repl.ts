@@ -21,6 +21,9 @@ import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
 import { resolveProvider, providerHelp } from '../providers.js';
 import { inferProviderFromBaseURL } from '../agent/registry.js';
+import { getDefaultSessionStore } from '../persistence/session.js';
+import { buildSystemPrompt, parseImageInput } from '../context/system-prompt.js';
+import { estimateCost } from '../providers/model-info.js';
 
 export interface ReplOptions {
   systemPrompt?: string;
@@ -65,10 +68,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     : httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: 60_000 });
   const ctxBlock = await buildLevel6Context({ cwd });
   const ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
+  // 2.3 layered system prompt
   const systemPromptFn = (_ctx: { cwd: string; telemetry?: string }): string => {
-    const base = opts.systemPrompt ?? 'You are Klyro, an autonomous coding harness. Solve the user\'s task using the available tools.';
+    const base = buildSystemPrompt({ cwd, model, extraSystem: opts.systemPrompt, appendSystem: ctxPrefix });
     const t = _ctx.telemetry ? '\n\n' + _ctx.telemetry : '';
-    return base + ctxPrefix + t;
+    return base + t;
   };
 
   const ac = new AbortController();
@@ -117,6 +121,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // Declare app before handler to avoid TDZ; handler added after render
   let app: ReturnType<typeof render> | undefined;
   let sigintHandler: (() => void) | undefined;
+  // Level 9 — session store for TUI (one store per REPL)
+  const tuiStore = getDefaultSessionStore();
+  let tuiSessionId: string | undefined;
 
   app = render(
     React.createElement(App, {
@@ -160,6 +167,19 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       queuedStatus({ status: 'error', errorMessage: 'no model configured' });
       return;
     }
+    // 2.3 image handling: extract @img refs
+    const { text: cleanText, images } = parseImageInput(text);
+    const taskText = images.length > 0 ? `${cleanText}\n\n[images: ${images.join(', ')}]` : cleanText;
+    // Level 9 — create session for this prompt if not already (one session per prompt)
+    let sessionId: string | undefined;
+    try {
+      const rec = await tuiStore.create({ cwd, task: taskText, config: { model, maxSteps: opts.maxSteps ?? 30 } });
+      sessionId = rec.id;
+      tuiSessionId = rec.id;
+      queuedAppend({ id: `sess-${Date.now()}`, kind: 'text', text: `session ${rec.id.slice(0, 8)} started`, role: 'assistant' });
+    } catch {
+      // best-effort
+    }
     queuedStatus({ status: 'running', step: 0, model });
     let textBuf = '';
     let pendingTextId: string | null = null;
@@ -169,12 +189,14 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     try {
       const result = await run(
         {
-          task: text,
+          task: taskText,
           cwd,
           model,
           maxSteps: opts.maxSteps ?? 30,
           signal: ac.signal,
           nonInteractive: opts.nonInteractive ?? false,
+          verify: { enabled: true, maxRepairAttempts: 3 },
+          persist: sessionId ? { store: tuiStore, sessionId } : undefined,
           onEvent: (ev) => {
             if (ev.kind === 'step_start') {
               // Flush coalesced text before new step
@@ -200,6 +222,16 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
               const id = `text-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
               pendingTextId = id;
               queuedAppend({ id, kind: 'text', text: ev.text, role: 'assistant' });
+            } else if (ev.kind === 'verification_started') {
+              queuedAppend({ id: `vrfy-${Date.now()}`, kind: 'text', text: `[verify] running \`${ev.command}\``, role: 'assistant' });
+              queuedStatus({ status: 'running' });
+            } else if (ev.kind === 'verification_succeeded') {
+              queuedAppend({ id: `vrfy-ok-${Date.now()}`, kind: 'text', text: `[verify] passed (${ev.command})`, role: 'assistant' });
+            } else if (ev.kind === 'repair_started') {
+              queuedAppend({ id: `repair-${Date.now()}`, kind: 'text', text: `[repair] attempt ${ev.attempt}/${ev.maxAttempts}: ${ev.reason.slice(0, 200)}`, role: 'assistant' });
+              queuedStatus({ status: 'running', errorMessage: undefined });
+            } else if (ev.kind === 'checkpoint_saved') {
+              queuedStatus({ status: 'running' });
             } else if (ev.kind === 'tool_call_start') {
               activeCallId = ev.id;
               activeCallName = ev.name;
@@ -262,7 +294,27 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         },
         { adapter, registry, policy, approval, systemPrompt: systemPromptFn },
       );
-      queuedStatus({ status: 'complete' === result.status ? 'done' : 'error', repairs: result.repairs ?? 0 });
+      if (result.verification) {
+        const v = result.verification;
+        queuedAppend({
+          id: `vfin-${Date.now()}`,
+          kind: 'text',
+          text: `[verify] ${v.ok ? 'passed' : `failed (${v.failureType ?? 'unknown'})`} after ${v.attempts} attempt(s)${v.command ? ` — ${v.command}` : ''}`,
+          role: 'assistant',
+        });
+        if (!v.ok) {
+          queuedStatus({ status: 'error', errorMessage: `verification failed: ${v.failureType ?? 'unknown'}` });
+        }
+      }
+      if (result.status === 'verify_failed') {
+        queuedAppend({ id: `verr-${Date.now()}`, kind: 'error', message: `Verification failed after ${result.verification?.attempts ?? 3} attempts. Check output above.` });
+        queuedStatus({ status: 'error', errorMessage: 'verification failed' });
+      } else {
+        queuedStatus({ status: 'complete' === result.status ? 'done' : 'error', repairs: result.repairs ?? 0 });
+      }
+      if (sessionId) {
+        queuedAppend({ id: `sess-end-${Date.now()}`, kind: 'text', text: `session ${sessionId.slice(0, 8)} ${result.status} — ${result.steps} steps, ${result.toolCalls} tool calls`, role: 'assistant' });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       queuedAppend({ id: `err-${Date.now()}`, kind: 'error', message });
@@ -287,10 +339,59 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           '  /status         — show session status',
           '  /compact        — (stub) context compaction',
           '  /model <id>     — switch model mid-session',
-          '  /quit           — exit',
+          '  /config         — show config path',
+          '  /doctor         — run diagnostics',
+          '  /version        — show version',
+          '  /quit (/exit)   — exit',
           `provider: ${effectiveProvider}  model: ${model}  cwd: ${cwd}`,
         ].join('\n');
         queuedAppend({ id: `help-${Date.now()}`, kind: 'text', text: helpText, role: 'assistant' });
+        return;
+      }
+      case 'config': {
+        const { getConfigPath } = await import('./config.js');
+        queuedAppend({ id: `cfg-${Date.now()}`, kind: 'text', text: `config: ${getConfigPath()}`, role: 'assistant' });
+        return;
+      }
+      case 'doctor': {
+        const { runDoctor } = await import('./doctor.js');
+        // Capture doctor output via temporary override
+        const origWrite = process.stdout.write.bind(process.stdout);
+        let out = '';
+        (process.stdout as unknown as { write: (s: string) => boolean }).write = ((chunk: string) => { out += String(chunk); return true; }) as typeof process.stdout.write;
+        await runDoctor({});
+        (process.stdout as unknown as { write: typeof origWrite }).write = origWrite;
+        queuedAppend({ id: `doc-${Date.now()}`, kind: 'text', text: out, role: 'assistant' });
+        return;
+      }
+      case 'version': {
+        const { readFileSync } = await import('node:fs');
+        const { resolve, dirname } = await import('node:path');
+        const { fileURLToPath } = await import('node:url');
+        try {
+          const here = dirname(fileURLToPath(import.meta.url));
+          const pkg = JSON.parse(readFileSync(resolve(here, '../../package.json'), 'utf-8')) as { version?: string };
+          queuedAppend({ id: `ver-${Date.now()}`, kind: 'text', text: `klyro ${pkg.version ?? '0.0.0'}`, role: 'assistant' });
+        } catch {
+          queuedAppend({ id: `ver-${Date.now()}`, kind: 'text', text: 'klyro (version unknown)', role: 'assistant' });
+        }
+        return;
+      }
+      case 'cost': {
+        const cost = lastStatus ? estimateCost(lastStatus.model ?? model, lastStatus.usageInput ?? 0, lastStatus.usageOutput ?? 0) : 0;
+        const input = lastStatus?.usageInput ?? 0;
+        const output = lastStatus?.usageOutput ?? 0;
+        const total = input + output;
+        queuedAppend({
+          id: `cost-${Date.now()}`,
+          kind: 'text',
+          text: `Cost: $${cost.toFixed(4)} · ${input} in / ${output} out · ${total} total · model ${lastStatus?.model ?? model}`,
+          role: 'assistant',
+        });
+        return;
+      }
+      case 'thinking': {
+        queuedAppend({ id: `think-${Date.now()}`, kind: 'text', text: 'Thinking: collapsed (use --show-thinking to expand)', role: 'assistant' });
         return;
       }
       case 'status': {

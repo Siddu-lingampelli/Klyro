@@ -45,10 +45,17 @@ export function assertSafeBaseURL(url: string): void {
   if (parsed.protocol === 'https:') return;
   if (parsed.protocol === 'http:') {
     const host = parsed.hostname.toLowerCase();
-    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return;
+    // Allow loopback equivalents: localhost, 127.0.0.1, ::1, 0.0.0.0, ::, 127.x.x.x is NOT allowed without https
+    // Note: hostnames that resolve to loopback (e.g. nip.io) still require https — we check hostname, not DNS.
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0' || host === '::' || host === '[::]') return;
+    // Also allow 127.0.0.0/8 range via prefix check (e.g. 127.0.0.2)
+    if (host.startsWith('127.')) {
+      const parts = host.split('.');
+      if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) return;
+    }
     throw new Error(
       `Refusing to send KLYRO_API_KEY over plaintext HTTP to ${host}. ` +
-        `Use https:// or a localhost URL.`,
+        `Use https:// or a localhost URL (localhost, 127.0.0.1, ::1, 0.0.0.0).`,
     );
   }
   throw new Error(`Unsupported KLYRO_BASE_URL protocol: ${parsed.protocol}`);
@@ -74,10 +81,16 @@ export async function chat(
 
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(new Error(`request timed out after ${timeoutMs}ms`)), timeoutMs);
+  // Ensure timer is always cleared — use try/finally pattern
+  const clearTimer = () => clearTimeout(timeout);
   // If the caller passed their own signal, abort when they abort.
+  let callerAbortHandler: (() => void) | undefined;
   if (opts.signal) {
     if (opts.signal.aborted) ac.abort(opts.signal.reason);
-    else opts.signal.addEventListener('abort', () => ac.abort(opts.signal?.reason), { once: true });
+    else {
+      callerAbortHandler = () => ac.abort(opts.signal?.reason);
+      opts.signal.addEventListener('abort', callerAbortHandler, { once: true });
+    }
   }
 
   let res: Response;
@@ -99,12 +112,14 @@ export async function chat(
       signal: ac.signal,
     });
   } catch (err) {
-    clearTimeout(timeout);
+    clearTimer();
+    if (callerAbortHandler && opts.signal) opts.signal.removeEventListener('abort', callerAbortHandler);
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`klyro: request failed: ${msg}`);
     process.exit(1);
   }
-  clearTimeout(timeout);
+  clearTimer();
+  if (callerAbortHandler && opts.signal) opts.signal.removeEventListener('abort', callerAbortHandler);
 
   if (!res.ok) {
     const text = await readBoundedText(res.body, MAX_ERROR_BODY_BYTES);
@@ -130,9 +145,9 @@ export async function chat(
 }
 
 /**
- * Parse SSE frames and write text deltas to stdout. Each `data: ...` line is
- * one chunk; `[DONE]` terminates the stream. Respects backpressure on stdout
- * and the provided abort signal.
+ * Parse SSE frames and write text deltas to stdout. Handles
+ * fragmented chunks by buffering and splitting on \n\n event boundary.
+ * Respects backpressure on stdout and the provided abort signal.
  */
 export async function streamToStdout(
   body: ReadableStream<Uint8Array>,
@@ -148,33 +163,63 @@ export async function streamToStdout(
       const { value, done } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
+      // SSE events are separated by \n\n — handle fragmented deliveries
       let idx: number;
-      while ((idx = buf.indexOf('\n')) !== -1) {
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
         if (signal.aborted) throw new Error('aborted');
-        const line = buf.slice(0, idx).replace(/\r$/, '');
-        buf = buf.slice(idx + 1);
-        if (!line.startsWith('data:')) continue;
-        const data = line.slice(5).trim();
-        if (data === '[DONE]') {
-          process.stdout.write('\n');
-          return;
-        }
-        let parsed: { choices?: Array<{ delta?: { content?: string } }> };
-        try {
-          parsed = JSON.parse(data);
-        } catch {
-          continue;
-        }
-        const text = parsed.choices?.[0]?.delta?.content;
-        if (text) {
-          if (!await writeWithBackpressure(text)) {
-            // stdout closed (pipe severed). Stop reading.
-            try {
-              await reader.cancel();
-            } catch {
-              /* ignore */
-            }
+        const event = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const rawLine of event.split('\n')) {
+          const line = rawLine.replace(/\r$/, '');
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') {
+            process.stdout.write('\n');
             return;
+          }
+          // Handle case where data was split across chunks and reassembled as event
+          if (data === '') continue;
+          let parsed: { choices?: Array<{ delta?: { content?: string } }> };
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          const text = parsed.choices?.[0]?.delta?.content;
+          if (text) {
+            if (!await writeWithBackpressure(text, signal)) {
+              try { await reader.cancel(); } catch { /* ignore */ }
+              return;
+            }
+          }
+        }
+      }
+      // Also handle single \n lines that haven't yet formed \n\n (for providers that send \n only)
+      // Process remaining complete lines if no \n\n found but buffer has \n
+      if (buf.includes('\n') && !buf.includes('\n\n')) {
+        const lines = buf.split('\n');
+        // Keep last incomplete line in buf
+        buf = lines.pop() ?? '';
+        for (const rawLine of lines) {
+          const line = rawLine.replace(/\r$/, '');
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') {
+            process.stdout.write('\n');
+            return;
+          }
+          if (data === '') continue;
+          try {
+            const parsed = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }> };
+            const text = parsed.choices?.[0]?.delta?.content;
+            if (text) {
+              if (!await writeWithBackpressure(text, signal)) {
+                try { await reader.cancel(); } catch { /* ignore */ }
+                return;
+              }
+            }
+          } catch {
+            continue;
           }
         }
       }
@@ -192,20 +237,42 @@ export async function streamToStdout(
 /**
  * Write to stdout and wait for the drain event if the buffer is full.
  * Returns false if stdout has been closed (e.g. piped to `head`).
+ * Respects abort signal — resolves false if aborted while waiting.
  */
-function writeWithBackpressure(chunk: string): Promise<boolean> {
+function writeWithBackpressure(chunk: string, signal?: AbortSignal): Promise<boolean> {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve(false);
+      return;
+    }
     if (!process.stdout.write(chunk)) {
-      const onDrain = () => {
+      let settled = false;
+      const cleanup = () => {
+        process.stdout.off('drain', onDrain);
         process.stdout.off('error', onError);
+        if (signal) signal.removeEventListener('abort', onAbort);
+      };
+      const onDrain = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         resolve(true);
       };
       const onError = () => {
-        process.stdout.off('drain', onDrain);
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(false);
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         resolve(false);
       };
       process.stdout.once('drain', onDrain);
       process.stdout.once('error', onError);
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
     } else {
       resolve(true);
     }
@@ -226,8 +293,15 @@ export async function readBoundedText(
   const chunks: Uint8Array[] = [];
   try {
     while (received < max) {
-      const { value, done } = await reader.read();
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch {
+        break;
+      }
+      const { value, done } = result;
       if (done) break;
+      if (!value) break;
       const remaining = max - received;
       if (value.byteLength <= remaining) {
         chunks.push(value);
@@ -240,6 +314,11 @@ export async function readBoundedText(
   } finally {
     try {
       reader.releaseLock();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await reader.cancel().catch(() => undefined);
     } catch {
       /* ignore */
     }

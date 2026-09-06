@@ -50,8 +50,8 @@ export async function repl(system: string): Promise<void> {
   // 'SIGINT' event on the interface. Wire it to a clean exit so the user gets
   // exit code 130 (the conventional 128+SIGINT(2)) instead of a crash.
   rl.on('SIGINT', () => {
-    process.stdout.write('\n');
-    rl.close();
+    try { process.stdout.write('\n'); } catch { /* ignore */ }
+    try { rl.close(); } catch { /* ignore */ }
     exit(130);
   });
 
@@ -92,16 +92,31 @@ export async function repl(system: string): Promise<void> {
   }
 }
 
-/** Drop oldest turns to stay under the size cap. */
+/** Drop oldest turns to stay under the size cap. Keep user/assistant pairs together. */
 function trimHistory(history: Turn[]): void {
-  while (history.length > MAX_HISTORY_TURNS) history.shift();
+  // Keep even number of turns (pairs) when trimming for turn count
+  while (history.length > MAX_HISTORY_TURNS) {
+    // Drop oldest 2 (user+assistant) to preserve adjacency
+    if (history.length >= 2) {
+      history.shift();
+      history.shift();
+    } else {
+      history.shift();
+    }
+  }
   let total = 0;
   for (const t of history) total += t.content.length;
   while (total > MAX_HISTORY_CHARS && history.length > 2) {
-    const head = history[0];
-    if (!head) break;
-    total -= head.content.length;
+    // Drop oldest pair to avoid orphaning tool context
+    const first = history[0];
+    const second = history[1];
+    if (!first) break;
+    total -= first.content.length;
     history.shift();
+    if (second) {
+      total -= second.content.length;
+      history.shift();
+    }
   }
 }
 
@@ -157,13 +172,23 @@ async function ask(
   }
 
   // Use the shared streamToStdout from chat.ts. Capture what we wrote so we
-  // can return it for the conversation history.
+  // can return it for the conversation history. Handle Buffer/Uint8Array and re-entrancy.
   const collected: string[] = [];
-  const origWrite = process.stdout.write.bind(process.stdout);
-  (process.stdout as unknown as { write: (c: string) => boolean }).write = (chunk: string) => {
-    if (typeof chunk === 'string') collected.push(chunk);
-    return origWrite(chunk);
-  };
+  const origWrite = process.stdout.write.bind(process.stdout) as unknown as typeof process.stdout.write;
+  const alreadyWrapped = !!(process.stdout.write as unknown as Record<string, unknown>).__klyroWrapped;
+  let didWrap = false;
+  if (!alreadyWrapped) {
+    const wrapped = function (chunk: unknown, encoding?: unknown, cb?: unknown): boolean {
+      if (typeof chunk === 'string') collected.push(chunk);
+      else if (chunk instanceof Buffer) collected.push(chunk.toString('utf-8'));
+      else if (chunk instanceof Uint8Array) collected.push(Buffer.from(chunk as Uint8Array).toString('utf-8'));
+      else if (chunk != null) collected.push(String(chunk));
+      return (origWrite as unknown as (...a: unknown[]) => boolean)(chunk as string, encoding as string, cb as () => void);
+    };
+    (wrapped as unknown as Record<string, unknown>).__klyroWrapped = true;
+    process.stdout.write = wrapped as unknown as typeof process.stdout.write;
+    didWrap = true;
+  }
   try {
     await streamToStdout(res.body, ac.signal);
   } catch (err) {
@@ -172,7 +197,10 @@ async function ask(
       console.error(`\nklyro: stream error: ${msg}`);
     }
   } finally {
-    (process.stdout as unknown as { write: typeof origWrite }).write = origWrite;
+    if (didWrap) {
+      (process.stdout as unknown as { write: typeof origWrite }).write = origWrite;
+    }
   }
+  // If we were already wrapped (re-entrant), outer wrapper already captured, so return whatever we collected (may be empty)
   return collected.join('');
 }

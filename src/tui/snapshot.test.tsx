@@ -32,8 +32,8 @@ describe('App visual snapshot', () => {
     expect(frame).toContain('gpt-4o-mini');
     // Status line should show
     expect(frame).toMatch(/idle/i);
-    // Input prompt should be visible
-    expect(frame).toContain('>');
+    // Input prompt should be visible (klyro › per 1.4)
+    expect(frame).toMatch(/klyro|›/);
   });
 
   it('renders a transcript with assistant text', () => {
