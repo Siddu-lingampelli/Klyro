@@ -106,3 +106,33 @@ export class MouseFilter {
 
 export const MOUSE_ENABLE = '\x1b[?1000h\x1b[?1006h'; // button events + SGR coords
 export const MOUSE_DISABLE = '\x1b[?1000l\x1b[?1006l';
+
+/**
+ * stdin.read() wrapper implementing the tap (see repl.ts installMouseTap).
+ * Ink 7 consumes stdin via paused-mode read() calls, so filtering happens
+ * here — not on 'data' events (which never fire for Ink).
+ *
+ * Contract: sized reads pass through untouched; null passes through;
+ * mouse sequences are swallowed (wheels dispatched); everything else is
+ * returned byte-identical in its original string/Buffer shape.
+ */
+export function createReadWrapper(
+  origRead: (size?: number) => unknown,
+  filter: MouseFilter,
+  onWheel: (delta: number) => void,
+): (size?: number) => unknown {
+  return (size?: number): unknown => {
+    if (size !== undefined) return origRead(size);
+    const chunk = origRead();
+    if (chunk == null) return chunk;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+    const split = filter.push(buf);
+    for (const w of split.wheels) {
+      try {
+        onWheel(w);
+      } catch { /* ignore */ }
+    }
+    if (split.kept.length === 0) return null;
+    return typeof chunk === 'string' ? split.kept.toString('utf8') : split.kept;
+  };
+}

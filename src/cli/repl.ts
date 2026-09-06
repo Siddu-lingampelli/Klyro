@@ -22,7 +22,7 @@ import { TuiApprovalBridge } from '../tui/approval.js';
 import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
 import { resolveProvider, providerHelp, lastProviderError } from '../providers.js';
-import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE } from '../tui/mouse.js';
+import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE, createReadWrapper } from '../tui/mouse.js';
 import { inferProviderFromBaseURL } from '../agent/registry.js';
 import { getDefaultSessionStore } from '../persistence/session.js';
 import { buildSystemPrompt, parseImageInput } from '../context/system-prompt.js';
@@ -223,22 +223,41 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     } catch { /* ignore */ }
   };
   // OpenCode-style wheel scrolling (§8.5, S8): Ink owns stdin and cannot see
-  // mouse events, so tap stdin.emit — wheel deltas drive the App's scroll
-  // hooks, everything else passes through to Ink untouched.
+  // mouse events, so intercept stdin reads — wheel deltas drive the App's
+  // scroll hooks, everything else passes through to Ink untouched.
+  //
+  // IMPORTANT: Ink 7 reads stdin via 'readable' + stdin.read() (paused mode),
+  // never 'data' events — so the tap wraps read(), not emit().
   const mouseFilter = new MouseFilter();
+  const origStdinRead = process.stdin.read.bind(process.stdin);
   const origStdinEmit = process.stdin.emit.bind(process.stdin);
   let mouseTapInstalled = false;
+  function dispatchWheels(wheels: number[]): void {
+    for (const w of wheels) {
+      try {
+        if (isMounted && directHooks) directHooks.scrollLines(w);
+      } catch { /* ignore */ }
+    }
+  }
   function installMouseTap(): void {
     if (!isAltScreen || mouseTapInstalled) return;
     mouseTapInstalled = true;
-    (process.stdin as unknown as { emit: (...a: unknown[]) => boolean }).emit = (...a: unknown[]) => {
+    const stdinAny = process.stdin as unknown as {
+      read: (size?: number) => Buffer | string | null;
+      emit: (...a: unknown[]) => boolean;
+    };
+    // Primary path: Ink's paused-mode read loop.
+    stdinAny.read = createReadWrapper(
+      origStdinRead as (size?: number) => unknown,
+      mouseFilter,
+      (d) => dispatchWheels([d]),
+    ) as (size?: number) => Buffer | string | null;
+    // Fallback path: flowing mode ('data' events), e.g. if any library
+    // resumes the stream. Same split, same dispatch.
+    stdinAny.emit = (...a: unknown[]): boolean => {
       if (a[0] === 'data' && Buffer.isBuffer(a[1])) {
         const split = mouseFilter.push(a[1] as Buffer);
-        for (const w of split.wheels) {
-          try {
-            if (isMounted && directHooks) directHooks.scrollLines(w);
-          } catch { /* ignore */ }
-        }
+        dispatchWheels(split.wheels);
         if (split.kept.length === 0) return false;
         a[1] = split.kept;
       }
@@ -249,7 +268,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     if (!mouseTapInstalled) return;
     mouseTapInstalled = false;
     mouseFilter.reset();
-    (process.stdin as unknown as { emit: (...a: unknown[]) => boolean }).emit = origStdinEmit as (...a: unknown[]) => boolean;
+    const stdinAny = process.stdin as unknown as {
+      read: (size?: number) => Buffer | string | null;
+      emit: (...a: unknown[]) => boolean;
+    };
+    stdinAny.read = origStdinRead as (size?: number) => Buffer | string | null;
+    stdinAny.emit = origStdinEmit as (...a: unknown[]) => boolean;
   }
 
   // Declare app before handler to avoid TDZ; handler added after render

@@ -2,7 +2,7 @@
  * scroll.md §15.1 — mouse splitter unit tests (no terminal).
  */
 import { describe, it, expect } from 'vitest';
-import { MouseFilter, WHEEL_LINES } from './mouse.js';
+import { MouseFilter, WHEEL_LINES, createReadWrapper } from './mouse.js';
 
 describe('MouseFilter', () => {
   it('passes normal typing through untouched', () => {
@@ -58,5 +58,40 @@ describe('MouseFilter', () => {
     const r = f.push(Buffer.from('ab\x1b[<65;1;1Mcd', 'latin1'));
     expect(r.kept.toString('latin1')).toBe('abcd');
     expect(r.wheels).toEqual([WHEEL_LINES]);
+  });
+});
+
+describe('createReadWrapper (Ink paused-mode tap)', () => {
+  it('swallows wheel chunks (returns null) and dispatches deltas', () => {
+    const seen: number[] = [];
+    const chunks: Array<Buffer | null> = [Buffer.from('\x1b[<64;5;5M', 'latin1'), null];
+    const read = createReadWrapper(() => chunks.shift() ?? null, new MouseFilter(), (d) => seen.push(d));
+    expect(read()).toBeNull();
+    expect(seen).toEqual([-WHEEL_LINES]);
+    expect(read()).toBeNull();
+  });
+  it('passes typing through byte-identical, preserving string shape', () => {
+    const seen: number[] = [];
+    const chunks: Array<string | null> = ['hello', null];
+    const read = createReadWrapper(() => chunks.shift() ?? null, new MouseFilter(), (d) => seen.push(d));
+    expect(read()).toBe('hello');
+    expect(seen).toEqual([]);
+    expect(read()).toBeNull();
+  });
+  it('splits mixed chunks: wheels dispatched, text returned', () => {
+    const seen: number[] = [];
+    const chunks: Array<Buffer | null> = [Buffer.from('ab\x1b[<65;1;1Mcd', 'latin1'), null];
+    const read = createReadWrapper(() => chunks.shift() ?? null, new MouseFilter(), (d) => seen.push(d));
+    const out = read() as Buffer;
+    expect(Buffer.isBuffer(out)).toBe(true);
+    expect(out.toString('latin1')).toBe('abcd');
+    expect(seen).toEqual([WHEEL_LINES]);
+  });
+  it('passes sized reads through untouched', () => {
+    const seen: number[] = [];
+    const marker = Buffer.from('x');
+    const read = createReadWrapper(() => marker, new MouseFilter(), (d) => seen.push(d));
+    expect(read(5)).toBe(marker);
+    expect(seen).toEqual([]);
   });
 });
