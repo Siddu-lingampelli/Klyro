@@ -15,6 +15,14 @@ import { Text, Box } from 'ink';
 import Spinner from 'ink-spinner';
 import { DiffView, type DiffHunk } from './diff.js';
 
+/** Patch applied to a running tool item when its result arrives. */
+export interface ToolResultPatch {
+  result: string;
+  isError: boolean;
+  latencyMs: number;
+  status: 'done' | 'error';
+}
+
 export type TranscriptItem =
   | { id: string; kind: 'text'; text: string; role: 'user' | 'assistant' }
   | {

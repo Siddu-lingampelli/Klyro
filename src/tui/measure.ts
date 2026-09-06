@@ -75,7 +75,7 @@ export function contentWidth(termWidth: number): number {
 export type BlockDesc =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string }
-  | { kind: 'group'; count: number; expanded: boolean }
+  | { kind: 'group'; count: number; expanded: boolean; status: string; resultLen: number }
   | { kind: 'error'; message: string }
   | { kind: 'policy' }
   | { kind: 'file'; path: string }
@@ -124,7 +124,7 @@ export function blockSig(b: BlockDesc): string {
     case 'assistant':
       return `a:${b.text.length}:${b.text.slice(0, 16)}:${b.text.slice(-16)}`;
     case 'group':
-      return `g:${b.count}:${b.expanded ? 1 : 0}`;
+      return `g:${b.count}:${b.expanded ? 1 : 0}:${b.status}:${b.resultLen}`;
     case 'error':
       return `e:${b.message.length}:${b.message.slice(-32)}`;
     case 'policy':

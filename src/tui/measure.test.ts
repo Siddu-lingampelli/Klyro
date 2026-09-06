@@ -49,9 +49,9 @@ describe('blockHeight mirrors app.tsx render', () => {
     expect(blockHeight({ kind: 'assistant', text: 'hi' }, 100)).toBe(3);
   });
   it('collapsed group = 2, expanded caps at 12 + overflow (§9.3)', () => {
-    expect(blockHeight({ kind: 'group', count: 14, expanded: false }, 100)).toBe(2);
-    expect(blockHeight({ kind: 'group', count: 4, expanded: true }, 100)).toBe(1 + 4 + 1);
-    expect(blockHeight({ kind: 'group', count: 20, expanded: true }, 100)).toBe(1 + 12 + 1 + 1);
+    expect(blockHeight({ kind: 'group', count: 14, expanded: false, status: 'done', resultLen: 0 }, 100)).toBe(2);
+    expect(blockHeight({ kind: 'group', count: 4, expanded: true, status: 'done', resultLen: 0 }, 100)).toBe(1 + 4 + 1);
+    expect(blockHeight({ kind: 'group', count: 20, expanded: true, status: 'done', resultLen: 0 }, 100)).toBe(1 + 12 + 1 + 1);
   });
   it('policy renders null → 0', () => {
     expect(blockHeight({ kind: 'policy' }, 100)).toBe(0);

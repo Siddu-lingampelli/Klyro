@@ -552,6 +552,69 @@ describe('App', () => {
     expect(lastFrame() ?? '').toMatch(/MSG-24-tag/);
   });
 
+  it('tool result patches the running item in place (no stale spinner)', async () => {
+    let hooks: {
+      append: (i: TranscriptItem) => void;
+      updateTool: (idCall: string, patch: { result: string; isError: boolean; latencyMs: number; status: 'done' | 'error' }) => void;
+    } | null = null;
+    const { lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        onMounted={(h) => {
+          hooks = { append: h.append, updateTool: h.updateTool };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(hooks).not.toBeNull();
+    hooks!.append({ id: 't1', kind: 'tool', name: 'read_file', id_call: 'c1', args: '{"path":"a.ts"}', status: 'running' });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(lastFrame() ?? '').toMatch(/Read/);
+    hooks!.updateTool('c1', { result: 'ok', isError: false, latencyMs: 42, status: 'done' });
+    await new Promise((r) => setTimeout(r, 50));
+    const frame = lastFrame() ?? '';
+    // Resolved with real latency — exactly one group (start item patched, no duplicate).
+    expect(frame).toMatch(/42ms/);
+    expect(frame.match(/Read/g)?.length ?? 0).toBeLessThanOrEqual(2);
+  });
+
+  it('heavy transcript: frame bounded, input and tail visible', async () => {
+    const items: TranscriptItem[] = [];
+    for (let i = 0; i < 30; i++) {
+      items.push({ id: `u-${i}`, kind: 'text', text: `user message number ${i} asking about stuff`, role: 'user' });
+      items.push({
+        id: `a-${i}`,
+        kind: 'text',
+        text: `## Answer ${i}\n\nAssistant answer **number ${i}** with a long explanation that wraps across multiple terminal lines.`,
+        role: 'assistant',
+      });
+      items.push({ id: `t-${i}`, kind: 'tool', name: 'read_file', id_call: `c-${i}`, args: '{"path":"a.ts"}', result: 'ok', latencyMs: 5, status: 'done' });
+    }
+    const { lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={items}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    const frame = lastFrame() ?? '';
+    // I1: frame never exceeds terminal rows; input + tail always on screen.
+    expect(frame.split('\n').length).toBeLessThanOrEqual(32);
+    expect(frame).toContain('Message Klyro');
+    expect(frame).toContain('Answer 29');
+    expect(frame).not.toContain('user message number 0');
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App

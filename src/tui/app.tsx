@@ -6,7 +6,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Box, Text, useInput, useStdout } from 'ink';
 import { execFileSync } from 'node:child_process';
 import type { StatusSnapshot } from './status.js';
-import type { TranscriptItem } from './transcript.js';
+import type { TranscriptItem, ToolResultPatch } from './transcript.js';
 import { TuiApprovalBridge } from './approval.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash, suggestCommands } from '../cli/slash/parser.js';
@@ -37,7 +37,7 @@ export interface AppProps {
   initialTranscript?: TranscriptItem[];
   initialStatus?: Partial<StatusSnapshot>;
   approvalBridge?: TuiApprovalBridge;
-  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void; scrollHalfPage: (dir: -1 | 1) => void; scrollToTop: () => void; transcript: TranscriptScrollHandle }) => void;
+  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void; scrollHalfPage: (dir: -1 | 1) => void; scrollToTop: () => void; transcript: TranscriptScrollHandle; updateTool: (idCall: string, patch: ToolResultPatch) => void }) => void;
   version?: string;
   isFullscreen?: boolean;
 }
@@ -70,7 +70,7 @@ function verbForTool(name: string): Verb {
   if (name === 'read_file') return 'Read' as Verb;
   if (name === 'list_directory') return 'Listed' as Verb;
   if (name === 'grep' || name === 'glob' || name === 'find_files' || name === 'search_files' || name === 'recent_files') return 'Searched' as Verb;
-  if (name === 'shell_exec') return 'Ran' as Verb;
+  if (name === 'shell_exec' || name === 'run_verify') return 'Ran' as Verb;
   if (name.startsWith('git_')) return 'Checked git' as Verb;
   if (name === 'web_fetch') return 'Fetched' as Verb;
   if (name === 'web_search') return 'Searched web' as Verb;
@@ -304,7 +304,13 @@ export function App(props: AppProps): React.JSX.Element {
         const gr = entry as Group;
         out.push({
           key: gr.id,
-          desc: { kind: 'group', count: gr.items.length, expanded: expandedGroups.has(gr.id) },
+          desc: {
+            kind: 'group',
+            count: gr.items.length,
+            expanded: expandedGroups.has(gr.id),
+            status: gr.status,
+            resultLen: gr.items.reduce((s, x) => s + (x.result?.length ?? 0), 0),
+          },
           groupIndex: gi,
           tail: null,
         });
@@ -431,6 +437,22 @@ export function App(props: AppProps): React.JSX.Element {
   useEffect(() => { if (status.status !== 'running') streamingIdRef.current = null; }, [status.status]);
   const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
   const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
+  // Tool results patch the running start-item IN PLACE (no second item, so a
+  // group never stays 'running' forever showing a ticking elapsed timer).
+  const updateTool = useCallback((idCall: string, patch: ToolResultPatch) => {
+    setTranscript((prev) => {
+      const idx = prev.findIndex(
+        (x) =>
+          x.kind === 'tool' &&
+          (x as Extract<TranscriptItem, { kind: 'tool' }>).id_call === idCall &&
+          (x as Extract<TranscriptItem, { kind: 'tool' }>).status === 'running',
+      );
+      if (idx === -1) return prev;
+      const copy = [...prev];
+      copy[idx] = { ...(copy[idx] as Extract<TranscriptItem, { kind: 'tool' }>), ...patch } as TranscriptItem;
+      return copy;
+    });
+  }, []);
   const clearTranscript = useCallback(() => { streamingIdRef.current = null; setTranscript([]); setPlan([]); }, []);
   // Scroll control for external drivers (mouse-wheel tap in repl.ts, §8.4).
   // Stored in refs so the callbacks stay stable while acting on latest state.
@@ -462,7 +484,7 @@ export function App(props: AppProps): React.JSX.Element {
   );
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
-  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle]);
+  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle, updateTool }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle, updateTool]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
@@ -565,11 +587,17 @@ export function App(props: AppProps): React.JSX.Element {
   const cost = (status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015);
   const totalTokens = status.usageInput + status.usageOutput;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
-  const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑/↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
+  // Narrow terminals: compact hints so the status bar never wraps mid-word.
+  const baseHints = width < 90
+    ? status.status === 'running' ? 'ctrl+c stop · enter queue' : 'enter send · / commands'
+    : status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑/↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
   const hints = maxTop > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
 
+  // I1 structural guard: the frame can never exceed terminal rows. Even if a
+  // child mis-measures, the root clips — the input/status stay on screen and
+  // Ink's cursor math can't corrupt into overlapping text.
   return (
-    <Box flexDirection="column" width={width} height={isFullscreen ? height - 1 : undefined}>
+    <Box flexDirection="column" width={width} height={isFullscreen ? height - 1 : undefined} overflow={isFullscreen ? 'hidden' : undefined}>
       <Header cwd={props.cwd} model={status.model} version={ver} width={width} />
       <Box flexDirection="row" flexGrow={isFullscreen ? 1 : 0} overflow={isFullscreen ? 'hidden' : undefined}>
         <Box flexDirection="column" flexGrow={1} overflow={isFullscreen ? 'hidden' : undefined} paddingX={0}>

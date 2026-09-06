@@ -127,7 +127,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     | { kind: 'append'; item: import('../tui/transcript.js').TranscriptItem }
     | { kind: 'delta'; text: string }
     | { kind: 'status'; patch: Partial<import('../tui/status.js').StatusSnapshot> }
-    | { kind: 'plan'; plan: import('../agent/runtime.js').PlanStep[] };
+    | { kind: 'plan'; plan: import('../agent/runtime.js').PlanStep[] }
+    | { kind: 'toolupdate'; idCall: string; patch: import('../tui/transcript.js').ToolResultPatch };
   const pendingQueue: QueuedEvent[] = [];
   let isMounted = false;
   let directHooks:
@@ -142,6 +143,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         scrollHalfPage: (dir: -1 | 1) => void;
         scrollToTop: () => void;
         transcript: import('../tui/transcript-commands.js').TranscriptScrollHandle;
+        updateTool: (idCall: string, patch: import('../tui/transcript.js').ToolResultPatch) => void;
       }
     | undefined;
 
@@ -166,6 +168,14 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     if (!text) return;
     if (isMounted && directHooks) directHooks.appendDelta(text);
     else pendingQueue.push({ kind: 'delta', text });
+  }
+  // Tool results patch the running start-item in place (App.updateTool) so a
+  // group resolves to done/error with its real latency instead of ticking
+  // forever. Falls back to a standalone item if the start item is gone.
+  const pendingToolIds = new Set<string>();
+  function queuedToolUpdate(idCall: string, patch: import('../tui/transcript.js').ToolResultPatch): void {
+    if (isMounted && directHooks) directHooks.updateTool(idCall, patch);
+    else pendingQueue.push({ kind: 'toolupdate', idCall, patch });
   }
   function queuedStatus(s: Partial<import('../tui/status.js').StatusSnapshot>): void {
     lastStatus = { ...(lastStatus ?? { model: model ?? '', step: 0, maxSteps: opts.maxSteps ?? 30, usageInput: 0, usageOutput: 0, repairs: 0, status: 'idle' } as import('../tui/status.js').StatusSnapshot), ...s };
@@ -391,6 +401,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           if (ev.kind === 'status') hooks.updateStatus(ev.patch);
           else if (ev.kind === 'plan') hooks.updatePlan(ev.plan);
           else if (ev.kind === 'delta') hooks.appendDelta(ev.text);
+          else if (ev.kind === 'toolupdate') hooks.updateTool(ev.idCall, ev.patch);
           else hooks.append(ev.item);
         }
         pendingQueue.length = 0;
@@ -496,6 +507,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             } else if (ev.kind === 'tool_call_delta') {
               activeCallArgs += ev.argsJson;
             } else if (ev.kind === 'tool_call_end') {
+              pendingToolIds.add(ev.id);
               queuedAppend({
                 id: `tool-${ev.id}-${Date.now()}`,
                 kind: 'tool',
@@ -516,17 +528,29 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 reason: ev.reason,
               });
             } else if (ev.kind === 'tool_result') {
-              queuedAppend({
-                id: `tres-${ev.id}-${Date.now()}`,
-                kind: 'tool',
-                name: ev.name,
-                id_call: ev.id,
-                args: '',
+              const patch = {
                 result: typeof ev.output === 'string' ? ev.output : JSON.stringify(ev.output, null, 2),
                 isError: ev.isError,
                 latencyMs: ev.latencyMs,
-                status: ev.isError ? 'error' : 'done',
-              });
+                status: (ev.isError ? 'error' : 'done') as 'done' | 'error',
+              };
+              if (pendingToolIds.delete(ev.id)) {
+                // Patch the running start-item in place — no stale spinner.
+                queuedToolUpdate(ev.id, patch);
+              } else {
+                // Start item gone (e.g. transcript cleared) — keep a record.
+                queuedAppend({
+                  id: `tres-${ev.id}-${Date.now()}`,
+                  kind: 'tool',
+                  name: ev.name,
+                  id_call: ev.id,
+                  args: '',
+                  result: patch.result,
+                  isError: patch.isError,
+                  latencyMs: patch.latencyMs,
+                  status: patch.status,
+                });
+              }
             } else if (ev.kind === 'final_text') {
               // streamingId is closed by status change; no extra handling needed
             } else if (ev.kind === 'usage') {
