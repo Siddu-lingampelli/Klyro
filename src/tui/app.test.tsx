@@ -491,6 +491,67 @@ describe('App', () => {
     expect(onPrompt).toHaveBeenCalledWith('line one\nline two');
   });
 
+  it('submitting while pinned snaps back to bottom (scroll.md §7)', async () => {
+    const onPrompt = vi.fn(async () => {});
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={onPrompt}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(lastFrame() ?? '').toMatch(/MSG-00-tag/);
+    stdin.write('hello again');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0d');
+    // Settle effect: immediate + microtask + timeout(0) bottom pin.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(onPrompt).toHaveBeenCalledWith('hello again');
+    expect(lastFrame() ?? '').toMatch(/MSG-24-tag/);
+  });
+
+  it('onMounted transcript handle runs the four commands (scroll.md §2)', async () => {
+    type Handle = import('./transcript-commands.js').TranscriptScrollHandle;
+    let handle: Handle | null = null;
+    const { lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+        onMounted={(h) => {
+          handle = h.transcript;
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(handle).not.toBeNull();
+    handle!.runTranscriptCommand('messages_half_page_up');
+    await new Promise((r) => setTimeout(r, 50));
+    let frame = lastFrame() ?? '';
+    // Half page (10 lines) up from bottom (row 30 → 20): MSG-24 gone, MSG-14 in view.
+    expect(frame).not.toMatch(/MSG-24-tag/);
+    expect(frame).toMatch(/MSG-14-tag/);
+    handle!.runTranscriptCommand('messages_first');
+    await new Promise((r) => setTimeout(r, 50));
+    frame = lastFrame() ?? '';
+    expect(frame).toMatch(/MSG-00-tag/);
+    expect(frame).not.toMatch(/MSG-24-tag/);
+    handle!.runTranscriptCommand('messages_last');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(lastFrame() ?? '').toMatch(/MSG-24-tag/);
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App

@@ -22,6 +22,11 @@ import {
 } from './scroll-model.js';
 import { buildIndex, itemAtRow, MeasureCache, type BlockDesc } from './measure.js';
 import { renderMarkdownLines } from './markdown.js';
+import {
+  getTranscriptCommand,
+  type TranscriptCommand,
+  type TranscriptScrollHandle,
+} from './transcript-commands.js';
 
 export interface AppProps {
   initialModel: string;
@@ -32,7 +37,7 @@ export interface AppProps {
   initialTranscript?: TranscriptItem[];
   initialStatus?: Partial<StatusSnapshot>;
   approvalBridge?: TuiApprovalBridge;
-  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void; scrollHalfPage: (dir: -1 | 1) => void; scrollToTop: () => void }) => void;
+  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void; scrollHalfPage: (dir: -1 | 1) => void; scrollToTop: () => void; transcript: TranscriptScrollHandle }) => void;
   version?: string;
   isFullscreen?: boolean;
 }
@@ -238,13 +243,20 @@ export function App(props: AppProps): React.JSX.Element {
   useEffect(() => {
     if (status.status !== 'running') ctrlCArmed.current = false;
   }, [status.status]);
-  // design.md §13: submit snaps to bottom — immediate + microtask + timeout
-  // so React/Ink layout settles before the final pin.
-  const snapToBottomSettled = useCallback(() => {
-    scrollCmdsRef.current.bottom();
-    queueMicrotask(() => scrollCmdsRef.current.bottom());
-    setTimeout(() => scrollCmdsRef.current.bottom(), 0);
-  }, []);
+  // scroll.md §7: submit bumps a version key; the settle effect below pins
+  // to bottom immediate + microtask + timeout so layout settles first.
+  // (Decoupled from render: never scroll directly inside the submit handler.)
+  const [submitKey, setSubmitKey] = useState(0);
+  useEffect(() => {
+    if (!submitKey) return;
+    const toBottom = (): void => {
+      scrollCmdsRef.current.bottom();
+    };
+    toBottom();
+    queueMicrotask(toBottom);
+    const t = setTimeout(toBottom, 0);
+    return () => clearTimeout(t);
+  }, [submitKey]);
   // Shift+Enter intent: explicit shift+return, kitty/CSI-u sequence, legacy
   // ESC+CR pair, or Esc immediately followed by Return (75ms, non-empty input).
   const escReturnAt = useRef(0);
@@ -421,9 +433,31 @@ export function App(props: AppProps): React.JSX.Element {
   const scrollToBottom = useCallback(() => { scrollCmdsRef.current.bottom(); }, []);
   const scrollHalfPage = useCallback((dir: -1 | 1) => { scrollCmdsRef.current.halfPage(dir); }, []);
   const scrollToTop = useCallback(() => { scrollCmdsRef.current.top(); }, []);
+  // scroll.md §2/§10: the four-command TranscriptScrollHandle.
+  const transcriptHandle = useMemo<TranscriptScrollHandle>(
+    () => ({
+      runTranscriptCommand: (command: TranscriptCommand) => {
+        switch (command) {
+          case 'messages_half_page_up':
+            scrollCmdsRef.current.halfPage(-1);
+            return;
+          case 'messages_half_page_down':
+            scrollCmdsRef.current.halfPage(1);
+            return;
+          case 'messages_first':
+            scrollCmdsRef.current.top();
+            return;
+          case 'messages_last':
+            scrollCmdsRef.current.bottom();
+            return;
+        }
+      },
+    }),
+    [],
+  );
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
-  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop]);
+  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
@@ -441,14 +475,17 @@ export function App(props: AppProps): React.JSX.Element {
       return;
     }
     // Scroll keys (work in any mode, including while running).
+    // scroll.md §6 flow: Keyboard → getTranscriptCommand → handle.
     // design.md §11: PageUp/Ctrl+U half-up, PageDown/Ctrl+D half-down,
-    // Ctrl+Home/Ctrl+End first/last. (Ctrl+B/F kept as pager aliases.)
+    // Ctrl+Home/Ctrl+End first/last. (Plain Home/End + Ctrl+B/F/G kept.)
     if (isFullscreen && maxTop > 0) {
-      if (key.home) { commands.jumpTop(); return; } // Home / Ctrl+Home → first
-      if (key.end)  { commands.jumpBottom(); return; } // End / Ctrl+End → last
+      const tcmd = getTranscriptCommand(inputStr, key);
+      if (tcmd) { transcriptHandle.runTranscriptCommand(tcmd); return; }
+      if (key.home) { commands.jumpTop(); return; }
+      if (key.end)  { commands.jumpBottom(); return; }
       if (key.ctrl && inputStr === 'g') { commands.jumpBottom(); return; } // Ctrl+G → bottom
-      if (key.pageUp || (key.ctrl && inputStr === 'u') || (key.ctrl && inputStr === 'b')) { commands.pageUp(); return; }
-      if (key.pageDown || (key.ctrl && inputStr === 'd') || (key.ctrl && inputStr === 'f')) { commands.pageDown(); return; }
+      if ((key.ctrl && inputStr === 'b')) { commands.pageUp(); return; }
+      if ((key.ctrl && inputStr === 'f')) { commands.pageDown(); return; }
       if (key.upArrow && (key.shift || key.ctrl)) { commands.lineUp(); return; }
       if (key.downArrow && (key.shift || key.ctrl)) { commands.lineDown(); return; }
     }
@@ -482,7 +519,7 @@ export function App(props: AppProps): React.JSX.Element {
       // Esc with an empty queue cancels streaming (§18); non-empty drops one (top).
       if (key.escape) { void props.onSlash({ kind: 'cancel' }); return; }
       // Enter on empty input dismisses the badge (jump to bottom, §7.2)
-      if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } if (queuedInputs.length >= 3) return; setQueuedInputs((prev) => [...prev, v]); setInput(''); pushHistory(v); snapToBottomSettled(); return; }
+      if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } if (queuedInputs.length >= 3) return; setQueuedInputs((prev) => [...prev, v]); setInput(''); pushHistory(v); setSubmitKey((k) => k + 1); return; }
       if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
       if (!key.ctrl && !key.meta) setInput((v) => v + inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
       return;
@@ -513,7 +550,7 @@ export function App(props: AppProps): React.JSX.Element {
       if (isFullscreen && maxTop > 0) { commands.lineDown(); return; }
     }
     // Enter on empty input dismisses the badge (jump to bottom, §7.2)
-    if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } setInput(''); setHistIdx(null); pushHistory(v); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); streamingIdRef.current = null; snapToBottomSettled(); const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
+    if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } setInput(''); setHistIdx(null); pushHistory(v); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); streamingIdRef.current = null; setSubmitKey((k) => k + 1); const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
     if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); setHistIdx(null); return; }
     if (!key.ctrl && !key.meta) { setInput((v) => v + inputStr); setHistIdx(null); }
   });
@@ -605,7 +642,7 @@ export function App(props: AppProps): React.JSX.Element {
             return null;
           }) : null}
           {showThinking && status.status === 'running' && !streamingIdRef.current ? (
-            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.dim as string}>Thinking...</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
+            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.dim as string}>Thinking... (esc to cancel)</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
           ) : null}
           {showPlan && plan.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>

@@ -141,6 +141,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         scrollToBottom: () => void;
         scrollHalfPage: (dir: -1 | 1) => void;
         scrollToTop: () => void;
+        transcript: import('../tui/transcript-commands.js').TranscriptScrollHandle;
       }
     | undefined;
 
