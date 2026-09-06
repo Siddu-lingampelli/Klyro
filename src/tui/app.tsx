@@ -11,6 +11,16 @@ import { TuiApprovalBridge } from './approval.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash, suggestCommands } from '../cli/slash/parser.js';
 import { tokens, g } from './tokens.js';
+import {
+  initialScroll,
+  scrollReducer,
+  resolveTopRow,
+  maxTopFor,
+  type ScrollState,
+  type ScrollAction,
+  type ScrollCtx,
+} from './scroll-model.js';
+import { buildIndex, itemAtRow, MeasureCache, type BlockDesc } from './measure.js';
 
 export interface AppProps {
   initialModel: string;
@@ -62,21 +72,36 @@ function verbForTool(name: string): Verb {
   return 'Called' as Verb;
 }
 interface Group { id: string; verb: Verb; items: Extract<TranscriptItem, { kind: 'tool' }>[]; totalMs: number; status: 'running' | 'done' | 'error'; }
+/**
+ * Aggregator (scroll.md §9): merge CONSECUTIVE same-op tool events into one
+ * ActivityGroup. Never merge across a different op — read,read,edit,read →
+ * 3 groups, not 2. Group ids are content-derived (stable across regroups so
+ * scroll anchors and expansion state survive streaming appends).
+ */
 function groupTools(items: TranscriptItem[]): Array<TranscriptItem | Group> {
   const out: Array<TranscriptItem | Group> = [];
   let cur: Extract<TranscriptItem, { kind: 'tool' }>[] = [];
+  let curVerb: Verb | null = null;
   const flush = () => {
     if (cur.length === 0) return;
-    const byVerb = new Map<Verb, typeof cur>();
-    for (const it of cur) { const v = verbForTool(it.name); if (!byVerb.has(v)) byVerb.set(v, []); byVerb.get(v)!.push(it); }
-    for (const [verb, list] of byVerb) {
-      const totalMs = list.reduce((s, x) => s + (x.latencyMs ?? 0), 0);
-      const status = list.some((x) => x.isError || x.status === 'error') ? 'error' as const : list.some((x) => x.status === 'running') ? 'running' as const : 'done' as const;
-      out.push({ id: nextId('g'), verb, items: list, totalMs, status });
-    }
+    const verb = curVerb!;
+    const totalMs = cur.reduce((s, x) => s + (x.latencyMs ?? 0), 0);
+    const status = cur.some((x) => x.isError || x.status === 'error') ? 'error' as const : cur.some((x) => x.status === 'running') ? 'running' as const : 'done' as const;
+    out.push({ id: `g:${verb}:${cur.map((i) => i.id_call).join('|')}`, verb, items: cur, totalMs, status });
     cur = [];
+    curVerb = null;
   };
-  for (const it of items) { if (it.kind === 'tool') cur.push(it as Extract<TranscriptItem, { kind: 'tool' }>); else { flush(); out.push(it); } }
+  for (const it of items) {
+    if (it.kind === 'tool') {
+      const v = verbForTool((it as Extract<TranscriptItem, { kind: 'tool' }>).name);
+      if (curVerb !== null && v !== curVerb) flush(); // different op → break the group
+      curVerb = v;
+      cur.push(it as Extract<TranscriptItem, { kind: 'tool' }>);
+    } else {
+      flush();
+      out.push(it);
+    }
+  }
   flush(); return out;
 }
 
@@ -99,82 +124,98 @@ function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width
   return <Text wrap="wrap">{parts}</Text>;
 }
 
-// Chat scroll state: scrollOffset, pinned (user scrolled away from bottom),
-// pendingNew (rows arrived while pinned), and a commands bag for key handlers.
-// The `tick` prop is a monotonic value that increments on every content mutation,
-// including in-place text growth during streaming (appendDelta mutates by index,
-// so transcript.length does not change on a delta — the effect must fire anyway).
+// Chat scroll — scroll.md §5 anchor model adapted to Ink.
+//
+// Position is an Anchor ({itemId, lineInItem}), never a raw row index (I4),
+// resolved per frame against measured *display lines* (I3, see measure.ts).
+// While anchored to 'bottom', new output follows; scrolling up pins to an
+// item and freezes, accumulating newSinceUnstick lines for the `↓ N new` pill.
+//
+// Deviation from §7.1: Ink cannot overlay rows, so the badge renders as a
+// one-line pill above the input instead of overwriting the last viewport row.
 function useChatScroll(opts: {
-  totalRows: number;
+  keys: string[];
+  heights: number[];
   viewportH: number;
-  messageBoundaries: number[];
-  tick: number;
+  width: number;
 }) {
-  const { totalRows, viewportH, messageBoundaries, tick } = opts;
-  const [scrollOffset, setScrollOffset] = useState(0);
-  const [pinned, setPinned] = useState(false);
-  const [pendingNew, setPendingNew] = useState(0);
-  const pinnedRef = useRef(false);
+  const { keys, heights, viewportH, width } = opts;
+  const [state, setState] = useState<ScrollState>(initialScroll);
 
-  const maxOffset = Math.max(0, totalRows - viewportH);
-  // 1-line tolerance: maxOffset can shift by 1 during streaming and leave us
-  // at maxOffset - 1, which would otherwise be "not at bottom". The +1 tolerance
-  // keeps follow-tail engaged through that off-by-one.
-  const isAtBottom = scrollOffset + 1 >= maxOffset;
+  const index = useMemo(() => buildIndex(heights), [heights]);
+  const boundaries = useMemo(() => index.offsets.filter((_, i) => heights[i]! > 0), [index, heights]);
 
-  const recomputePinned = useCallback((next: number) => {
-    const atBottom = next + 1 >= maxOffset;
-    pinnedRef.current = !atBottom;
-    setPinned(!atBottom);
-    if (atBottom) setPendingNew(0);
-  }, [maxOffset]);
+  const ctx: ScrollCtx = {
+    count: keys.length,
+    offsetOf: (i) => index.offsets[i] ?? 0,
+    keyOf: (i) => keys[i] ?? '',
+    indexAt: (row) => itemAtRow(index.offsets, row),
+    total: index.total,
+    viewportH,
+  };
+  const ctxRef = useRef(ctx);
+  ctxRef.current = ctx;
+  const boundariesRef = useRef(boundaries);
+  boundariesRef.current = boundaries;
 
-  // Watch `tick` — fires on every content change (add, remove, in-place delta).
-  const lastTickRef = useRef(tick);
-  const lastMaxOffsetRef = useRef(maxOffset);
-  const firstEffectRef = useRef(true);
+  // Auto-follow wiring (§6): measured total deltas → CONTENT_GREW;
+  // width change → REFLOW (§12). Initial anchor is 'bottom' → follow-tail.
+  const prevTotalRef = useRef(index.total);
+  const prevWidthRef = useRef(width);
   useEffect(() => {
-    if (firstEffectRef.current) {
-      // Initial mount: if there's content, follow the tail (preserves the
-      // pre-refactor behavior where scrollOffset was 0 only on empty state).
-      firstEffectRef.current = false;
-      lastTickRef.current = tick;
-      lastMaxOffsetRef.current = maxOffset;
-      if (maxOffset > 0) {
-        setScrollOffset(maxOffset);
-      }
+    const prevTotal = prevTotalRef.current;
+    const prevWidth = prevWidthRef.current;
+    prevTotalRef.current = index.total;
+    prevWidthRef.current = width;
+    if (width !== prevWidth) {
+      setState((s) => scrollReducer(s, { type: 'REFLOW' }, ctxRef.current));
       return;
     }
-    if (tick === lastTickRef.current) return;
-    lastTickRef.current = tick;
-    const grew = maxOffset - lastMaxOffsetRef.current;
-    lastMaxOffsetRef.current = maxOffset;
-    if (pinnedRef.current) {
-      if (grew > 0) setPendingNew((p) => p + grew);
-    } else {
-      // FollowTail: snap to the new bottom.
-      setScrollOffset(maxOffset);
+    const delta = index.total - prevTotal;
+    if (delta !== 0) {
+      setState((s) => scrollReducer(s, { type: 'CONTENT_GREW', lines: delta }, ctxRef.current));
     }
-  }, [tick, maxOffset]);
+  }, [index.total, width]);
 
-  const commands = {
-    lineUp:    () => { const next = Math.max(0, scrollOffset - 1);           setScrollOffset(next); recomputePinned(next); },
-    lineDown:  () => { const next = Math.min(maxOffset, scrollOffset + 1);   setScrollOffset(next); recomputePinned(next); },
-    pageUp:    () => {
-      const prev = [...messageBoundaries].reverse().find((b) => b < scrollOffset);
-      const next = prev ?? Math.max(0, scrollOffset - viewportH);
-      setScrollOffset(next); recomputePinned(next);
+  const dispatch = useCallback((a: ScrollAction) => {
+    setState((s) => scrollReducer(s, a, ctxRef.current));
+  }, []);
+
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  const commands = useMemo(() => ({
+    lineUp: () => dispatch({ type: 'BY_LINES', delta: -1 }),
+    lineDown: () => dispatch({ type: 'BY_LINES', delta: 1 }),
+    pageUp: () => {
+      const c = ctxRef.current;
+      const top = resolveTopRow(stateRef.current, c).topRow;
+      const prev = [...boundariesRef.current].reverse().find((b) => b < top);
+      const next = prev ?? Math.max(0, top - (c.viewportH - 1)); // 1-line overlap
+      dispatch({ type: 'BY_LINES', delta: next - top });
     },
-    pageDown:  () => {
-      const nxt = messageBoundaries.find((b) => b > scrollOffset);
-      const next = nxt ?? Math.min(maxOffset, scrollOffset + viewportH);
-      setScrollOffset(next); recomputePinned(next);
+    pageDown: () => {
+      const c = ctxRef.current;
+      const top = resolveTopRow(stateRef.current, c).topRow;
+      const nxt = boundariesRef.current.find((b) => b > top);
+      const next = nxt ?? Math.min(maxTopFor(c), top + (c.viewportH - 1));
+      dispatch({ type: 'BY_LINES', delta: next - top });
     },
-    jumpTop:    () => { setScrollOffset(0);        recomputePinned(0); },
-    jumpBottom: () => { setScrollOffset(maxOffset); recomputePinned(maxOffset); },
+    jumpTop: () => dispatch({ type: 'TO_TOP' }),
+    jumpBottom: () => dispatch({ type: 'TO_BOTTOM' }),
+  }), [dispatch]);
+
+  const resolved = resolveTopRow(state, ctx);
+  const maxTop = maxTopFor(ctx);
+  const pinned = state.anchor.mode === 'pinned' && !resolved.atBottom;
+  return {
+    topRow: resolved.topRow,
+    atBottom: resolved.atBottom,
+    maxTop,
+    pinned,
+    pendingNew: state.newSinceUnstick,
+    commands,
   };
-
-  return { scrollOffset, setScrollOffset, pinned, pendingNew, isAtBottom, maxOffset, commands };
 }
 
 export function App(props: AppProps): React.JSX.Element {
@@ -189,30 +230,130 @@ export function App(props: AppProps): React.JSX.Element {
   const [queuedInputs, setQueuedInputs] = useState<string[]>([]);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const streamingIdRef = useRef<string | null>(null);
+  // Input history for contextual ↑/↓ (scroll.md §8.3, S6)
+  const [history, setHistory] = useState<string[]>([]);
+  const [histIdx, setHistIdx] = useState<number | null>(null);
+  const pushHistory = useCallback((v: string) => {
+    setHistory((prev) => (prev[prev.length - 1] === v ? prev : [...prev.slice(-99), v]));
+    setHistIdx(null);
+  }, []);
 
   const width = stdout?.columns ?? 100;
   const height = stdout?.rows ?? 30;
   const isFullscreen = props.isFullscreen ?? false;
   const grouped = groupTools(transcript);
   const viewportH = Math.max(5, height - 10);
-  const totalRows = grouped.length + (plan.length > 0 ? 1 : 0) + 2;
-  const messageBoundaries = useMemo(() => grouped.map((_, i) => i), [grouped]);
+  // Degraded mode (§12): terminal < 10 rows → transcript hidden, input+status only.
+  const tiny = height < 10;
 
-  // Monotonic tick: increments on every render, so the scroll hook fires
-  // for every content mutation — including in-place text deltas.
-  const tickRef = useRef(0);
-  useEffect(() => { tickRef.current += 1; });
+  // --- Measured blocks (§4): one entry per grouped item + tail blocks ------
+  // Heights are estimated wrapped display lines; the cache makes streaming
+  // O(1) (only the tail sig changes per tick, I6).
+  const measureCacheRef = useRef<MeasureCache | null>(null);
+  if (!measureCacheRef.current) measureCacheRef.current = new MeasureCache();
+  const cache = measureCacheRef.current;
 
-  const scroll = useChatScroll({
-    totalRows,
-    viewportH,
-    messageBoundaries,
-    tick: tickRef.current,
-  });
-  const { scrollOffset, isAtBottom, maxOffset, pinned, pendingNew, commands } = scroll;
+  interface ViewBlock {
+    key: string;
+    desc: BlockDesc;
+    groupIndex: number | null; // index into `grouped`, null for tail blocks
+    tail: 'plan' | 'thinking' | 'queued' | null;
+  }
+  const blocks: ViewBlock[] = useMemo(() => {
+    const out: ViewBlock[] = [];
+    grouped.forEach((entry, gi) => {
+      if ((entry as Group).verb) {
+        const gr = entry as Group;
+        out.push({
+          key: gr.id,
+          desc: { kind: 'group', count: gr.items.length, expanded: expandedGroups.has(gr.id) },
+          groupIndex: gi,
+          tail: null,
+        });
+        return;
+      }
+      const it = entry as TranscriptItem;
+      if (it.kind === 'text' && it.role === 'user') {
+        out.push({ key: it.id, desc: { kind: 'user', text: it.text }, groupIndex: gi, tail: null });
+      } else if (it.kind === 'text') {
+        out.push({ key: it.id, desc: { kind: 'assistant', text: it.text }, groupIndex: gi, tail: null });
+      } else if (it.kind === 'error') {
+        out.push({ key: it.id, desc: { kind: 'error', message: it.message }, groupIndex: gi, tail: null });
+      } else if (it.kind === 'policy') {
+        out.push({ key: it.id, desc: { kind: 'policy' }, groupIndex: gi, tail: null });
+      } else if (it.kind === 'file_changed') {
+        out.push({ key: it.id, desc: { kind: 'file', path: it.path }, groupIndex: gi, tail: null });
+      } else if (it.kind === 'diff') {
+        out.push({
+          key: it.id,
+          desc: { kind: 'diff', hunks: it.hunks.map((h) => ({ path: h.path, lines: h.lines.map((l) => l.text) })) },
+          groupIndex: gi,
+          tail: null,
+        });
+      }
+    });
+    if (plan.length > 0) {
+      out.push({
+        key: 'tail:plan',
+        desc: { kind: 'plan', done: plan.filter((p) => p.status === 'done').length, total: plan.length },
+        groupIndex: null,
+        tail: 'plan',
+      });
+    }
+    if (status.status === 'running' && !streamingIdRef.current) {
+      out.push({ key: 'tail:thinking', desc: { kind: 'thinking' }, groupIndex: null, tail: 'thinking' });
+    }
+    if (queuedInputs.length > 0) {
+      out.push({ key: 'tail:queued', desc: { kind: 'queued', count: queuedInputs.length }, groupIndex: null, tail: 'queued' });
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [grouped, plan, status.status, queuedInputs.length, expandedGroups, width, transcript]);
+
+  const blockKeys = useMemo(() => blocks.map((b) => b.key), [blocks]);
+  const blockHeights = useMemo(
+    () => blocks.map((b) => cache.heightFor(b.key, b.desc, width)),
+    [blocks, width, cache],
+  );
+
+  const scroll = useChatScroll({ keys: blockKeys, heights: blockHeights, viewportH, width });
+  const { topRow, maxTop, pinned, pendingNew, commands } = scroll;
   const trackH = viewportH;
-  const thumbPos = maxOffset === 0 ? 0 : Math.round((scrollOffset / maxOffset) * (trackH - 1));
-  const visibleGrouped = isFullscreen ? grouped.slice(scrollOffset, scrollOffset + viewportH) : grouped;
+  const thumbPos = maxTop === 0 ? 0 : Math.round((topRow / maxTop) * (trackH - 1));
+
+  // Slice *display lines* [topRow, topRow+viewportH): intersecting blocks only
+  // (§6.1 virtualization — only visible items are composed).
+  const endRow = topRow + viewportH;
+  let gi0 = grouped.length;
+  let gi1 = -1;
+  let showPlan = false;
+  let showThinking = false;
+  let showQueued = false;
+  if (!isFullscreen || tiny) {
+    gi0 = 0;
+    gi1 = grouped.length - 1;
+    showPlan = true;
+    showThinking = true;
+    showQueued = true;
+  } else {
+    let row = 0;
+    for (let bi = 0; bi < blocks.length; bi++) {
+      const h = blockHeights[bi] ?? 0;
+      const bStart = row;
+      const bEnd = row + h;
+      row = bEnd;
+      if (bEnd <= topRow || bStart >= endRow || h === 0) continue;
+      const b = blocks[bi]!;
+      if (b.groupIndex !== null) {
+        gi0 = Math.min(gi0, b.groupIndex);
+        gi1 = Math.max(gi1, b.groupIndex);
+      } else if (b.tail === 'plan') showPlan = true;
+      else if (b.tail === 'thinking') showThinking = true;
+      else if (b.tail === 'queued') showQueued = true;
+    }
+    if (gi1 < gi0) { gi0 = 0; gi1 = -1; }
+  }
+  const visibleGrouped = isFullscreen && !tiny ? grouped.slice(gi0, gi1 + 1) : grouped;
 
   useEffect(() => bridge.subscribe((p) => setAwaitingApproval(p !== null)), [bridge]);
   useEffect(() => {
@@ -257,9 +398,10 @@ export function App(props: AppProps): React.JSX.Element {
       return;
     }
     // Scroll keys (work in any mode, including while running).
-    if (isFullscreen && maxOffset > 0) {
+    if (isFullscreen && maxTop > 0) {
       if (key.home) { commands.jumpTop(); return; }
       if (key.end)  { commands.jumpBottom(); return; }
+      if (key.ctrl && inputStr === 'g') { commands.jumpBottom(); return; } // Ctrl+G → bottom (§8.4)
       if (key.pageUp || (key.ctrl && inputStr === 'u')) { commands.pageUp(); return; }
       if (key.pageDown || (key.ctrl && inputStr === 'd')) { commands.pageDown(); return; }
       if (key.upArrow && (key.shift || key.ctrl)) { commands.lineUp(); return; }
@@ -269,14 +411,39 @@ export function App(props: AppProps): React.JSX.Element {
     if (key.ctrl && inputStr === 'o') { const groups = grouped.filter((x): x is Group => typeof (x as Group).verb === 'string'); const last = groups[groups.length - 1]; if (last) toggleGroup(last.id); return; }
     if (status.status === 'running') {
       if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
-      if (key.return) { const v = input.trim(); if (!v) return; if (queuedInputs.length >= 3) return; setQueuedInputs((prev) => [...prev, v]); setInput(''); return; }
+      // Enter on empty input dismisses the badge (jump to bottom, §7.2)
+      if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } if (queuedInputs.length >= 3) return; setQueuedInputs((prev) => [...prev, v]); setInput(''); pushHistory(v); return; }
       if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
       if (!key.ctrl && !key.meta) setInput((v) => v + inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
       return;
     }
-    if (key.return) { const v = input.trim(); if (!v) return; setInput(''); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); streamingIdRef.current = null; const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
-    if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
-    if (!key.ctrl && !key.meta) setInput((v) => v + inputStr);
+    // Contextual ↑/↓ (§8.3): text in buffer (or browsing) → history;
+    // empty buffer → scroll viewport one line.
+    if (key.upArrow && !key.shift && !key.ctrl) {
+      if (input.trim() !== '' || histIdx !== null) {
+        if (history.length > 0) {
+          const next = histIdx === null ? history.length - 1 : Math.max(0, histIdx - 1);
+          setHistIdx(next);
+          setInput(history[next] ?? '');
+        }
+        return;
+      }
+      if (isFullscreen && maxTop > 0) { commands.lineUp(); return; }
+    }
+    if (key.downArrow && !key.shift && !key.ctrl) {
+      if (histIdx !== null) {
+        const next = histIdx + 1;
+        if (next >= history.length) { setHistIdx(null); setInput(''); }
+        else { setHistIdx(next); setInput(history[next] ?? ''); }
+        return;
+      }
+      if (input.trim() !== '') return; // single line with text, nothing newer
+      if (isFullscreen && maxTop > 0) { commands.lineDown(); return; }
+    }
+    // Enter on empty input dismisses the badge (jump to bottom, §7.2)
+    if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } setInput(''); setHistIdx(null); pushHistory(v); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); streamingIdRef.current = null; const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
+    if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); setHistIdx(null); return; }
+    if (!key.ctrl && !key.meta) { setInput((v) => v + inputStr); setHistIdx(null); }
   });
 
   const ver = props.version ?? '0.1.27';
@@ -285,16 +452,19 @@ export function App(props: AppProps): React.JSX.Element {
   const totalTokens = status.usageInput + status.usageOutput;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
   const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑/↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
-  const hints = maxOffset > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
+  const hints = maxTop > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
 
   return (
     <Box flexDirection="column" width={width} height={isFullscreen ? height - 1 : undefined}>
       <Header cwd={props.cwd} model={status.model} version={ver} width={width} />
       <Box flexDirection="row" flexGrow={isFullscreen ? 1 : 0} overflow={isFullscreen ? 'hidden' : undefined}>
         <Box flexDirection="column" flexGrow={1} overflow={isFullscreen ? 'hidden' : undefined} paddingX={0}>
-          {grouped.length === 0 ? (
+          {tiny ? (
+            <Text color={tokens.colors.warn as string}>⚠ terminal too small ({width}x{height}) — transcript hidden</Text>
+          ) : null}
+          {!tiny && grouped.length === 0 ? (
             <Text color={tokens.colors.dim as string}>Message Klyro...</Text>
-          ) : visibleGrouped.map((item) => {
+          ) : !tiny ? visibleGrouped.map((item) => {
             if ((item as Group).verb) {
               const gr = item as Group;
               const isExpanded = expandedGroups.has(gr.id);
@@ -316,11 +486,16 @@ export function App(props: AppProps): React.JSX.Element {
                     <Text color={markerColor}>{marker} {verbLine}</Text>
                     <Text color={tokens.colors.dim as string}>  {right}</Text>
                   </Box>
-                  {isExpanded ? gr.items.map((it) => {
-                    let friendly = '';
-                    try { const a = JSON.parse(it.args) as Record<string, unknown>; const p = (a.path as string) ?? (a.pattern as string) ?? (a.command as string) ?? ''; const short = p ? String(p).split('/').pop()?.slice(0, 40) ?? p : ''; if (it.name === 'read_file' && short) friendly = `${short}`; else if (it.name === 'shell_exec' && p) friendly = `$ ${String(p).slice(0, 40)}`; else if (short) friendly = short; else friendly = it.args.slice(0, 40); } catch { friendly = it.args.slice(0, 40); }
-                    return (<Box key={it.id} paddingLeft={4}><Text color={tokens.colors.guide as string}>{g('end')} </Text><Text color={tokens.colors.dim as string}>{friendly}</Text></Box>);
-                  }) : null}
+                  {isExpanded ? (<>
+                    {gr.items.slice(0, 12).map((it) => {
+                      let friendly = '';
+                      try { const a = JSON.parse(it.args) as Record<string, unknown>; const p = (a.path as string) ?? (a.pattern as string) ?? (a.command as string) ?? ''; const short = p ? String(p).split('/').pop()?.slice(0, 40) ?? p : ''; if (it.name === 'read_file' && short) friendly = `${short}`; else if (it.name === 'shell_exec' && p) friendly = `$ ${String(p).slice(0, 40)}`; else if (short) friendly = short; else friendly = it.args.slice(0, 40); } catch { friendly = it.args.slice(0, 40); }
+                      return (<Box key={it.id} paddingLeft={4}><Text color={tokens.colors.guide as string}>{g('end')} </Text><Text color={tokens.colors.dim as string}>{friendly}</Text></Box>);
+                    })}
+                    {gr.items.length > 12 ? (
+                      <Box paddingLeft={4}><Text color={tokens.colors.dim as string}>… {gr.items.length - 12} more</Text></Box>
+                    ) : null}
+                  </>) : null}
                 </Box>
               );
             }
@@ -356,11 +531,11 @@ export function App(props: AppProps): React.JSX.Element {
               </Box>
             );
             return null;
-          })}
-          {status.status === 'running' && !streamingIdRef.current ? (
+          }) : null}
+          {showThinking && status.status === 'running' && !streamingIdRef.current ? (
             <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.dim as string}>Thinking...</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
           ) : null}
-          {plan.length > 0 ? (
+          {showPlan && plan.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
               <Box><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
               {plan.slice(0, 8).map((p) => (
@@ -368,7 +543,7 @@ export function App(props: AppProps): React.JSX.Element {
               ))}
             </Box>
           ) : null}
-          {queuedInputs.length > 0 ? (
+          {showQueued && queuedInputs.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
               {queuedInputs.map((q, i) => (
                 <Text key={i} color={tokens.colors.dim as string}>queued: {q.slice(0, 60)}{i === 0 ? '  esc to drop' : ''}</Text>
@@ -387,7 +562,7 @@ export function App(props: AppProps): React.JSX.Element {
       {pinned && pendingNew > 0 ? (
         <Box justifyContent="flex-end" paddingX={1} marginTop={-1}>
           <Text backgroundColor={tokens.colors.accentSoft as string} color={tokens.colors.accent as string} bold>
-            {' ↓ '}{pendingNew}{' new '}{pendingNew === 1 ? 'message' : 'messages'}{' '}
+            {' ↓ '}{pendingNew >= 1000 ? '999+ new' : `${pendingNew} new`}{' '}
           </Text>
         </Box>
       ) : null}
@@ -408,7 +583,7 @@ export function App(props: AppProps): React.JSX.Element {
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
       </Box>
       <Box justifyContent="space-between">
-        <Text color={tokens.colors.dim as string}>{baseHints}{maxOffset > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
+        <Text color={tokens.colors.dim as string}>{baseHints}{maxTop > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
         <Text color={tokens.colors.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct > 0 ? `${ctxPct}% ctx · ` : ''}{status.status === 'running' ? 'auto mode on ●' : ''}</Text>
       </Box>
     </Box>

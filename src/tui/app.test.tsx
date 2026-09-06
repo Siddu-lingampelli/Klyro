@@ -308,6 +308,82 @@ describe('App', () => {
     expect(frame).toMatch(/LATE-1-tag/);
   });
 
+  it('↑ recalls the previous prompt (input history, §8.3)', async () => {
+    const onPrompt = vi.fn(async () => {});
+    const { stdin, lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={onPrompt} onSlash={async () => {}} />,
+    );
+    stdin.write('first recallable prompt');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onPrompt).toHaveBeenCalledWith('first recallable prompt');
+    // Input cleared after submit; ↑ should restore it from history.
+    stdin.write('\x1b[A');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('first recallable prompt');
+  });
+
+  it('↑ on empty input scrolls one line instead of history', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 30));
+    // Empty input + plain ↑ → line up (stays near top, MSG-00 visible).
+    stdin.write('\x1b[A');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toMatch(/MSG-00-tag/);
+  });
+
+  it('/c shows top-6 suggestions and Tab completes', async () => {
+    const { stdin, lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
+    );
+    stdin.write('/c');
+    await new Promise((r) => setTimeout(r, 30));
+    const withSuggest = lastFrame() ?? '';
+    expect(withSuggest).toMatch(/\/clear/);
+    expect(withSuggest).toMatch(/tab to complete/i);
+    stdin.write('\t');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('/clear ');
+  });
+
+  it('Enter on empty input while pinned jumps back to bottom (§7.2)', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 100));
+    const g = globalThis as unknown as { __klyroAppAppend?: (i: TranscriptItem) => void };
+    g.__klyroAppAppend!({ id: 'late-1', kind: 'text', text: 'LATE-1-tag', role: 'assistant' });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(lastFrame() ?? '').not.toMatch(/LATE-1-tag/);
+    // Empty input + Enter → dismiss badge, follow tail.
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(lastFrame() ?? '').toMatch(/LATE-1-tag/);
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App

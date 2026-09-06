@@ -117,7 +117,20 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
     | undefined;
 
+  // Plain-text mirror for exit replay (scroll.md §1.2: session survives in
+  // native scrollback after the alt screen is torn down). Cap 300 lines.
+  const exitMirror: string[] = [];
+  function mirrorLine(item: import('../tui/transcript.js').TranscriptItem): void {
+    let line: string | null = null;
+    if (item.kind === 'text') line = `${item.role === 'user' ? '> ' : ''}${item.text}`;
+    else if (item.kind === 'error') line = `[error] ${item.message}`;
+    else if (item.kind === 'file_changed') line = `[${item.op}] ${item.path}`;
+    if (line === null) return;
+    exitMirror.push(line.slice(0, 2000));
+    if (exitMirror.length > 300) exitMirror.splice(0, exitMirror.length - 300);
+  }
   function queuedAppend(item: import('../tui/transcript.js').TranscriptItem): void {
+    mirrorLine(item);
     if (isMounted && directHooks) directHooks.append(item);
     else pendingQueue.push({ kind: 'append', item });
   }
@@ -161,6 +174,47 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   let tuiSessionId: string | undefined;
 
   if (isAltScreen) enterAlt();
+
+  // I7 (scroll.md §8.6, S8): while the TUI owns stdout, route console.*
+  // to a ring buffer + ~/.klyro/debug.log so stray tool/provider logs
+  // can't corrupt the frame. Restored on exit.
+  const consoleRing: string[] = [];
+  const origConsoleFns = {
+    log: console.log,
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+    debug: console.debug,
+  };
+  function patchConsole(): void {
+    if (!isAltScreen) return;
+    const sink = (...args: unknown[]): void => {
+      const line = `[${new Date().toISOString()}] ${args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`;
+      consoleRing.push(line);
+      if (consoleRing.length > 200) consoleRing.splice(0, consoleRing.length - 200);
+      try {
+        const fs = require('node:fs') as typeof import('node:fs');
+        const path = require('node:path') as typeof import('node:path');
+        const home = process.env.HOME ?? process.env.USERPROFILE ?? cwd;
+        const dir = path.join(home, '.klyro');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(path.join(dir, 'debug.log'), line + '\n');
+      } catch { /* ignore */ }
+    };
+    console.log = sink;
+    console.info = sink;
+    console.warn = sink;
+    console.error = sink;
+    console.debug = sink;
+  }
+  function restoreConsole(): void {
+    console.log = origConsoleFns.log;
+    console.info = origConsoleFns.info;
+    console.warn = origConsoleFns.warn;
+    console.error = origConsoleFns.error;
+    console.debug = origConsoleFns.debug;
+  }
+  patchConsole();
 
   const EFFORT_STEPS: Record<string, number> = { low: 10, medium: 30, high: 50, max: 100 };
   // P1 session/permission state (commands.md Priority 1)
@@ -285,6 +339,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     leaveAlt();
   };
   process.once('SIGINT', sigintHandler);
+  process.once('SIGTERM', sigintHandler);
 
   async function runWithBridge(text: string): Promise<void> {
     if (!model) {
@@ -1911,8 +1966,20 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // ac.aborted indicates SIGINT; return 130 (128+SIGINT) like shells do.
   return new Promise<number>((resolve) => {
     const onExit = () => {
-      if (sigintHandler) process.removeListener('SIGINT', sigintHandler);
+      if (sigintHandler) {
+        process.removeListener('SIGINT', sigintHandler);
+        process.removeListener('SIGTERM', sigintHandler);
+      }
+      restoreConsole();
       leaveAlt();
+      // §1.2 exit behavior: replay a plain-text transcript into the main
+      // buffer so the session survives in native scrollback.
+      if (exitMirror.length > 0) {
+        try {
+          process.stdout.write('\n--- klyro session transcript ---\n');
+          for (const line of exitMirror.slice(-100)) process.stdout.write(line + '\n');
+        } catch { /* ignore */ }
+      }
       resolve(ac.signal.aborted ? 130 : 0);
     };
     if (!app) {
