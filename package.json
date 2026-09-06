@@ -1,6 +1,6 @@
 {
   "name": "klyro",
-  "version": "0.1.24",
+  "version": "0.1.25",
   "description": "Klyro — autonomous coding harness CLI that streams from any OpenAI-compatible or Anthropic LLM endpoint.",
   "type": "module",
   "main": "dist/index.js",

@@ -111,6 +111,7 @@ export function App(props: AppProps): React.JSX.Element {
   const [elapsed, setElapsed] = useState(0);
   const [queued, setQueued] = useState<string | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [scrollOffset, setScrollOffset] = useState(0);
   const streamingIdRef = useRef<string | null>(null);
   const placeholders = ['Message Klyro…', 'Message @file to attach…', 'Type / for commands…', '! runs a shell command…'];
   const placeholder = placeholders[0] ?? 'Message Klyro…';
@@ -167,10 +168,25 @@ export function App(props: AppProps): React.JSX.Element {
   }, [append, appendDelta, updateStatus, updatePlan]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const width = stdout?.columns ?? 100;
+  const height = stdout?.rows ?? 30;
+  const grouped = groupTools(transcript);
+  const viewportH = Math.max(5, height - 10);
+  const totalRows = grouped.length + (plan.length > 0 ? 1 : 0) + 2;
+  const maxOffset = Math.max(0, totalRows - viewportH);
+  const isAtBottom = scrollOffset >= maxOffset;
+  useEffect(() => { if (isAtBottom) setScrollOffset(maxOffset); }, [transcript.length, plan.length, maxOffset, isAtBottom]);
+  const scrollUp = (n = 3) => setScrollOffset((p) => Math.max(0, p - n));
+  const scrollDown = (n = 3) => setScrollOffset((p) => Math.min(maxOffset, p + n));
+
   useInput((inputStr, key) => {
+    // slider scroll: PageUp/PageDown, Ctrl+U/D, Shift+↑/↓, j/k in vim-like
+    if (key.pageUp || (key.ctrl && inputStr === 'u')) { scrollUp(5); return; }
+    if (key.pageDown || (key.ctrl && inputStr === 'd')) { scrollDown(5); return; }
+    if (key.upArrow && (key.shift || key.ctrl)) { scrollUp(1); return; }
+    if (key.downArrow && (key.shift || key.ctrl)) { scrollDown(1); return; }
     if (awaitingApproval) return;
     if (key.ctrl && inputStr === 'o') {
-      // Ctrl+O toggle most recent group in live window
       const groups = groupTools(transcript).filter((x): x is Group => typeof (x as Group).verb === 'string');
       const last = groups[groups.length - 1];
       if (last) toggleGroup(last.id);
@@ -199,30 +215,30 @@ export function App(props: AppProps): React.JSX.Element {
     if (!key.ctrl && !key.meta) setInput((v) => v + inputStr);
   });
 
-  const width = stdout?.columns ?? 100;
-  const height = stdout?.rows ?? 30;
   const isSmall = width < 80;
-  const ver = props.version ?? '0.1.19';
+  const ver = props.version ?? '0.1.24';
   const rule = g('rule').repeat(Math.max(10, width - 2));
 
   // Derived status right
   const cost = (status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015);
   const totalTokens = status.usageInput + status.usageOutput;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
-  const hints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : status.status === 'idle' && transcript.length === 0 ? 'shift+tab to cycle  ·  ↑↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
-  // Grouped transcript
-  const grouped = groupTools(transcript);
+  const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : status.status === 'idle' && transcript.length === 0 ? 'shift+tab to cycle  ·  ↑↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
+  const hints = maxOffset > 0 ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
+  const visibleGrouped = grouped.slice(scrollOffset, scrollOffset + viewportH);
+  const trackH = viewportH;
+  const thumbPos = maxOffset === 0 ? 0 : Math.round((scrollOffset / maxOffset) * (trackH - 1));
 
   return (
     <Box flexDirection="column" width={width} height={height - 1}>
-      {/* Header §4 */}
       <Header cwd={props.cwd} model={status.model} version={ver} width={width} />
 
-      {/* Transcript §5 */}
-      <Box flexDirection="column" flexGrow={1} overflow="hidden" paddingX={0}>
+      {/* Transcript §5 + slider line + dot */}
+      <Box flexDirection="row" flexGrow={1} overflow="hidden">
+        <Box flexDirection="column" flexGrow={1} overflow="hidden" paddingX={0}>
         {grouped.length === 0 ? (
           <Text color={tokens.ansi.dim as string}>{placeholder}</Text>
-        ) : grouped.map((item) => {
+        ) : visibleGrouped.map((item) => {
           if ((item as Group).verb) {
             const gr = item as Group;
             const isExpanded = expandedGroups.has(gr.id);
@@ -305,10 +321,16 @@ export function App(props: AppProps): React.JSX.Element {
             {plan.length > 8 ? <Text color={tokens.ansi.dim as string}>  {g('guide')}   … +{plan.length - 8} more (/todos)</Text> : null}
           </Box>
         ) : null}
-        {/* End-of-turn summary §5.7 */}
         {status.status === 'done' && transcript.some((x) => x.kind === 'file_changed') ? (
           <Box paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {transcript.filter((x) => x.kind === 'file_changed').length} files · /diff</Text></Box>
         ) : null}
+        </Box>
+        {/* Slider — vertical line + dot for chat scroll */}
+        <Box flexDirection="column" width={1} marginLeft={1}>
+          {Array.from({ length: trackH }).map((_, i) => (
+            <Text key={i} color={i === thumbPos ? (tokens.ansi.accent as string) : (tokens.ansi.guide as string)}>{i === thumbPos ? '●' : '│'}</Text>
+          ))}
+        </Box>
       </Box>
 
       {/* Input §6 — rules + prompt */}
