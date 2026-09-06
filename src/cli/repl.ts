@@ -85,7 +85,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     return base + t;
   };
 
-  const ac = new AbortController();
+  let ac = new AbortController();
 
   // When the TUI is mounted, use the inline Ink prompt. Otherwise
   // fall back to stdin readline. The bridge is shared between the
@@ -163,6 +163,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   if (isAltScreen) enterAlt();
 
   const EFFORT_STEPS: Record<string, number> = { low: 10, medium: 30, high: 50, max: 100 };
+  // P1 session/permission state (commands.md Priority 1)
+  let sessionLabel = '';
+  let currentBranch = '';
+  let fastMode = false;
+  let displayMode = 'default';
+  let lastAssistantText = '';
   function queuedClear(): void {
     if (isMounted && directHooks) directHooks.clearTranscript();
     else pendingQueue.length = 0;
@@ -249,6 +255,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           if (ev.kind === 'text_delta') { simpleText += ev.text; queuedDelta(ev.text); }
           else if (ev.kind === 'error') throw new Error(ev.message);
         }
+        lastAssistantText = simpleText;
         queuedStatus({ status: 'done' });
         return;
       } catch (err) {
@@ -352,6 +359,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         },
         { adapter, registry, policy, approval, systemPrompt: systemPromptFn },
       );
+      if (result.finalText) lastAssistantText = result.finalText;
       if (result.verification) {
         const v = result.verification;
         queuedAppend({
@@ -401,29 +409,14 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       case 'help': {
         const helpText = [
-          'commands:',
-          '  /clear            — clear transcript',
-          '  /compact [focus]  — compact context (clears transcript, keeps marker)',
-          '  /model [id]       — show or switch model mid-session',
-          '  /provider [name]  — show or switch provider (openai|anthropic)',
-          '  /effort [level]   — show or set effort (low|medium|high|max → steps)',
-          '  /diff             — show git diff',
-          '  /status           — show session status',
-          '  /plan             — show current plan/todos',
-          '  /verify           — detect + run verifiers',
-          '  /project          — project scan',
-          '  /context          — context breakdown',
-          '  /cost             — token cost',
-          '  /jobs             — background jobs',
-          '  /memory           — session notes',
-          '  /undo /rewind     — checkpoints',
-          '  /login /logout    — credentials',
-          '  /init             — create KLYRO.md',
-          '  /config           — show config path',
-          '  /doctor           — run diagnostics',
-          '  /version          — show version',
-          '  /quit (/exit)     — exit',
-          `provider: ${currentProvider}  model: ${model}  effort: ${effortLevel} (${currentMaxSteps} steps)  cwd: ${cwd}`,
+          'commands (Priority 1):',
+          '  session: /new /clear /compact [focus] /resume [id] /sessions /rename [n] /fork [p] /branch [n] /export [f] /copy [n] /quit',
+          '  model:   /model [id] /models /provider [name] /effort [low|medium|high|max] /fast [on|off]',
+          '  project: /init /status /context /diff /plan [task] /todos /memory',
+          '  perms:   /permissions /mode [m] /sandbox [dir] /approve /deny',
+          '  app:     /login /logout /auth /version /update /cancel /shell (!cmd) /mention (@path) /tools /config /doctor',
+          '  (!cmd runs shell, @path attaches a file)',
+          `provider: ${currentProvider}  model: ${model}  effort: ${effortLevel}${fastMode ? ' fast' : ''} (${currentMaxSteps} steps)  mode: ${displayMode}  cwd: ${cwd}${sessionLabel ? `  session: ${sessionLabel}` : ''}${currentBranch ? `  branch: ${currentBranch}` : ''}`,
         ].join('\n');
         queuedAppend({ id: `help-${Date.now()}`, kind: 'text', text: helpText, role: 'assistant' });
         return;
@@ -679,6 +672,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'plan': {
+        if (cmd.task) {
+          queuedAppend({ id: `plan-mode-${Date.now()}`, kind: 'text', text: `Plan mode: "${cmd.task}" — the agent will plan first (todo_write) before editing. Current plan below:`, role: 'assistant' });
+        }
         try {
           const { readFileSync, existsSync } = await import('node:fs');
           const { join } = await import('node:path');
@@ -692,6 +688,288 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         } catch (err) {
           queuedAppend({ id: `plan-err-${Date.now()}`, kind: 'error', message: `plan failed: ${err instanceof Error ? err.message : String(err)}` });
         }
+        return;
+      }
+      case 'todos': {
+        try {
+          const { readFileSync, existsSync } = await import('node:fs');
+          const { join } = await import('node:path');
+          const todosPath = join(cwd, '.klyro', 'plans', 'todos.json');
+          if (!existsSync(todosPath)) {
+            queuedAppend({ id: `todos-${Date.now()}`, kind: 'text', text: 'No todos (no .klyro/plans/todos.json yet).', role: 'assistant' });
+          } else {
+            const arr = JSON.parse(readFileSync(todosPath, 'utf-8')) as Array<{ id: string; title: string; status: string }>;
+            const lines = arr.map((t) => `${t.status === 'done' ? '[x]' : t.status === 'in_progress' ? '[>]' : '[ ]'} ${t.title} (${t.id})`);
+            queuedAppend({ id: `todos2-${Date.now()}`, kind: 'text', text: `Todos (${arr.length}):\n${lines.join('\n').slice(0, 3000)}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `todos-err-${Date.now()}`, kind: 'error', message: `todos failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'new': {
+        queuedClear();
+        sessionLabel = '';
+        currentBranch = '';
+        try {
+          const rec = await tuiStore.create({ cwd, task: 'new session', config: { model, maxSteps: currentMaxSteps } });
+          tuiSessionId = rec.id;
+          queuedAppend({ id: `new-${Date.now()}`, kind: 'text', text: `new session ${rec.id.slice(0, 8)} started`, role: 'assistant' });
+        } catch {
+          queuedAppend({ id: `new2-${Date.now()}`, kind: 'text', text: 'new session started', role: 'assistant' });
+        }
+        queuedStatus({ status: 'idle', step: 0 });
+        return;
+      }
+      case 'models': {
+        const { MODEL_REGISTRY } = await import('../providers/model-info.js');
+        const lines = Object.values(MODEL_REGISTRY).map((m) => `  ${m.id}  ctx ${(m.contextWindow / 1000).toFixed(0)}k  $${m.inputPricePer1k}/$${m.outputPricePer1k} per 1k`);
+        queuedAppend({ id: `models-${Date.now()}`, kind: 'text', text: `Available models (current: ${model}):\n${lines.join('\n')}\nusage: /model <id>`, role: 'assistant' });
+        return;
+      }
+      case 'fast': {
+        const s = cmd.state?.trim().toLowerCase();
+        if (!s) {
+          queuedAppend({ id: `fast-${Date.now()}`, kind: 'text', text: `fast mode: ${fastMode ? 'on' : 'off'} (${currentMaxSteps} steps)\nusage: /fast on|off`, role: 'assistant' });
+        } else if (s === 'on') {
+          fastMode = true;
+          currentMaxSteps = 10;
+          queuedStatus({ maxSteps: currentMaxSteps });
+          queuedAppend({ id: `fast2-${Date.now()}`, kind: 'text', text: 'fast mode on (10 max steps)', role: 'assistant' });
+        } else if (s === 'off') {
+          fastMode = false;
+          currentMaxSteps = EFFORT_STEPS[effortLevel]!;
+          queuedStatus({ maxSteps: currentMaxSteps });
+          queuedAppend({ id: `fast3-${Date.now()}`, kind: 'text', text: `fast mode off (restored ${effortLevel}: ${currentMaxSteps} steps)`, role: 'assistant' });
+        } else {
+          queuedAppend({ id: `fast-err-${Date.now()}`, kind: 'error', message: `unknown /fast value: ${s} (expected on|off)` });
+        }
+        return;
+      }
+      case 'permissions': {
+        const cfg = (policy as unknown as { config: Record<string, unknown> }).config;
+        const lines = [
+          `mode: ${displayMode} (engine: ${String(cfg.mode ?? 'default')})`,
+          `shellAllow: ${((cfg.shellAllow as string[]) ?? []).length} prefixes`,
+          `shellDeny: ${((cfg.shellDeny as string[]) ?? []).length} patterns`,
+          `allow: ${JSON.stringify(cfg.allow ?? [])}`,
+          `deny: ${JSON.stringify(cfg.deny ?? [])}`,
+          `ask: ${JSON.stringify(cfg.ask ?? [])}`,
+          `sandbox dirs: ${JSON.stringify(cfg.additionalDirs ?? [])}`,
+        ];
+        queuedAppend({ id: `perm-${Date.now()}`, kind: 'text', text: `Permissions:\n${lines.join('\n')}\nchange via /mode <manual|accept-edits|plan|auto|yolo>`, role: 'assistant' });
+        return;
+      }
+      case 'mode': {
+        const m = cmd.mode?.trim().toLowerCase();
+        if (!m) {
+          queuedAppend({ id: `mode-${Date.now()}`, kind: 'text', text: `current mode: ${displayMode}\nmodes: manual | accept-edits | plan | auto | yolo\nusage: /mode <mode>`, role: 'assistant' });
+        } else {
+          const map: Record<string, string> = { manual: 'default', 'accept-edits': 'accept-edits', plan: 'plan', auto: 'auto', yolo: 'auto' };
+          const engineMode = map[m];
+          if (!engineMode) {
+            queuedAppend({ id: `mode-err-${Date.now()}`, kind: 'error', message: `unknown mode: ${m} (expected manual|accept-edits|plan|auto|yolo)` });
+          } else {
+            (policy as unknown as { config: Record<string, unknown> }).config.mode = engineMode;
+            displayMode = m;
+            queuedAppend({ id: `mode2-${Date.now()}`, kind: 'text', text: `mode set to ${m}${m === 'yolo' ? ' (auto-approve everything — careful)' : ''}${m === 'plan' ? ' (writes blocked)' : ''}`, role: 'assistant' });
+          }
+        }
+        return;
+      }
+      case 'sandbox': {
+        const cfg = (policy as unknown as { config: { additionalDirs?: string[] } }).config;
+        const p = cmd.policy?.trim();
+        if (!p) {
+          queuedAppend({ id: `sb-${Date.now()}`, kind: 'text', text: `sandbox dirs: ${JSON.stringify(cfg.additionalDirs ?? [])}\nusage: /sandbox <dir> (adds an allowed directory)`, role: 'assistant' });
+        } else {
+          cfg.additionalDirs = [...(cfg.additionalDirs ?? []), p];
+          queuedAppend({ id: `sb2-${Date.now()}`, kind: 'text', text: `sandbox: added allowed dir ${p}`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'approve': {
+        const ok = tuiBridge.resolve('allow');
+        queuedAppend({ id: `appr-${Date.now()}`, kind: 'text', text: ok ? 'approved pending action' : 'no pending approval', role: 'assistant' });
+        return;
+      }
+      case 'deny': {
+        const ok = tuiBridge.resolve('deny');
+        queuedAppend({ id: `deny-${Date.now()}`, kind: 'text', text: ok ? 'denied pending action' : 'no pending approval', role: 'assistant' });
+        return;
+      }
+      case 'resume': {
+        try {
+          const { resolveSessionId } = await import('../persistence/session.js');
+          const all = (await tuiStore.list()).filter((r) => r.cwd === cwd).sort((a, b) => b.updatedAt - a.updatedAt);
+          const full = cmd.id ? await resolveSessionId(tuiStore, cmd.id) : all[0]?.id;
+          if (!full) {
+            queuedAppend({ id: `resume-err-${Date.now()}`, kind: 'error', message: cmd.id ? `session not found: ${cmd.id}` : 'no previous session in this cwd' });
+            return;
+          }
+          const rec = await tuiStore.get(full);
+          const msgs = await tuiStore.loadMessages(full);
+          tuiSessionId = full;
+          sessionLabel = rec?.task.slice(0, 40) ?? '';
+          queuedAppend({ id: `resume-${Date.now()}`, kind: 'text', text: `resumed session ${full.slice(0, 8)} — "${rec?.task}" (${msgs.length} messages, status ${rec?.status})`, role: 'assistant' });
+          queuedStatus({ status: 'idle' });
+        } catch (err) {
+          queuedAppend({ id: `resume-err2-${Date.now()}`, kind: 'error', message: `resume failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'sessions': {
+        try {
+          const { formatSession } = await import('../persistence/session.js');
+          const all = (await tuiStore.list()).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
+          if (all.length === 0) {
+            queuedAppend({ id: `sess-${Date.now()}`, kind: 'text', text: 'No sessions yet.', role: 'assistant' });
+          } else {
+            const lines = all.map((r) => `${r.id.slice(0, 8) === tuiSessionId?.slice(0, 8) ? '*' : ' '} ${formatSession(r)}`);
+            queuedAppend({ id: `sess2-${Date.now()}`, kind: 'text', text: `Sessions (* = current):\n${lines.join('\n')}\nusage: /resume <id>`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `sess-err-${Date.now()}`, kind: 'error', message: `sessions failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'rename': {
+        if (!cmd.name) {
+          queuedAppend({ id: `ren-${Date.now()}`, kind: 'text', text: `current session label: ${sessionLabel || '(none)'}\nusage: /rename <name>`, role: 'assistant' });
+        } else {
+          sessionLabel = cmd.name;
+          queuedAppend({ id: `ren2-${Date.now()}`, kind: 'text', text: `session renamed to "${cmd.name}"`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'fork': {
+        try {
+          const base = sessionLabel || 'session';
+          const rec = await tuiStore.create({ cwd, task: `${base} (fork)${cmd.prompt ? `: ${cmd.prompt}` : ''}`, config: { model, maxSteps: currentMaxSteps } });
+          tuiSessionId = rec.id;
+          queuedAppend({ id: `fork-${Date.now()}`, kind: 'text', text: `forked → session ${rec.id.slice(0, 8)}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `fork-err-${Date.now()}`, kind: 'error', message: `fork failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'branch': {
+        if (!cmd.name) {
+          queuedAppend({ id: `br-${Date.now()}`, kind: 'text', text: `current branch: ${currentBranch || '(none)'}\nusage: /branch <name>`, role: 'assistant' });
+        } else {
+          currentBranch = cmd.name;
+          queuedAppend({ id: `br2-${Date.now()}`, kind: 'text', text: `branch "${cmd.name}" created — conversation continues here`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'export': {
+        try {
+          const all = (await tuiStore.list()).filter((r) => r.cwd === cwd).sort((a, b) => b.updatedAt - a.updatedAt);
+          const target = tuiSessionId ?? all[0]?.id;
+          if (!target) {
+            queuedAppend({ id: `exp-err-${Date.now()}`, kind: 'error', message: 'nothing to export (no session)' });
+            return;
+          }
+          const rec = await tuiStore.get(target);
+          const msgs = await tuiStore.loadMessages(target);
+          const out = cmd.file ?? `${target.slice(0, 8)}.export.json`;
+          await (await import('node:fs/promises')).writeFile(out, JSON.stringify({ record: rec, messages: msgs }, null, 2), 'utf-8');
+          queuedAppend({ id: `exp-${Date.now()}`, kind: 'text', text: `exported ${target.slice(0, 8)} → ${out} (${msgs.length} messages)`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `exp-err2-${Date.now()}`, kind: 'error', message: `export failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'copy': {
+        if (!lastAssistantText) {
+          queuedAppend({ id: `copy-err-${Date.now()}`, kind: 'error', message: 'nothing to copy yet (no assistant response this session)' });
+          return;
+        }
+        const n = cmd.n ? parseInt(cmd.n, 10) : NaN;
+        const text = Number.isFinite(n) && n > 0 ? lastAssistantText.slice(0, n) : lastAssistantText;
+        try {
+          const { execSync } = await import('node:child_process');
+          const clip = process.platform === 'win32' ? 'clip' : process.platform === 'darwin' ? 'pbcopy' : 'xclip -selection clipboard';
+          execSync(clip, { input: text });
+          queuedAppend({ id: `copy-${Date.now()}`, kind: 'text', text: `copied ${text.length} chars to clipboard`, role: 'assistant' });
+        } catch {
+          queuedAppend({ id: `copy2-${Date.now()}`, kind: 'text', text: `clipboard unavailable — response preview (${text.length} chars):\n${text.slice(0, 500)}`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'auth': {
+        const { getStoredKey } = await import('./auth.js');
+        const rows = ['openai', 'anthropic'].map((p) => {
+          const hasFile = !!getStoredKey(p);
+          const hasEnv = !!(p === 'openai' ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || !!process.env.KLYRO_API_KEY;
+          return `  ${p}: ${hasFile ? 'stored key (0600)' : hasEnv ? 'env key' : '—'}`;
+        });
+        queuedAppend({ id: `auth-${Date.now()}`, kind: 'text', text: `Auth:\n${rows.join('\n')}\ncurrent provider: ${currentProvider}\nmanage via /login /logout`, role: 'assistant' });
+        return;
+      }
+      case 'update': {
+        const { runUpdate } = await import('./update.js');
+        const origWrite = process.stdout.write.bind(process.stdout);
+        let out = '';
+        (process.stdout as unknown as { write: (s: string) => boolean }).write = ((chunk: string) => { out += String(chunk); return true; }) as typeof process.stdout.write;
+        await runUpdate();
+        (process.stdout as unknown as { write: typeof origWrite }).write = origWrite;
+        queuedAppend({ id: `upd-${Date.now()}`, kind: 'text', text: out || 'update check done', role: 'assistant' });
+        return;
+      }
+      case 'cancel': {
+        ac.abort();
+        ac = new AbortController();
+        queuedStatus({ status: 'aborted' });
+        queuedAppend({ id: `cancel-${Date.now()}`, kind: 'text', text: 'cancelled current operation', role: 'assistant' });
+        return;
+      }
+      case 'shell': {
+        if (!cmd.command) {
+          queuedAppend({ id: `sh-${Date.now()}`, kind: 'text', text: 'usage: /shell <command>  (or !<command>)', role: 'assistant' });
+          return;
+        }
+        try {
+          const r = await registry.execute('shell_exec', { command: cmd.command }, { cwd, env: process.env, nonInteractive: true });
+          if (!r.ok) {
+            queuedAppend({ id: `sh-err-${Date.now()}`, kind: 'error', message: `shell failed: ${(r.error as { message?: string }).message ?? (r.error as { code?: string }).code}` });
+          } else {
+            const v = r.value as { exitCode: number; stdout: string; stderr: string };
+            const body = (v.stdout + (v.stderr ? `\n[stderr]\n${v.stderr}` : '')).slice(0, 4000) || '(no output)';
+            queuedAppend({ id: `sh2-${Date.now()}`, kind: 'text', text: `$ ${cmd.command}\nexit ${v.exitCode}\n${body}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `sh-err2-${Date.now()}`, kind: 'error', message: `shell failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'mention': {
+        if (!cmd.path) {
+          queuedAppend({ id: `men-${Date.now()}`, kind: 'text', text: 'usage: /mention <path>  (or @<path>)', role: 'assistant' });
+          return;
+        }
+        try {
+          const r = await registry.execute('read_file', { path: cmd.path }, { cwd, env: process.env, nonInteractive: true });
+          if (!r.ok) {
+            queuedAppend({ id: `men-err-${Date.now()}`, kind: 'error', message: `mention failed: ${(r.error as { message?: string }).message ?? (r.error as { code?: string }).code}` });
+          } else {
+            const v = r.value as { path: string; content?: string; text?: string };
+            const body = String(v.content ?? v.text ?? JSON.stringify(v)).slice(0, 6000);
+            queuedAppend({ id: `men2-${Date.now()}`, kind: 'text', text: `attached ${cmd.path} (${body.length} chars):\n${body}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `men-err2-${Date.now()}`, kind: 'error', message: `mention failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'tools': {
+        const lines = registry.list().map((t) => `  ${t.name} — ${t.description.slice(0, 80)}`);
+        queuedAppend({ id: `tools-${Date.now()}`, kind: 'text', text: `Tools (${lines.length}):\n${lines.join('\n')}`, role: 'assistant' });
+        return;
+      }
+      case 'settings': {
+        const { getConfigPath } = await import('./config.js');
+        queuedAppend({ id: `set-${Date.now()}`, kind: 'text', text: `config: ${getConfigPath()} (alias of /config)`, role: 'assistant' });
         return;
       }
       case 'prompt': {
