@@ -219,6 +219,30 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
     }
     queuedStatus({ status: 'running', step: 0, model });
+    // Simple chat like "hello" must NOT trigger tool calls — direct LLM chat, no tools, no files
+    if (isSimpleChat) {
+      try {
+        const simpleReq = {
+          model,
+          system: systemPromptFn({ cwd, telemetry: '' }),
+          messages: [{ role: 'user' as const, content: [{ kind: 'text' as const, text: taskText }] } as unknown as import('../agent/message.js').Message],
+          tools: [] as import('../agent/provider-adapter.js').ToolDefinition[],
+          signal: ac.signal,
+        };
+        let simpleText = '';
+        for await (const ev of adapter.stream(simpleReq)) {
+          if (ev.kind === 'text_delta') { simpleText += ev.text; queuedDelta(ev.text); }
+          else if (ev.kind === 'error') throw new Error(ev.message);
+        }
+        queuedStatus({ status: 'done' });
+        return;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        queuedAppend({ id: `err-${Date.now()}`, kind: 'error', message: msg });
+        queuedStatus({ status: 'error', errorMessage: msg });
+        return;
+      }
+    }
     let activeCallId: string | null = null;
     let activeCallName: string | null = null;
     let activeCallArgs = '';
