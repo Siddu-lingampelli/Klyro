@@ -1,85 +1,72 @@
 /**
- * design.md Â§2 â€” White & Orange (light default) + Dark mirror
- * Light: bg #FFFFFF orange #FF6B1A â€” Dark: bg #1A1A1A orange #FF8A3D
- * Only orange is saturated in chrome; content uses dim borders.
+ * -º2.1 Color tokens + -º2.2 Glyph set GÇö TUI_DESIGN.md
+ * Accent is Orange #E8843C (256:209, 16: yellow bold), one accent Gëñ5%
+ * No backgrounds except diff viewer. fg.dim GëÑ4.5:1 on near-black.
  */
 export const tokens = {
   colors: {
-    bg: '#FFFFFF',
-    bgElevated: '#FAF7F2',
-    bgSubtle: '#F5F0E8',
-    fg: '#1A1A1A',
-    fgMuted: '#6B6B6B',
-    fgDim: '#9A9A9A',
-    orange: '#FF6B1A',
-    orangeHot: '#FF8A3D',
-    orangeDeep: '#CC4F0A',
-    orangeSoft: '#FFF1E6',
-    border: '#E8E0D2',
-    borderStrong: '#1A1A1A',
-    success: '#2E7D32',
-    warning: '#C77700',
-    danger: '#C62828',
-    codeBg: '#FAF7F2',
-    codeBorder: '#E8E0D2',
-    guide: '#E8E0D2',
-    // dark mirror
-    darkBg: '#1A1A1A',
-    darkOrange: '#FF8A3D',
-    darkBorder: '#333333',
+    accent: '#E8843C', // Orange GÇö wordmark, prompt >, GùÅ, thumb, selected
+    fg: '#FFFFFF', // White GÇö user input, headings, file names
+    soft: '#F5F5F5', // Soft white GÇö assistant prose
+    dim: '#9A9A9A', // Dim white GÇö hints, durations
+    guide: '#3A3A3A', // Guide Göé
+    ok: '#E8843C', // Orange for success check (white+orange theme)
+    err: '#E06C6C',
+    warn: '#E8843C', // Orange for running/spinner
+    info: '#FFFFFF',
+    diffAddBg: '#12250F',
+    diffDelBg: '#2A1212',
   },
   ansi: {
-    bg: 'white' as const,
-    fg: 'black' as const,
-    fgMuted: 'gray' as const,
-    dim: 'gray' as const,
-    orange: 'yellow' as const, // #FF6B1A â†’ 202
-    orangeBright: 'red' as const, // fallback vivid
-    border: 'gray' as const,
-    guide: 'gray' as const,
-    success: 'green' as const,
-    warning: 'yellow' as const,
-    danger: 'red' as const,
-    accent: 'yellow' as const,
+    accent: 'yellowBright' as const, // #E8843C GåÆ vivid orange
     accentBold: 'yellowBright' as const,
+    fg: 'whiteBright' as const, // #FFFFFF GÇö pure white
     soft: 'white' as const,
+    dim: 'gray' as const,
+    guide: 'gray' as const,
+    ok: 'yellowBright' as const, // G£ô orange vivid
+    err: 'red' as const,
+    warn: 'yellowBright' as const, // spinner orange vivid
+    info: 'white' as const,
+    border: 'gray' as const,
     muted: 'gray' as const,
+    success: 'yellowBright' as const,
     error: 'red' as const,
-    ok: 'green' as const,
-    warn: 'yellow' as const,
-    info: 'blue' as const,
-    successAlt: 'green' as const,
+    warning: 'yellowBright' as const,
   },
 } as const;
 
 export const glyphs = {
   prompt: '>',
-  agentBullet: 'â—',
-  collapsed: 'â–¸',
-  expanded: 'â–¾',
-  guide: 'â”‚',
-  branch: 'â”œ',
-  end: 'â””',
-  rule: 'â”€',
-  treeBranch: 'â”œâ”€â”€',
-  treeEnd: 'â””â”€â”€',
-  success: 'âœ“',
-  failure: 'âœ—',
+  agentBullet: 'GùÅ',
+  collapsed: 'Gû+',
+  expanded: 'Gû+',
+  guide: 'Göé',
+  branch: 'Gö£',
+  end: 'Göö',
+  rule: 'GöÇ',
+  treeBranch: 'Gö£GöÇGöÇ',
+  treeEnd: 'GööGöÇGöÇ',
+  success: 'G£ô',
+  failure: 'G£ù',
   warning: '!',
-  repair: 'â†»',
-  todoPending: 'â—‹',
-  todoActive: 'â—',
-  todoDone: 'âœ“',
-  todoPlan: 'â—‡',
-  logoBar: 'â–Œ',
-  dotFilled: 'â—',
-  dotEmpty: 'â—‹',
-  dotHalf: 'â—',
-  sidebar: 'âŠž',
-  inspector: 'â–¢',
-  copy: 'â§‰',
-  brand: 'â—†',
-  compaction: 'âŸ²',
+  repair: 'Gå+',
+  todoPending: 'Gùï',
+  todoActive: 'GùÅ',
+  todoDone: 'G£ô',
+  todoPlan: 'Gùç',
+  modeAccept: 'GùÉ',
+  modePlan: 'Gùï',
+  modeAuto: 'GùÅ',
+  editsBadge: 'G£Ä',
+  dot: '-+',
+  ellipsis: 'GÇª',
+  meterFilled: 'Gû¦',
+  meterEmpty: 'Gû¦',
+  continuation: 'Gå¬',
+  // compat
+  brand: 'Gùå',
+  compaction: 'Gƒ¦',
 } as const;
 
 export const glyphAscii = {
@@ -101,17 +88,18 @@ export const glyphAscii = {
   todoActive: '[>]',
   todoDone: '[x]',
   todoPlan: '#',
-  logoBar: '|',
-  dotFilled: '*',
-  dotEmpty: 'o',
-  dotHalf: 'o',
 } as const;
 
 export function isAsciiMode(): boolean {
-  return process.env.TERM === 'dumb' || process.env.KLYRO_ASCII === '1' || false;
+  return (
+    process.env.TERM === 'dumb' ||
+    process.env.KLYRO_ASCII === '1' ||
+    (process.env.LANG !== undefined && !process.env.LANG.toLowerCase().includes('utf-8')) ||
+    false
+  );
 }
 export function g(name: keyof typeof glyphs): string {
   if (isAsciiMode()) return (glyphAscii as Record<string, string>)[name] ?? glyphs[name];
   return glyphs[name];
 }
-export const spacing = { maxWidth: 120, indent: 2, gap: 1, sidebar: 28, inspector: 36 } as const;
+export const spacing = { maxWidth: 120, indent: 2, gap: 1 } as const;
