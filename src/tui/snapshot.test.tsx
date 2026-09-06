@@ -130,6 +130,25 @@ describe('App visual snapshot', () => {
     expect(frame).not.toContain('`npm test`');
   });
 
+  it('multiline assistant text renders as stacked lines, not columns', () => {
+    const { lastFrame } = render(
+      <App {...DEFAULT_PROPS}
+        initialModel="gpt-4o-mini"
+        maxSteps={30}
+        initialStatus={{ status: 'idle', model: 'gpt-4o-mini', step: 0, maxSteps: 30, usageInput: 0, usageOutput: 0, repairs: 0 }}
+        initialTranscript={[
+          { id: 'm1', kind: 'text', text: 'ZZZTOPLINE\nZZZBOTTOMLINE', role: 'assistant' },
+        ]}
+      />
+    );
+    const rows = (lastFrame() ?? '').split('\n');
+    const top = rows.findIndex((r) => r.includes('ZZZTOPLINE'));
+    const bottom = rows.findIndex((r) => r.includes('ZZZBOTTOMLINE'));
+    // Columns bug put both markers on the SAME row; correct render stacks them.
+    expect(top).toBeGreaterThanOrEqual(0);
+    expect(bottom).toBeGreaterThan(top);
+  });
+
   it('diff transcript item renders the diff box', () => {
     const { lastFrame } = render(
       <App {...DEFAULT_PROPS}

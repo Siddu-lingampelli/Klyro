@@ -112,16 +112,21 @@ function groupTools(items: TranscriptItem[]): Array<TranscriptItem | Group> {
 }
 
 // design.md §23/§24 — terminal Markdown via tui/markdown.ts: headings,
-// **bold**, *italic*, `code`, fences, links, lists. Ink wraps each line.
+// **bold**, *italic*, `code`, fences, links, lists. Ink wraps the text.
+//
+// CRITICAL: this must return a SINGLE <Text> with inline nested parts.
+// A fragment of sibling <Text>s inside the row-direction parent Box lays
+// out as side-by-side COLUMNS (garbled transcript) instead of lines.
 function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width?: number }) {
   void width;
   const lines = useMemo(() => renderMarkdownLines(text), [text]);
   const dimColor = tokens.colors.dim as string;
   const softColor = tokens.colors.soft as string;
   return (
-    <>
+    <Text wrap="wrap" color={dim ? dimColor : undefined}>
       {lines.map((l, i) => (
-        <Text key={i} wrap="wrap" color={dim ? dimColor : undefined}>
+        <React.Fragment key={i}>
+          {i > 0 ? '\n' : null}
           {l.parts.map((p, j) => (
             <Text
               key={j}
@@ -131,9 +136,9 @@ function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width
               {p.text}
             </Text>
           ))}
-        </Text>
+        </React.Fragment>
       ))}
-    </>
+    </Text>
   );
 }
 
