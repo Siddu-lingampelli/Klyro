@@ -1,65 +1,94 @@
 /**
- * Design Tokens — TUI_DESIGN.md §4
- * Semantic colors, glyphs, spacing for Klyro TUI
+ * §2.1 Color tokens + §2.2 Glyph set — TUI_DESIGN.md
+ * Accent is Orange #E8843C (256:209, 16: yellow bold), one accent ≤5%
+ * No backgrounds except diff viewer. fg.dim ≥4.5:1 on near-black.
  */
-
 export const tokens = {
   colors: {
-    accent: '#8B7CF6',
+    accent: '#E8843C',
     fg: '#E6E6E6',
-    muted: '#7A7A7A',
-    success: '#4ADE80',
-    error: '#F87171',
-    warning: '#FBBF24',
-    info: '#60A5FA',
-    diffAddBg: '#12351F',
-    diffDelBg: '#3B1519',
-    border: '#3A3A3A',
-    codeBg: '#1E1E1E',
-    thinking: '#7A7A7A',
+    soft: '#B3B3B3',
+    dim: '#6F6F6F',
+    guide: '#3A3A3A',
+    ok: '#6BBF6B',
+    err: '#E06C6C',
+    warn: '#D9A441',
+    info: '#6FA8DC',
+    diffAddBg: '#12250F',
+    diffDelBg: '#2A1212',
   },
-  // For Ink, map to closest ANSI names
   ansi: {
-    accent: 'magenta',
-    fg: undefined,
-    muted: 'gray',
-    success: 'green',
-    error: 'red',
-    warning: 'yellow',
-    info: 'blue',
-    border: 'gray',
+    accent: 'yellow' as const,
+    accentBold: 'yellowBright' as const,
+    fg: undefined as unknown as string | undefined,
+    soft: 'white' as const,
+    dim: 'gray' as const,
+    guide: 'gray' as const,
+    ok: 'green' as const,
+    err: 'red' as const,
+    warn: 'yellow' as const,
+    info: 'blue' as const,
+    border: 'gray' as const,
+    // compat aliases for older components (TUI_DESIGN §24 Don'ts still happy — no boxes)
+    muted: 'gray' as const,
+    success: 'green' as const,
+    error: 'red' as const,
+    warning: 'yellow' as const,
   },
 } as const;
 
 export const glyphs = {
-  prompt: '›',
-  promptAscii: '>',
-  toolRunning: '●',
-  toolDone: '●',
-  connector: '⎿',
-  connectorAscii: '\\',
-  success: '✔',
-  successAscii: '[ok]',
-  failure: '✘',
-  failureAscii: '[x]',
-  warning: '⚠',
-  warningAscii: '[!]',
-  spinner: ['✻', '✽', '✶', '✳', '✢', '·'] as const,
-  spinnerAscii: ['-', '\\', '|', '/'] as const,
-  pending: '○',
-  pendingAscii: 'o',
-  checkboxDone: '☒',
-  checkboxTodo: '☐',
+  prompt: '>',
+  agentBullet: '●',
+  collapsed: '▸',
+  expanded: '▾',
+  guide: '│',
+  branch: '├',
+  end: '└',
+  rule: '─',
+  treeBranch: '├──',
+  treeEnd: '└──',
+  success: '✓',
+  failure: '✗',
+  warning: '!',
   repair: '↻',
-  repairAscii: '~',
-  compaction: '⟲',
-  compactionAscii: '~~',
-  expand: '▸',
-  selected: '❯',
-  contextBar: '▰',
-  contextBarEmpty: '▱',
+  todoPending: '○',
+  todoActive: '●',
+  todoDone: '✓',
+  todoPlan: '◇',
+  modeAccept: '◐',
+  modePlan: '○',
+  modeAuto: '●',
+  editsBadge: '✎',
+  dot: '·',
+  ellipsis: '…',
+  meterFilled: '▰',
+  meterEmpty: '▱',
+  continuation: '↪',
+  // compat
   brand: '◆',
-  brandAscii: '*',
+  compaction: '⟲',
+} as const;
+
+export const glyphAscii = {
+  prompt: '>',
+  agentBullet: '*',
+  collapsed: '>',
+  expanded: 'v',
+  guide: '|',
+  branch: '|',
+  end: '\\',
+  rule: '-',
+  treeBranch: '|--',
+  treeEnd: '`--',
+  success: 'ok',
+  failure: 'x',
+  warning: '!',
+  repair: '~',
+  todoPending: '[ ]',
+  todoActive: '[>]',
+  todoDone: '[x]',
+  todoPlan: '#',
 } as const;
 
 export function isAsciiMode(): boolean {
@@ -67,25 +96,11 @@ export function isAsciiMode(): boolean {
     process.env.TERM === 'dumb' ||
     process.env.KLYRO_ASCII === '1' ||
     (process.env.LANG !== undefined && !process.env.LANG.toLowerCase().includes('utf-8')) ||
-    process.platform === 'win32' // legacy console fallback check could be more precise
+    false
   );
 }
-
-export function glyph(name: keyof typeof glyphs): string {
-  if (isAsciiMode()) {
-    const asciiKey = `${String(name)}Ascii` as keyof typeof glyphs;
-    const val = glyphs[asciiKey];
-    if (typeof val === 'string') return val;
-    if (Array.isArray(val)) return (val as readonly string[])[0] ?? '>';
-    return '>';
-  }
-  const val = glyphs[name];
-  if (Array.isArray(val)) return (val as readonly string[])[0] ?? '●';
-  return val as string;
+export function g(name: keyof typeof glyphs): string {
+  if (isAsciiMode()) return (glyphAscii as Record<string, string>)[name] ?? glyphs[name];
+  return glyphs[name];
 }
-
-export const spacing = {
-  maxWidth: 120,
-  indent: 2,
-  gap: 1,
-} as const;
+export const spacing = { maxWidth: 120, indent: 2, gap: 1 } as const;

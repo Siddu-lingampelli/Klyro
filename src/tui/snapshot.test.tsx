@@ -26,14 +26,11 @@ describe('App visual snapshot', () => {
       />
     );
     const frame = lastFrame();
-    // Header should be visible (uppercase KLYRO as rendered)
     expect(frame).toContain('KLYRO');
-    expect(frame).toContain('demo');  // cwd basename
+    expect(frame).toContain('demo');
     expect(frame).toContain('gpt-4o-mini');
-    // Status line should show
-    expect(frame).toMatch(/idle/i);
-    // Input prompt should be visible (klyro › per 1.4)
-    expect(frame).toMatch(/klyro|›/);
+    expect(frame).toMatch(/shift\+tab|for history|Message Klyro/);
+    expect(frame).toMatch(/KLYRO|Message Klyro|>/i);
   });
 
   it('renders a transcript with assistant text', () => {

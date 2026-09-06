@@ -1,17 +1,16 @@
 /**
- * Klyro TUI — opencode-style linear transcript
- * Header (top) → Conversation (scrollable, Q→A→Q→A) → Input (bottom) → StatusBar (bottom)
- * Single streamingId merges text_delta into one assistant item — no duplication, no liveText ghost.
+ * Klyro TUI — TUI_DESIGN.md §3-7,10-12 — Professional monochrome + one accent orange #E8843C
+ * No boxes, no borders (§24). Guide │ at col2, accent ● at col4 for agent.
+ * Regions: scrollback (header+turns) / live window (streaming tail+groups) / pinned (input+status)
  */
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
 import type { StatusSnapshot } from './status.js';
 import type { TranscriptItem } from './transcript.js';
 import { TuiApprovalBridge } from './approval.js';
-import { PlanView } from './plan.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash } from '../cli/slash/parser.js';
-import { tokens } from './tokens.js';
+import { tokens, g } from './tokens.js';
 
 export interface AppProps {
   initialModel: string;
@@ -22,17 +21,85 @@ export interface AppProps {
   initialTranscript?: TranscriptItem[];
   initialStatus?: Partial<StatusSnapshot>;
   approvalBridge?: TuiApprovalBridge;
-  onMounted?: (hooks: {
-    append: (i: TranscriptItem) => void;
-    appendDelta: (text: string) => void;
-    updateStatus: (s: Partial<StatusSnapshot>) => void;
-    updatePlan: (p: PlanStep[]) => void;
-  }) => void;
+  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void }) => void;
+  version?: string;
 }
 
 let _id = 0;
 function nextId(p: string): string { _id++; return `${p}-${_id}`; }
 
+// ── Header §4 ───────────────────────────────────────────────────────────────
+function Header({ cwd, model, version, width }: { cwd: string; model: string; version: string; width: number }) {
+  const branch = (() => { try { const { execSync } = require('node:child_process') as typeof import('node:child_process'); return execSync('git rev-parse --abbrev-ref HEAD', { cwd, stdio: ['ignore','pipe','ignore'] }).toString().trim(); } catch { return ''; } })();
+  const showLinks = width >= 120;
+  const links = '│  /help   /config   /clear   /exit';
+  const ctxShort = '200k'; // TODO wire real context window
+  const row1Left = `KLYRO  v${version}`;
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      <Box justifyContent="space-between">
+        <Text bold color={tokens.ansi.accent as string}>{row1Left}</Text>
+        {showLinks ? <Text color={tokens.ansi.dim as string}>{links}</Text> : null}
+      </Box>
+      <Text color={tokens.ansi.dim as string}>{model}[{ctxShort}]  ·  API Usage Billing</Text>
+      <Text color={tokens.ansi.dim as string}>{cwd}{branch ? `  ·  ${branch}` : ''}</Text>
+    </Box>
+  );
+}
+
+// ── Verb table §5.3.1 ──────────────────────────────────────────────────────
+type Verb = 'Read' | 'Listed' | 'Searched' | 'Ran' | 'Started' | 'Edited' | 'Created' | 'Checked git' | 'Fetched' | 'Searched web' | 'Mapped' | 'Called';
+function verbForTool(name: string): { verb: Verb; plural: string } {
+  if (name === 'read_file') return { verb: 'Read', plural: 'Read' };
+  if (name === 'list_directory') return { verb: 'Listed', plural: 'Listed' };
+  if (name === 'grep' || name === 'glob' || name === 'find_files' || name === 'search_files' || name === 'recent_files') return { verb: 'Searched', plural: 'Searched' };
+  if (name === 'shell_exec') return { verb: 'Ran', plural: 'Ran' };
+  if (name.startsWith('git_')) return { verb: 'Checked git', plural: 'Checked git' };
+  if (name === 'web_fetch') return { verb: 'Fetched', plural: 'Fetched' };
+  if (name === 'web_search') return { verb: 'Searched web', plural: 'Searched web' };
+  if (name === 'edit_file' || name === 'multi_edit' || name === 'apply_patch' || name === 'write_file') return { verb: 'Edited', plural: 'Edited' };
+  return { verb: 'Called', plural: 'Called' };
+}
+
+interface Group {
+  id: string;
+  verb: Verb;
+  items: Extract<TranscriptItem, { kind: 'tool' }>[];
+  totalMs: number;
+  status: 'running' | 'done' | 'error';
+}
+
+function groupTools(items: TranscriptItem[]): Array<TranscriptItem | Group> {
+  const out: Array<TranscriptItem | Group> = [];
+  let cur: Extract<TranscriptItem, { kind: 'tool' }>[] = [];
+  const flush = () => {
+    if (cur.length === 0) return;
+    // bucket by verb
+    const byVerb = new Map<Verb, typeof cur>();
+    for (const it of cur) {
+      const v = verbForTool(it.name).verb;
+      if (!byVerb.has(v)) byVerb.set(v, []);
+      byVerb.get(v)!.push(it);
+    }
+    for (const [verb, list] of byVerb) {
+      const totalMs = list.reduce((s, x) => s + (x.latencyMs ?? 0), 0);
+      const status = list.some((x) => x.isError || x.status === 'error') ? 'error' : list.some((x) => x.status === 'running') ? 'running' : 'done';
+      out.push({ id: nextId('g'), verb, items: list, totalMs, status });
+    }
+    cur = [];
+  };
+  for (const it of items) {
+    if (it.kind === 'tool') cur.push(it as Extract<TranscriptItem, { kind: 'tool' }>);
+    else {
+      flush();
+      out.push(it);
+    }
+  }
+  flush();
+  return out;
+}
+
+// ── Main App §3 ────────────────────────────────────────────────────────────
 export function App(props: AppProps): React.JSX.Element {
   const { stdout } = useStdout();
   const [transcript, setTranscript] = useState<TranscriptItem[]>(props.initialTranscript ?? []);
@@ -40,37 +107,24 @@ export function App(props: AppProps): React.JSX.Element {
   const [bridge] = useState(() => props.approvalBridge ?? new TuiApprovalBridge());
   const [awaitingApproval, setAwaitingApproval] = useState(false);
   const [plan, setPlan] = useState<PlanStep[]>([]);
-  const [status, setStatus] = useState<StatusSnapshot>({
-    model: props.initialModel,
-    step: 0,
-    maxSteps: props.maxSteps,
-    usageInput: 0,
-    usageOutput: 0,
-    repairs: 0,
-    status: 'idle',
-    ...props.initialStatus,
-  });
+  const [status, setStatus] = useState<StatusSnapshot>({ model: props.initialModel, step: 0, maxSteps: props.maxSteps, usageInput: 0, usageOutput: 0, repairs: 0, status: 'idle', ...props.initialStatus });
   const [elapsed, setElapsed] = useState(0);
   const [queued, setQueued] = useState<string | null>(null);
-  // streaming: one assistant text item that text_delta merges into
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const streamingIdRef = useRef<string | null>(null);
+  const placeholders = ['Message Klyro…', 'Message @file to attach…', 'Type / for commands…', '! runs a shell command…'];
+  const placeholder = placeholders[0] ?? 'Message Klyro…';
 
   useEffect(() => bridge.subscribe((p) => setAwaitingApproval(p !== null)), [bridge]);
-
-  // queued: send when idle (2.4)
   useEffect(() => {
     if (queued && status.status !== 'running' && !awaitingApproval) {
-      const toSend = queued;
-      setQueued(null);
-      const item: TranscriptItem = { id: nextId('user'), kind: 'text', text: toSend, role: 'user' };
-      setTranscript((prev) => [...prev, item]);
+      const toSend = queued; setQueued(null);
+      setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: toSend, role: 'user' } as TranscriptItem]);
       streamingIdRef.current = null;
       const cmd = parseSlash(toSend.trim());
-      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text);
-      else void props.onSlash(cmd);
+      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd);
     }
   }, [queued, status.status, awaitingApproval]);
-
   useEffect(() => {
     if (status.status !== 'running') return;
     const start = Date.now() - elapsed;
@@ -79,11 +133,9 @@ export function App(props: AppProps): React.JSX.Element {
   }, [status.status, elapsed]);
 
   const append = useCallback((item: TranscriptItem) => {
-    // any non-streaming append closes the current streaming block
     if (item.kind !== 'text' || item.role !== 'assistant') streamingIdRef.current = null;
     setTranscript((prev) => [...prev, item]);
   }, []);
-
   const appendDelta = useCallback((text: string) => {
     if (!text) return;
     const sid = streamingIdRef.current;
@@ -93,72 +145,54 @@ export function App(props: AppProps): React.JSX.Element {
         if (idx === -1) return [...prev, { id: sid, kind: 'text', text, role: 'assistant' } as TranscriptItem];
         const cur = prev[idx] as Extract<TranscriptItem, { kind: 'text' }>;
         const next = { ...cur, text: cur.text + text } as TranscriptItem;
-        const copy = [...prev];
-        copy[idx] = next;
-        return copy;
+        const copy = [...prev]; copy[idx] = next; return copy;
       });
     } else {
-      const id = nextId('stream');
-      streamingIdRef.current = id;
+      const id = nextId('stream'); streamingIdRef.current = id;
       setTranscript((prev) => [...prev, { id, kind: 'text', text, role: 'assistant' } as TranscriptItem]);
     }
   }, []);
-
-  // close streaming block when status leaves running (so next text_delta starts new item)
-  useEffect(() => {
-    if (status.status !== 'running') streamingIdRef.current = null;
-  }, [status.status]);
-
+  useEffect(() => { if (status.status !== 'running') streamingIdRef.current = null; }, [status.status]);
   const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
   const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
-
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
   useEffect(() => {
     onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan });
-    // global hooks for repl bridge (instance-local queue drains here)
-    (globalThis as unknown as { __klyroAppAppend?: unknown }).__klyroAppAppend = append;
-    (globalThis as unknown as { __klyroAppendDelta?: unknown }).__klyroAppendDelta = appendDelta;
-    (globalThis as unknown as { __klyroAppStatus?: unknown }).__klyroAppStatus = updateStatus;
-    (globalThis as unknown as { __klyroAppPlan?: unknown }).__klyroAppPlan = updatePlan;
-    return () => {
-      delete (globalThis as unknown as { __klyroAppAppend?: unknown }).__klyroAppAppend;
-      delete (globalThis as unknown as { __klyroAppendDelta?: unknown }).__klyroAppendDelta;
-      delete (globalThis as unknown as { __klyroAppStatus?: unknown }).__klyroAppStatus;
-      delete (globalThis as unknown as { __klyroAppPlan?: unknown }).__klyroAppPlan;
-    };
+    (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append;
+    (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta;
+    (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus;
+    (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan;
+    return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; };
   }, [append, appendDelta, updateStatus, updatePlan]);
 
+  const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
   useInput((inputStr, key) => {
     if (awaitingApproval) return;
+    if (key.ctrl && inputStr === 'o') {
+      // Ctrl+O toggle most recent group in live window
+      const groups = groupTools(transcript).filter((x): x is Group => typeof (x as Group).verb === 'string');
+      const last = groups[groups.length - 1];
+      if (last) toggleGroup(last.id);
+      return;
+    }
     if (status.status === 'running') {
       if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
       if (key.return) {
-        const v = input.trim();
-        if (!v) return;
-        setQueued(v);
-        setInput('');
-        // queued indicator as muted text, not a full user bubble (opencode style)
+        const v = input.trim(); if (!v) return; setQueued(v); setInput('');
         setTranscript((prev) => [...prev, { id: nextId('queued'), kind: 'text', text: `queued: ${v.slice(0, 80)}`, role: 'assistant' } as TranscriptItem]);
         return;
       }
       if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
-      if (!key.ctrl && !key.meta) {
-        const norm = inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-        setInput((v) => v + norm);
-      }
+      if (!key.ctrl && !key.meta) setInput((v) => v + inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
       return;
     }
     if (key.return) {
-      const v = input.trim();
-      if (!v) return;
-      setInput('');
-      const item: TranscriptItem = { id: nextId('user'), kind: 'text', text: v, role: 'user' };
-      setTranscript((prev) => [...prev, item]);
+      const v = input.trim(); if (!v) return; setInput('');
+      setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]);
       streamingIdRef.current = null;
       const cmd = parseSlash(v);
-      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text);
-      else void props.onSlash(cmd);
+      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd);
       return;
     }
     if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
@@ -168,77 +202,129 @@ export function App(props: AppProps): React.JSX.Element {
   const width = stdout?.columns ?? 100;
   const height = stdout?.rows ?? 30;
   const isSmall = width < 80;
+  const ver = props.version ?? '0.1.19';
+  const rule = g('rule').repeat(Math.max(10, width - 2));
+
+  // Derived status right
+  const cost = (status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015);
+  const totalTokens = status.usageInput + status.usageOutput;
+  const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
+  const hints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : status.status === 'idle' && transcript.length === 0 ? 'shift+tab to cycle  ·  ↑↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
+  // Grouped transcript
+  const grouped = groupTools(transcript);
 
   return (
     <Box flexDirection="column" width={width} height={height - 1}>
-      {/* Header */}
-      <Box flexDirection="column" borderStyle="single" borderColor={tokens.ansi.border as unknown as string} paddingX={1}>
-        <Text bold>KLYRO v0.1.16</Text>
-        <Text color={tokens.ansi.muted as unknown as string}>{status.model} · API Usage Billing · step {status.step}/{status.maxSteps} · {status.status} · repairs {status.repairs}</Text>
-        <Text color={tokens.ansi.muted as unknown as string}>{props.cwd}</Text>
-      </Box>
+      {/* Header §4 */}
+      <Header cwd={props.cwd} model={status.model} version={ver} width={width} />
 
-      {/* Conversation — linear Q→A→Q→A like opencode */}
-      <Box flexDirection="column" flexGrow={1} overflow="hidden" paddingX={1} paddingY={1}>
-        {transcript.length === 0 ? (
-          <Text color={tokens.ansi.muted as unknown as string}>No conversation yet. Try "hi" or /help</Text>
-        ) : (
-          transcript.map((item) => (
-            <Box key={item.id} flexDirection="column" marginBottom={1}>
-              {item.kind === 'text' && item.role === 'user' ? (
-                <Text>› {item.text}</Text>
-              ) : item.kind === 'text' ? (
-                <Text>  {item.text}</Text>
-              ) : item.kind === 'tool' ? (
-                <Box flexDirection="column" borderStyle="round" borderColor={tokens.ansi.border as unknown as string} paddingX={1}>
-                  <Text>{item.name} {item.isError ? '✗' : '✓'} {item.latencyMs ?? 0}ms</Text>
-                  {item.result ? <Text color={tokens.ansi.muted as unknown as string}>{String(item.result).slice(0, 300)}</Text> : null}
+      {/* Transcript §5 */}
+      <Box flexDirection="column" flexGrow={1} overflow="hidden" paddingX={0}>
+        {grouped.length === 0 ? (
+          <Text color={tokens.ansi.dim as string}>{placeholder}</Text>
+        ) : grouped.map((item) => {
+          if ((item as Group).verb) {
+            const gr = item as Group;
+            const isExpanded = expandedGroups.has(gr.id);
+            const marker = isExpanded ? g('expanded') : g('collapsed');
+            const verbLine = (() => {
+              if (gr.items.length === 1) {
+                const it = gr.items[0]!;
+                const primary = (() => {
+                  try { const a = JSON.parse(it.args) as Record<string, unknown>; return (a.path as string) ?? (a.pattern as string) ?? (a.command as string)?.slice(0, 48) ?? ''; } catch { return ''; }
+                })();
+                const name = gr.verb === 'Read' && primary ? `Read ${primary.split('/').pop()}` : gr.verb === 'Searched' && primary ? `Searched "${primary}"` : gr.verb === 'Ran' && primary ? `Ran ${primary.split(' ')[0]}` : `${gr.verb} ${primary}`;
+                return name;
+              }
+              if (gr.verb === 'Read') return `Read ${gr.items.length} files`;
+              if (gr.verb === 'Searched') return `Searched ${gr.items.length} patterns`;
+              if (gr.verb === 'Ran') return `Ran ${gr.items.length} commands`;
+              if (gr.verb === 'Edited' || gr.verb === 'Created') return `${gr.verb} ${gr.items.length} files`;
+              return `${gr.verb} ${gr.items.length} items`;
+            })();
+            const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? '✗' : `${gr.totalMs}ms`;
+            return (
+              <Box key={gr.id} flexDirection="column" marginBottom={0}>
+                <Box>
+                  <Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text>
+                  <Text color={gr.status === 'running' ? tokens.ansi.warn as string : undefined}>{isExpanded ? g('expanded') : g('collapsed')} {verbLine}</Text>
+                  <Text color={tokens.ansi.dim as string}>  {right}</Text>
                 </Box>
-              ) : item.kind === 'diff' ? (
-                <Box flexDirection="column" borderStyle="round" borderColor={tokens.ansi.border as unknown as string} paddingX={1}>
-                  <Text bold>{item.summary ?? 'Diff'}</Text>
-                  {item.hunks.map((h, i) => (
-                    <Box key={i} flexDirection="column" marginTop={1}>
-                      <Text color={tokens.ansi.info as unknown as string}>{h.path}</Text>
-                      {h.lines.map((l, j) => (
-                        <Text key={j} color={l.kind === 'add' ? (tokens.ansi.success as unknown as string) : l.kind === 'remove' ? (tokens.ansi.error as unknown as string) : (tokens.ansi.muted as unknown as string)}>
-                          {l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}
-                        </Text>
-                      ))}
-                    </Box>
+                {isExpanded ? gr.items.map((it) => (
+                  <Box key={it.id} paddingLeft={2}>
+                    <Text color={tokens.ansi.guide as string}>    {g('end')} </Text>
+                    <Text color={it.isError ? tokens.ansi.err as string : tokens.ansi.dim as string}>{it.name} {it.args.slice(0, 80)}</Text>
+                    {it.result ? <Text color={tokens.ansi.dim as string}> · {String(it.result).slice(0, 80)}</Text> : null}
+                  </Box>
+                )) : null}
+              </Box>
+            );
+          }
+          const it = item as TranscriptItem;
+          if (it.kind === 'text' && it.role === 'user') {
+            return <Box key={it.id}><Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text><Text>{it.text}</Text></Box>;
+          }
+          if (it.kind === 'text') {
+            // Check if it's queued indicator
+            if (it.text.startsWith('queued:')) return <Box key={it.id} paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {it.text}  esc to drop</Text></Box>;
+            return (
+              <Box key={it.id} flexDirection="column">
+                <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.accent as string}>{g('agentBullet')} Klyro</Text></Box>
+                <Box paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   </Text><Text>{it.text}</Text></Box>
+              </Box>
+            );
+          }
+          if (it.kind === 'error') return <Box key={it.id} paddingLeft={2}><Text color={tokens.ansi.err as string}>  {g('guide')}   ✗ {it.message}</Text></Box>;
+          if (it.kind === 'policy') return <Box key={it.id} paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   [policy] {it.action} {it.name}</Text></Box>;
+          if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
+          if (it.kind === 'diff') return (
+            <Box key={it.id} flexDirection="column" paddingLeft={2}>
+              <Text bold>{it.summary ?? 'Diff'}</Text>
+              {it.hunks.map((h, i) => (
+                <Box key={i} flexDirection="column" marginTop={1}>
+                  <Text color={tokens.ansi.soft as string}>{h.path}</Text>
+                  {h.lines.map((l, j) => (
+                    <Text key={j} color={l.kind === 'add' ? tokens.ansi.ok as string : l.kind === 'remove' ? tokens.ansi.err as string : tokens.ansi.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}</Text>
                   ))}
                 </Box>
-              ) : item.kind === 'error' ? (
-                <Text color={tokens.ansi.error as unknown as string}>[error] {item.message}</Text>
-              ) : item.kind === 'policy' ? (
-                <Text color={tokens.ansi.muted as unknown as string}>[policy] {item.action} {item.name}{item.reason ? ` — ${item.reason}` : ''}</Text>
-              ) : item.kind === 'file_changed' ? (
-                <Text color={tokens.ansi.muted as unknown as string}>[{item.op}] {item.path}</Text>
-              ) : null}
+              ))}
             </Box>
-          ))
-        )}
+          );
+          return null;
+        })}
         {status.status === 'running' && !streamingIdRef.current ? (
-          <Box>
-            <Text color={tokens.ansi.info as unknown as string}>✦ Thinking...</Text>
-            <Text color={tokens.ansi.muted as unknown as string}> · {Math.round(elapsed / 1000)}s</Text>
+          <Box paddingLeft={2}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.dim as string}>Thinking...</Text><Text color={tokens.ansi.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
+        ) : null}
+        {/* Phase rule §11.1 and Plan §11.2 */}
+        {plan.length > 0 ? (
+          <Box flexDirection="column" paddingLeft={2} marginTop={1}>
+            <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
+            {plan.slice(0, 8).map((p) => (
+              <Box key={p.id}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.ansi.ok as string : p.status === 'in_progress' ? tokens.ansi.accent as string : tokens.ansi.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {p.title}</Text></Box>
+            ))}
+            {plan.length > 8 ? <Text color={tokens.ansi.dim as string}>  {g('guide')}   … +{plan.length - 8} more (/todos)</Text> : null}
           </Box>
         ) : null}
-        {plan.length > 0 ? <PlanView steps={plan} expanded={false} onToggle={() => {}} /> : null}
+        {/* End-of-turn summary §5.7 */}
+        {status.status === 'done' && transcript.some((x) => x.kind === 'file_changed') ? (
+          <Box paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {transcript.filter((x) => x.kind === 'file_changed').length} files · /diff</Text></Box>
+        ) : null}
       </Box>
 
-      {/* Input */}
-      <Box borderStyle="single" borderColor={tokens.ansi.accent as unknown as string} paddingX={1}>
-        <Text>› </Text>
-        <Text>{input}▏</Text>
+      {/* Input §6 — rules + prompt */}
+      <Box flexDirection="column">
+        <Text color={tokens.ansi.guide as string}>{rule}</Text>
+        <Box>
+          <Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text>
+          <Text>{input || <Text color={tokens.ansi.dim as string}>{placeholder}</Text> as unknown as string}▏</Text>
+        </Box>
+        <Text color={tokens.ansi.guide as string}>{rule}</Text>
       </Box>
 
-      {/* StatusBar */}
-      <Box justifyContent="space-between" paddingX={1} borderStyle="single" borderColor={tokens.ansi.border as unknown as string}>
-        <Text color={tokens.ansi.muted as unknown as string}>
-          {status.model} · {status.usageInput + status.usageOutput} tokens · ${(status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015).toFixed(2)} · {Math.round(elapsed / 1000)}s
-        </Text>
-        <Text color={tokens.ansi.muted as unknown as string}>{isSmall ? 'Ctrl+C interrupt' : 'Ctrl+C interrupt · Ctrl+O expand · ↑↓ scroll'}</Text>
+      {/* Status §7 */}
+      <Box justifyContent="space-between">
+        <Text color={tokens.ansi.dim as string}>{hints}</Text>
+        <Text color={tokens.ansi.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct > 0 ? `${ctxPct}% ctx · ` : ''}{status.status === 'running' ? 'auto mode on ●' : ''}</Text>
       </Box>
     </Box>
   );
