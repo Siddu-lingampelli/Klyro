@@ -83,6 +83,39 @@ describe('runOnce', () => {
     expect(code).toBe(3);
   });
 
+  it('forwards the L7 telemetry block into the adapter on every step', async () => {
+    const seenSystems: (string | undefined)[] = [];
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream(req) {
+        seenSystems.push(req.system);
+        if (seenSystems.length === 1) {
+          yield { kind: 'message_start' };
+          yield { kind: 'tool_call_start', id: 'c1', name: 'shell_exec' };
+          yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"command":"echo hi"}' };
+          yield { kind: 'tool_call_end', id: 'c1' };
+          yield { kind: 'message_end', finishReason: 'tool_calls' };
+        } else {
+          yield { kind: 'message_start' };
+          yield { kind: 'text_delta', text: 'done' };
+          yield { kind: 'message_end', finishReason: 'stop' };
+        }
+      },
+    };
+    await runOnce({
+      task: 'telemetry-e2e',
+      cwd: process.cwd(),
+      model: 'mock',
+      adapter,
+      abortOnSigint: false,
+    });
+    expect(seenSystems.length).toBeGreaterThanOrEqual(2);
+    // Step 1 placeholder; step 2 has the real telemetry line.
+    expect(seenSystems[0]).toMatch(/no telemetry yet/);
+    expect(seenSystems[1]).toMatch(/# Runtime telemetry/);
+    expect(seenSystems[1]).toMatch(/shell_exec echo hi/);
+  });
+
   describe('--output json', () => {
     it('emits one JSON object per line per RuntimeEvent', async () => {
       const adapter = scriptedAdapter([

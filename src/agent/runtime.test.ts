@@ -3,6 +3,7 @@ import { run, defaultSystemPrompt } from './runtime.js';
 import { ToolRegistry } from '../tools/registry.js';
 import { readFileTool } from '../tools/fs/read-file.js';
 import { writeFileTool } from '../tools/fs/write-file.js';
+import { shellExecTool } from '../tools/shell/shell-exec.js';
 import { PolicyEngine, builtinRules, DEFAULT_POLICY_CONFIG } from '../policy/engine.js';
 import { DenyAllApprovalPrompt } from '../policy/approval.js';
 import type { ProviderAdapter, StreamEvent } from './provider-adapter.js';
@@ -247,5 +248,144 @@ describe('runtime', () => {
     // just the single user message.
     expect(received!.length).toBeGreaterThanOrEqual(1);
     expect(received![0]?.content[0]).toMatchObject({ kind: 'text', text: 'only' });
+  });
+});
+
+describe('runtime: level-7 telemetry', () => {
+  it('injects the telemetry block into the system prompt on step 2 (after a tool call)', async () => {
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const seenSystems: (string | undefined)[] = [];
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream(req) {
+        seenSystems.push(req.system);
+        if (seenSystems.length === 1) {
+          // Step 1: emit a tool call, then end.
+          yield { kind: 'message_start' };
+          yield { kind: 'tool_call_start', id: 'c1', name: 'write_file' };
+          yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"x.txt","content":"y"}' };
+          yield { kind: 'tool_call_end', id: 'c1' };
+          yield { kind: 'message_end', finishReason: 'tool_calls', usage: { input: 100, output: 20 } };
+        } else {
+          // Step 2: final answer.
+          yield { kind: 'message_start' };
+          yield { kind: 'text_delta', text: 'done' };
+          yield { kind: 'message_end', finishReason: 'stop' };
+        }
+      },
+    };
+    const r = await run(
+      { task: 'telemetry', cwd, model: 'mock', maxSteps: 4, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('complete');
+    expect(seenSystems).toHaveLength(2);
+    // Step 1 has the "no telemetry yet" placeholder.
+    expect(seenSystems[0]).toMatch(/no telemetry yet/);
+    // Step 2 must include the prior tool call in its telemetry.
+    expect(seenSystems[1]).toMatch(/# Runtime telemetry/);
+    expect(seenSystems[1]).toMatch(/Step 2/);
+    expect(seenSystems[1]).toMatch(/tool calls: 1/);
+    expect(seenSystems[1]).toMatch(/write_file x\.txt/);
+    expect(seenSystems[1]).toMatch(/tokens: 100 in \/ 20 out/);
+  });
+
+  it('records policy denials into the telemetry visible to subsequent steps', async () => {
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const seenSystems: (string | undefined)[] = [];
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream(req) {
+        seenSystems.push(req.system);
+        if (seenSystems.length === 1) {
+          yield { kind: 'message_start' };
+          yield { kind: 'tool_call_start', id: 'c1', name: 'write_file' };
+          yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"../escape.txt","content":"x"}' };
+          yield { kind: 'tool_call_end', id: 'c1' };
+          yield { kind: 'message_end', finishReason: 'tool_calls' };
+        } else {
+          yield { kind: 'message_start' };
+          yield { kind: 'text_delta', text: 'ok' };
+          yield { kind: 'message_end', finishReason: 'stop' };
+        }
+      },
+    };
+    await run(
+      { task: 'telemetry-deny', cwd, model: 'mock', maxSteps: 4, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(seenSystems).toHaveLength(2);
+    // Step 2 telemetry must reflect that the previous call was denied.
+    expect(seenSystems[1]).toMatch(/write_file \.\.\/escape\.txt/);
+    expect(seenSystems[1]).toMatch(/ERR/);
+    expect(seenSystems[1]).toMatch(/Last error: policy_denied: write_file/);
+  });
+
+  it('records user-deny (ask→deny) into the telemetry visible to subsequent steps', async () => {
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool).register(shellExecTool);
+    // shell_exec with a non-allowlisted command goes through 'ask' in
+    // interactive mode. We run nonInteractive: false so the policy returns
+    // 'ask', and use DenyAllApprovalPrompt so the user denies.
+    const policy = new PolicyEngine(builtinRules(), { ...DEFAULT_POLICY_CONFIG, shellAllow: [] });
+    const seenSystems: (string | undefined)[] = [];
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream(req) {
+        seenSystems.push(req.system);
+        if (seenSystems.length === 1) {
+          yield { kind: 'message_start' };
+          yield { kind: 'tool_call_start', id: 'c1', name: 'shell_exec' };
+          yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"command":"echo hi"}' };
+          yield { kind: 'tool_call_end', id: 'c1' };
+          yield { kind: 'message_end', finishReason: 'tool_calls' };
+        } else {
+          yield { kind: 'message_start' };
+          yield { kind: 'text_delta', text: 'ok' };
+          yield { kind: 'message_end', finishReason: 'stop' };
+        }
+      },
+    };
+    await run(
+      { task: 'telemetry-ask-deny', cwd, model: 'mock', maxSteps: 4, nonInteractive: false },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(seenSystems).toHaveLength(2);
+    // The ask→deny branch records both the call (as error) and the user_denied kind.
+    expect(seenSystems[1]).toMatch(/shell_exec echo hi/);
+    expect(seenSystems[1]).toMatch(/Last error: user_denied: shell_exec/);
+  });
+
+  it('records tool execution errors (UNSUPPORTED tool) into the telemetry', async () => {
+    // Register only write_file but the model calls read_file → tool error.
+    const reg = new ToolRegistry().register(writeFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const seenSystems: (string | undefined)[] = [];
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream(req) {
+        seenSystems.push(req.system);
+        if (seenSystems.length === 1) {
+          yield { kind: 'message_start' };
+          yield { kind: 'tool_call_start', id: 'c1', name: 'read_file' };
+          yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"x.txt"}' };
+          yield { kind: 'tool_call_end', id: 'c1' };
+          yield { kind: 'message_end', finishReason: 'tool_calls' };
+        } else {
+          yield { kind: 'message_start' };
+          yield { kind: 'text_delta', text: 'ok' };
+          yield { kind: 'message_end', finishReason: 'stop' };
+        }
+      },
+    };
+    await run(
+      { task: 'telemetry-tool-err', cwd, model: 'mock', maxSteps: 4, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(seenSystems).toHaveLength(2);
+    expect(seenSystems[1]).toMatch(/read_file x\.txt/);
+    expect(seenSystems[1]).toMatch(/Last error: UNKNOWN_TOOL: read_file|UNKNOWN_TOOL/);
+    expect(seenSystems[1]).toMatch(/errors: 1/);
   });
 });

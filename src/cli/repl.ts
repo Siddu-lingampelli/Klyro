@@ -45,8 +45,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   const approval = opts.nonInteractive ? new DenyAllApprovalPrompt() : new StdinApprovalPrompt();
   const ctxBlock = await buildLevel6Context({ cwd });
   const ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
-  const systemPromptFn = (_ctx: { cwd: string }): string =>
-    (opts.systemPrompt ?? 'You are Klyro, an autonomous coding harness. Solve the user\'s task using the available tools.') + ctxPrefix;
+  const systemPromptFn = (_ctx: { cwd: string; telemetry?: string }): string => {
+    const base = opts.systemPrompt ?? 'You are Klyro, an autonomous coding harness. Solve the user\'s task using the available tools.';
+    const t = _ctx.telemetry ? '\n\n' + _ctx.telemetry : '';
+    return base + ctxPrefix + t;
+  };
 
   const ac = new AbortController();
   process.on('SIGINT', () => ac.abort());

@@ -1,14 +1,17 @@
 {
   "name": "klyro",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Klyro — autonomous coding harness CLI that streams from any OpenAI-compatible or Anthropic LLM endpoint.",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "klyro": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=20"
@@ -20,14 +23,21 @@
     "dev:watch": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "pack:dry": "npm pack --dry-run",
+    "publish:public": "npm publish --access public"
   },
   "keywords": [
     "llm",
     "ai",
     "cli",
     "openai",
-    "streaming"
+    "anthropic",
+    "harness",
+    "agent",
+    "streaming",
+    "klyro"
   ],
   "license": "MIT",
   "dependencies": {
@@ -35,7 +45,6 @@
     "ink": "^7.1.1",
     "ink-spinner": "^5.0.0",
     "react": "^19.2.0",
-    "vitest": "^4.1.11",
     "zod": "^4.5.4"
   },
   "devDependencies": {
@@ -43,6 +52,7 @@
     "@types/react": "^19.2.18",
     "ink-testing-library": "^4.0.0",
     "tsx": "^4.23.13",
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "vitest": "^4.1.11"
   }
 }

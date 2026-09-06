@@ -28,7 +28,7 @@ export interface RunCliOptions {
   maxSteps?: number;
   maxTokens?: number;
   temperature?: number;
-  systemPrompt?: (ctx: { cwd: string }) => string;
+  systemPrompt?: (ctx: { cwd: string; telemetry?: string }) => string;
   baseUrl?: string;
   apiKey?: string;
   timeoutMs?: number;
@@ -204,22 +204,26 @@ function dryRunReport(opts: RunCliOptions): number {
   return 0;
 }
 
-function defaultRunSystemPrompt(_ctx: { cwd: string }): string {
-  return [
+function defaultRunSystemPrompt(_ctx: { cwd: string; telemetry?: string }): string {
+  const base = [
     'You are Klyro running in one-shot mode. The user has given you a single task.',
     'Solve it by calling tools as needed. When done, produce a short final text answer.',
     'Do not invent file paths. Do not call tools outside the working directory.',
   ].join(' ');
+  return _ctx.telemetry ? base + '\n\n' + _ctx.telemetry : base;
 }
 
 /** Wrap a system-prompt fn to inject Level-6 context (project map etc.). */
 export async function makeRunSystemPrompt(
   cwd: string,
-  base: (ctx: { cwd: string }) => string,
-): Promise<(ctx: { cwd: string }) => string> {
+  base: (ctx: { cwd: string; telemetry?: string }) => string,
+): Promise<(ctx: { cwd: string; telemetry?: string }) => string> {
   const ctxBlock = await buildLevel6Context({ cwd });
   const prefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
-  return (ctx) => base(ctx) + prefix;
+  return (ctx) => {
+    const t = ctx.telemetry ? '\n\n' + ctx.telemetry : '';
+    return base(ctx) + prefix + t;
+  };
 }
 
 export function loadTranscript(path: string): Message[] {

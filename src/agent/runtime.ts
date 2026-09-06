@@ -23,14 +23,20 @@ import type { ToolContext } from '../tools/types.js';
 import type { PolicyEngine } from '../policy/engine.js';
 import type { ApprovalPrompt } from '../policy/approval.js';
 import { redact } from '../policy/secret-redactor.js';
+import { RuntimeTelemetry, emptyTelemetryBlock, summarizeToolCall } from '../context/level7.js';
 
 export interface RuntimeDeps {
   adapter: ProviderAdapter;
   registry: ToolRegistry;
   policy: PolicyEngine;
   approval: ApprovalPrompt;
-  /** Build a system prompt given cwd + the current transcript tail. */
-  systemPrompt: (ctx: { cwd: string }) => string;
+  /**
+   * Build a system prompt given cwd + the current Level-7 runtime telemetry.
+   * The telemetry block is a compact, in-memory summary of the run so far
+   * (step count, last tool calls, recent errors). Injected as part of the
+   * system prompt so the model can see its own state mid-run.
+   */
+  systemPrompt: (ctx: { cwd: string; telemetry?: string }) => string;
 }
 
 export interface RunOptions {
@@ -108,6 +114,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   let finalText = '';
   let repairs = 0;
   const emit = opts.onEvent;
+  const telemetry = new RuntimeTelemetry();
+  telemetry.setMaxSteps(maxSteps);
 
   outer: while (steps < maxSteps) {
     if (opts.signal?.aborted) {
@@ -116,10 +124,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     }
     steps++;
     emit?.({ kind: 'step_start', step: steps });
+    telemetry.recordStepStart(steps);
 
     const req = {
       model: opts.model,
-      system: deps.systemPrompt({ cwd: opts.cwd }),
+      system: deps.systemPrompt({ cwd: opts.cwd, telemetry: steps === 1 ? emptyTelemetryBlock() : telemetry.format() }),
       messages: transcript,
       tools: toolDefinitions(deps.registry),
       ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
@@ -151,9 +160,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         if (ev.usage) {
           usage.input += ev.usage.input;
           usage.output += ev.usage.output;
+          telemetry.recordUsage(ev.usage.input, ev.usage.output);
           emit?.({ kind: 'usage', input: usage.input, output: usage.output });
         }
       } else if (ev.kind === 'error') {
+        telemetry.recordError(`stream_error: ${ev.code}`);
         return {
           status: 'no_final',
           steps,
@@ -217,6 +228,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             mkToolResult(call.id, call.name, { error: 'POLICY_DENIED', reason: decision.reason }, true),
           ],
         });
+        telemetry.recordToolError(call, 'policy_denied');
         emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: decision.reason }, isError: true, latencyMs: 0 });
         continue;
       }
@@ -225,7 +237,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         const choice = await deps.approval.ask({
           toolName: call.name,
           reason: decision.reason,
-          summary: summarize(call),
+          summary: summarizeToolCall(call),
         });
         if (choice === 'deny') {
           transcript.push({
@@ -234,6 +246,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
               mkToolResult(call.id, call.name, { error: 'POLICY_DENIED', reason: 'user denied' }, true),
             ],
           });
+          telemetry.recordToolError(call, 'user_denied');
           emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: 'user denied' }, isError: true, latencyMs: 0 });
           continue;
         }
@@ -248,6 +261,13 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         role: 'tool',
         content: [mkToolResult(call.id, call.name, output, !obs.ok)],
       });
+      if (obs.ok) {
+        telemetry.recordToolCall(call, latencyMs, false);
+      } else {
+        const code = String((obs.error as { code?: string; message?: string })?.code ?? 'tool_error');
+        telemetry.recordToolCall(call, latencyMs, true);
+        telemetry.recordError(`${code}: ${call.name}`);
+      }
       emit?.({ kind: 'tool_result', id: call.id, name: call.name, output, isError: !obs.ok, latencyMs });
     }
     emit?.({ kind: 'step_end', step: steps });
@@ -267,21 +287,15 @@ function redactOutput(v: unknown): unknown {
   return v;
 }
 
-function summarize(call: ToolUseBlock): string {
-  if (call.name === 'shell_exec' || call.name === 'run_verify') {
-    return String((call.input as { command?: string }).command ?? '');
-  }
-  if (call.name === 'read_file' || call.name === 'write_file' || call.name === 'edit_file') {
-    return String((call.input as { path?: string }).path ?? '');
-  }
-  return call.name;
-}
-
-export function defaultSystemPrompt(_ctx: { cwd: string }): string {
-  return [
+export function defaultSystemPrompt(ctx: { cwd: string; telemetry?: string }): string {
+  const base = [
     'You are Klyro, an autonomous coding harness. You solve the user\'s task by',
     'calling tools in a loop. Prefer the smallest change that solves the task.',
     'When you have finished, produce a short final text answer (no tool calls).',
     'Do not invent file paths. Do not call tools outside the working directory.',
   ].join(' ');
+  if (ctx.telemetry) {
+    return base + '\n\n' + ctx.telemetry + '\n\nUse the telemetry above to avoid repeating the same failing call and to keep within the step budget.';
+  }
+  return base;
 }

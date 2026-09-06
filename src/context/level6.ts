@@ -8,6 +8,11 @@
  *
  * Token budget: we cap each sub-block so the total added context is bounded
  * (≤ ~6 KB). The exact budget is exposed via Level6Options.
+ *
+ * Static counterpart to Level-7 (`./level7.ts`), which injects a *live*
+ * runtime-telemetry snapshot (step count, recent tool calls, errors) into
+ * every model call. Together they give the model a static picture of the
+ * project (L6) and a live picture of its own run (L7).
  */
 
 import * as fs from 'node:fs/promises';
