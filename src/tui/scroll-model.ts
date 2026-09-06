@@ -63,10 +63,13 @@ function stickBottom(): ScrollState {
   return { anchor: { mode: 'bottom' }, userScrolled: false, newSinceUnstick: 0 };
 }
 
-function pinAt(s: ScrollState, ctx: ScrollCtx, row: number): ScrollState {
+// FOLLOW_EPSILON is directional: scrolling DOWN into the last line re-sticks
+// to bottom, but scrolling UP must always escape — otherwise single-line /
+// wheel scrolling from the bottom could never leave it (dead scroll trap).
+function pinAt(s: ScrollState, ctx: ScrollCtx, row: number, from: number): ScrollState {
   const maxTop = maxTopFor(ctx);
   const top = clampN(row, 0, maxTop);
-  if (top >= maxTop - FOLLOW_EPSILON) return stickBottom();
+  if (top >= maxTop - FOLLOW_EPSILON && top >= from) return stickBottom();
   if (ctx.count === 0) return stickBottom();
   const i = clampN(ctx.indexAt(top), 0, ctx.count - 1);
   return {
@@ -83,13 +86,13 @@ export function scrollReducer(s: ScrollState, a: ScrollAction, ctx: ScrollCtx): 
 
   switch (a.type) {
     case 'BY_LINES':
-      return pinAt(s, ctx, cur + a.delta);
+      return pinAt(s, ctx, cur + a.delta, cur);
     case 'BY_PAGE':
-      return pinAt(s, ctx, cur + a.dir * (ctx.viewportH - 1)); // 1-line overlap
+      return pinAt(s, ctx, cur + a.dir * (ctx.viewportH - 1), cur); // 1-line overlap
     case 'BY_HALF_PAGE':
-      return pinAt(s, ctx, cur + a.dir * Math.floor(ctx.viewportH / 2));
+      return pinAt(s, ctx, cur + a.dir * Math.floor(ctx.viewportH / 2), cur);
     case 'TO_TOP':
-      return pinAt(s, ctx, 0);
+      return pinAt(s, ctx, 0, cur);
     case 'TO_BOTTOM':
       return stickBottom();
     case 'CONTENT_GREW':

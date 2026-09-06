@@ -31,7 +31,7 @@ export interface AppProps {
   initialTranscript?: TranscriptItem[];
   initialStatus?: Partial<StatusSnapshot>;
   approvalBridge?: TuiApprovalBridge;
-  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void }) => void;
+  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void }) => void;
   version?: string;
   isFullscreen?: boolean;
 }
@@ -237,6 +237,8 @@ export function App(props: AppProps): React.JSX.Element {
     setHistory((prev) => (prev[prev.length - 1] === v ? prev : [...prev.slice(-99), v]));
     setHistIdx(null);
   }, []);
+  // Live scroll control for external drivers (mouse-wheel tap in repl.ts).
+  const scrollCmdsRef = useRef({ line: (_d: number) => {}, bottom: () => {} });
 
   const width = stdout?.columns ?? 100;
   const height = stdout?.rows ?? 30;
@@ -354,6 +356,17 @@ export function App(props: AppProps): React.JSX.Element {
     if (gi1 < gi0) { gi0 = 0; gi1 = -1; }
   }
   const visibleGrouped = isFullscreen && !tiny ? grouped.slice(gi0, gi1 + 1) : grouped;
+  // Publish live scroll control for the mouse-wheel tap (stable callbacks, latest ctx).
+  scrollCmdsRef.current = {
+    line: (d: number) => {
+      const n = Math.abs(Math.round(d));
+      for (let i = 0; i < n; i++) {
+        if (d < 0) commands.lineUp();
+        else commands.lineDown();
+      }
+    },
+    bottom: () => commands.jumpBottom(),
+  };
 
   useEffect(() => bridge.subscribe((p) => setAwaitingApproval(p !== null)), [bridge]);
   useEffect(() => {
@@ -378,9 +391,13 @@ export function App(props: AppProps): React.JSX.Element {
   const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
   const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
   const clearTranscript = useCallback(() => { streamingIdRef.current = null; setTranscript([]); setPlan([]); }, []);
+  // Scroll control for external drivers (mouse-wheel tap in repl.ts, §8.4).
+  // Stored in refs so the callbacks stay stable while acting on latest state.
+  const scrollLines = useCallback((delta: number) => { scrollCmdsRef.current.line(delta); }, []);
+  const scrollToBottom = useCallback(() => { scrollCmdsRef.current.bottom(); }, []);
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
-  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript]);
+  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
@@ -402,8 +419,8 @@ export function App(props: AppProps): React.JSX.Element {
       if (key.home) { commands.jumpTop(); return; }
       if (key.end)  { commands.jumpBottom(); return; }
       if (key.ctrl && inputStr === 'g') { commands.jumpBottom(); return; } // Ctrl+G → bottom (§8.4)
-      if (key.pageUp || (key.ctrl && inputStr === 'u')) { commands.pageUp(); return; }
-      if (key.pageDown || (key.ctrl && inputStr === 'd')) { commands.pageDown(); return; }
+      if (key.pageUp || (key.ctrl && inputStr === 'u') || (key.ctrl && inputStr === 'b')) { commands.pageUp(); return; }
+      if (key.pageDown || (key.ctrl && inputStr === 'd') || (key.ctrl && inputStr === 'f')) { commands.pageDown(); return; }
       if (key.upArrow && (key.shift || key.ctrl)) { commands.lineUp(); return; }
       if (key.downArrow && (key.shift || key.ctrl)) { commands.lineDown(); return; }
     }

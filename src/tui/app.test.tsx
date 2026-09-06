@@ -384,6 +384,36 @@ describe('App', () => {
     expect(lastFrame() ?? '').toMatch(/LATE-1-tag/);
   });
 
+  it('onMounted scrollLines/scrollToBottom drive the viewport (wheel path)', async () => {
+    let captured: { scrollLines: (d: number) => void; scrollToBottom: () => void } | null = null;
+    const { lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+        onMounted={(h) => {
+          captured = { scrollLines: h.scrollLines, scrollToBottom: h.scrollToBottom };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(captured).not.toBeNull();
+    // Wheel up ×12 (3 lines each = 36 > maxTop 32) → pinned at top.
+    for (let i = 0; i < 12; i++) captured!.scrollLines(-3);
+    await new Promise((r) => setTimeout(r, 50));
+    const top = lastFrame() ?? '';
+    expect(top).toMatch(/MSG-00-tag/);
+    expect(top).not.toMatch(/MSG-24-tag/);
+    // scrollToBottom → tail visible again.
+    captured!.scrollToBottom();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(lastFrame() ?? '').toMatch(/MSG-24-tag/);
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App

@@ -20,6 +20,7 @@ import { TuiApprovalBridge } from '../tui/approval.js';
 import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
 import { resolveProvider, providerHelp } from '../providers.js';
+import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE } from '../tui/mouse.js';
 import { inferProviderFromBaseURL } from '../agent/registry.js';
 import { getDefaultSessionStore } from '../persistence/session.js';
 import { buildSystemPrompt, parseImageInput } from '../context/system-prompt.js';
@@ -114,6 +115,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         updateStatus: (s: Partial<import('../tui/status.js').StatusSnapshot>) => void;
         updatePlan: (p: import('../agent/runtime.js').PlanStep[]) => void;
         clearTranscript: () => void;
+        scrollLines: (delta: number) => void;
+        scrollToBottom: () => void;
       }
     | undefined;
 
@@ -157,14 +160,45 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     try {
       process.stdout.write('\x1b[?1049h\x1b[?25l'); // alt screen + hide cursor
       process.stdout.write('\x1b[H\x1b[2J'); // home + clear
+      process.stdout.write(MOUSE_ENABLE); // wheel events (SGR), see tui/mouse.ts
     } catch { /* ignore */ }
   };
   const leaveAlt = () => {
     if (!isAltScreen) return;
     try {
+      process.stdout.write(MOUSE_DISABLE);
       process.stdout.write('\x1b[?25h\x1b[?1049l'); // show cursor + leave alt
     } catch { /* ignore */ }
   };
+  // OpenCode-style wheel scrolling (§8.5, S8): Ink owns stdin and cannot see
+  // mouse events, so tap stdin.emit — wheel deltas drive the App's scroll
+  // hooks, everything else passes through to Ink untouched.
+  const mouseFilter = new MouseFilter();
+  const origStdinEmit = process.stdin.emit.bind(process.stdin);
+  let mouseTapInstalled = false;
+  function installMouseTap(): void {
+    if (!isAltScreen || mouseTapInstalled) return;
+    mouseTapInstalled = true;
+    (process.stdin as unknown as { emit: (...a: unknown[]) => boolean }).emit = (...a: unknown[]) => {
+      if (a[0] === 'data' && Buffer.isBuffer(a[1])) {
+        const split = mouseFilter.push(a[1] as Buffer);
+        for (const w of split.wheels) {
+          try {
+            if (isMounted && directHooks) directHooks.scrollLines(w);
+          } catch { /* ignore */ }
+        }
+        if (split.kept.length === 0) return false;
+        a[1] = split.kept;
+      }
+      return (origStdinEmit as (...b: unknown[]) => boolean)(...a);
+    };
+  }
+  function removeMouseTap(): void {
+    if (!mouseTapInstalled) return;
+    mouseTapInstalled = false;
+    mouseFilter.reset();
+    (process.stdin as unknown as { emit: (...a: unknown[]) => boolean }).emit = origStdinEmit as (...a: unknown[]) => boolean;
+  }
 
   // Declare app before handler to avoid TDZ; handler added after render
   let app: ReturnType<typeof render> | undefined;
@@ -215,6 +249,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     console.debug = origConsoleFns.debug;
   }
   patchConsole();
+  installMouseTap();
 
   const EFFORT_STEPS: Record<string, number> = { low: 10, medium: 30, high: 50, max: 100 };
   // P1 session/permission state (commands.md Priority 1)
@@ -1971,6 +2006,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         process.removeListener('SIGTERM', sigintHandler);
       }
       restoreConsole();
+      removeMouseTap();
       leaveAlt();
       // §1.2 exit behavior: replay a plain-text transcript into the main
       // buffer so the session survives in native scrollback.

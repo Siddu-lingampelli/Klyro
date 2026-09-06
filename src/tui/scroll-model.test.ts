@@ -87,6 +87,29 @@ describe('pages, clamps, epsilon', () => {
     const s = scrollReducer(initialScroll, { type: 'TO_TOP' }, c);
     expect(s.anchor).toEqual({ mode: 'pinned', itemId: 'k0', lineInItem: 0 });
   });
+  it('single line up from bottom escapes (no dead scroll trap)', () => {
+    const c = ctx5(); // maxTop = 4, starts at bottom
+    expect(resolveTopRow(initialScroll, c).topRow).toBe(4);
+    const s1 = scrollReducer(initialScroll, { type: 'BY_LINES', delta: -1 }, c);
+    expect(s1.anchor.mode).toBe('pinned');
+    expect(resolveTopRow(s1, c).topRow).toBe(3);
+    const s2 = scrollReducer(s1, { type: 'BY_LINES', delta: -1 }, c);
+    expect(resolveTopRow(s2, c).topRow).toBe(2);
+  });
+  it('single line down into the last line re-sticks', () => {
+    const c = ctx5(); // maxTop = 4, epsilon = 1
+    const top = scrollReducer(initialScroll, { type: 'TO_TOP' }, c);
+    const r1 = scrollReducer(top, { type: 'BY_LINES', delta: 1 }, c);
+    expect(resolveTopRow(r1, c).topRow).toBe(1);
+    expect(r1.anchor.mode).toBe('pinned');
+    const r2 = scrollReducer(r1, { type: 'BY_LINES', delta: 1 }, c);
+    expect(resolveTopRow(r2, c).topRow).toBe(2);
+    expect(r2.anchor.mode).toBe('pinned');
+    // row 3 is within epsilon of bottom (4) while moving down → re-stick
+    const intoBottom = scrollReducer(r2, { type: 'BY_LINES', delta: 1 }, c);
+    expect(intoBottom.anchor.mode).toBe('bottom');
+    expect(resolveTopRow(intoBottom, c).topRow).toBe(4);
+  });
 });
 
 describe('anchor survives collapse above it (I4)', () => {
