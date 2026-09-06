@@ -54,7 +54,11 @@ export const LOGIN_DEFAULTS: Record<string, { baseUrl: string; model: string }> 
  */
 export async function runLogin(): Promise<number> {
   const rl = readline.createInterface({ input: stdin, output: stdout });
+  // Ctrl+C during prompts rejects with AbortError — report cleanly, no stack.
+  const isAbort = (err: unknown): boolean =>
+    err instanceof Error && (err.name === 'AbortError' || /abort|cancel/i.test(err.message));
   try {
+    try {
     const providerRaw = (await rl.question('Provider (openai/anthropic/local) [openai]: ')) || 'openai';
     const provider = providerRaw.trim().toLowerCase();
     const defs = LOGIN_DEFAULTS[provider] ?? LOGIN_DEFAULTS.openai!;
@@ -64,7 +68,17 @@ export async function runLogin(): Promise<number> {
       process.stderr.write('No key provided\n');
       return 2;
     }
-    const baseUrl = ((await rl.question(`Base URL [${defs.baseUrl}]: `)) || defs.baseUrl).trim();
+    const baseRaw = ((await rl.question(`Base URL [${defs.baseUrl}]: `)) || defs.baseUrl).trim();
+    // Same gate as first-run setup: a saved URL must actually work at startup.
+    const { ensureAllowedBaseURL } = await import('./setup.js');
+    const allowed = await ensureAllowedBaseURL(
+      (q) => rl.question(q),
+      baseRaw,
+    );
+    if (!allowed || 'declined' in allowed) {
+      process.stderr.write('Login aborted — nothing saved. Use an https:// URL or allow explicitly.\n');
+      return 2;
+    }
     const model = ((await rl.question(`Model [${defs.model}]: `)) || defs.model).trim();
     const storeProvider = provider === 'local' ? 'openai' : provider;
     if (key.trim()) {
@@ -75,11 +89,19 @@ export async function runLogin(): Promise<number> {
     const { loadConfig, saveConfig } = await import('./config.js');
     const cfg = await loadConfig();
     cfg.provider = storeProvider;
-    cfg.baseUrl = baseUrl;
+    cfg.baseUrl = allowed.url;
     cfg.model = model;
+    if (allowed.allowInsecure) cfg.allowInsecure = true;
     await saveConfig(cfg);
     process.stdout.write(`Saved provider settings (applies to all terminals — no env vars needed)\n`);
     return 0;
+    } catch (err) {
+      if (isAbort(err)) {
+        process.stderr.write('\nLogin cancelled — nothing saved.\n');
+        return 130;
+      }
+      throw err;
+    }
   } finally {
     rl.close();
   }

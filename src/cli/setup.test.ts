@@ -70,4 +70,41 @@ describe('runFirstRunSetup', () => {
     // nothing persisted on abort
     expect(fs.existsSync(process.env.KLYRO_CONFIG!)).toBe(false);
   });
+
+  it('plain-HTTP remote URL: explains, and persists opt-in on explicit yes', async () => {
+    const ans = await runFirstRunSetup(
+      asker(['1', 'sk-x', 'http://129.159.226.245:20128/v1', 'y', 'my-model']),
+    );
+    expect(ans).not.toBeNull();
+    expect(ans!.baseUrl).toBe('http://129.159.226.245:20128/v1');
+    const cfg = JSON.parse(fs.readFileSync(process.env.KLYRO_CONFIG!, 'utf-8'));
+    expect(cfg.allowInsecure).toBe(true);
+    expect(cfg.baseUrl).toBe('http://129.159.226.245:20128/v1');
+    expect(cfg.model).toBe('my-model');
+  });
+
+  it('plain-HTTP remote URL: no means no (nothing saved)', async () => {
+    expect(
+      await runFirstRunSetup(asker(['1', 'sk-x', 'http://129.159.226.245:20128/v1', 'n'])),
+    ).toBeNull();
+    expect(fs.existsSync(process.env.KLYRO_CONFIG!)).toBe(false);
+  });
+
+  it('reuses an already-saved key instead of re-asking', async () => {
+    fs.writeFileSync(process.env.KLYRO_CREDENTIALS_FILE!, JSON.stringify({ openai: 'sk-kept' }));
+    const ans = await runFirstRunSetup(asker(['1', '', '', '']));
+    expect(ans).not.toBeNull();
+    expect(ans!.keySaved).toBe(true);
+    const creds = JSON.parse(fs.readFileSync(process.env.KLYRO_CREDENTIALS_FILE!, 'utf-8'));
+    expect(creds.openai).toBe('sk-kept'); // untouched
+  });
+
+  it('Ctrl+C aborts cleanly (no throw)', async () => {
+    const aborting = async (_q: string): Promise<string> => {
+      const err = new Error('Aborted with Ctrl+C');
+      err.name = 'AbortError';
+      throw err;
+    };
+    expect(await runFirstRunSetup(aborting)).toBeNull();
+  });
 });

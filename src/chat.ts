@@ -34,8 +34,12 @@ export function normalizeBaseURL(url: string): string {
 /**
  * Validate that the base URL is HTTPS (or localhost over HTTP for local LLMs).
  * Refuses to send the bearer token over a plaintext remote connection.
+ *
+ * The opt-in is explicit: `opts.allowInsecure` (persisted
+ * `allowInsecure: true` in settings.json — set once, works in every
+ * terminal) or the legacy per-terminal KLYRO_ALLOW_INSECURE=1.
  */
-export function assertSafeBaseURL(url: string): void {
+export function assertSafeBaseURL(url: string, opts?: { allowInsecure?: boolean }): void {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -45,7 +49,7 @@ export function assertSafeBaseURL(url: string): void {
   if (parsed.protocol === 'https:') return;
   if (parsed.protocol === 'http:') {
     // Allow insecure HTTP if explicitly opted in (for remote Ollama etc.)
-    if (process.env.KLYRO_ALLOW_INSECURE === '1') return;
+    if (opts?.allowInsecure === true || process.env.KLYRO_ALLOW_INSECURE === '1') return;
     const host = parsed.hostname.toLowerCase();
     // Allow loopback and private networks without extra flag
     if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0' || host === '::' || host === '[::]') return;

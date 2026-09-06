@@ -6,11 +6,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { resolveProvider } from './providers.js';
+import { resolveProvider, lastProviderError } from './providers.js';
 
 let dir: string;
 const savedEnv: Record<string, string | undefined> = {};
-const ENV_KEYS = ['KLYRO_BASE_URL', 'KLYRO_API_KEY', 'KLYRO_MODEL', 'KLYRO_PROVIDER', 'KLYRO_CONFIG', 'KLYRO_CREDENTIALS_FILE'];
+const ENV_KEYS = ['KLYRO_BASE_URL', 'KLYRO_API_KEY', 'KLYRO_MODEL', 'KLYRO_PROVIDER', 'KLYRO_CONFIG', 'KLYRO_CONFIG_DIR', 'KLYRO_CREDENTIALS_FILE'];
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-prov-'));
@@ -19,6 +19,7 @@ beforeEach(() => {
     delete process.env[k];
   }
   process.env.KLYRO_CONFIG = path.join(dir, 'settings.json');
+  process.env.KLYRO_CONFIG_DIR = dir;
   process.env.KLYRO_CREDENTIALS_FILE = path.join(dir, 'credentials.json');
 });
 
@@ -67,6 +68,30 @@ describe('resolveProvider persisted layers', () => {
     expect(r!.source).toBe('env');
     expect(r!.baseURL).toBe('https://env.example.com/v1');
     expect(r!.model).toBe('env-model');
+  });
+
+  it('persisted allowInsecure honors a saved plain-HTTP remote URL', async () => {
+    writeConfig({
+      provider: 'openai',
+      baseUrl: 'http://129.159.226.245:20128/v1',
+      model: 'm',
+      allowInsecure: true,
+    });
+    writeCreds({ openai: 'sk-saved' });
+    const r = await resolveProvider();
+    expect(r).not.toBeNull();
+    expect(r!.source).toBe('config');
+    expect(r!.baseURL).toBe('http://129.159.226.245:20128/v1');
+    expect(r!.apiKey).toBe('sk-saved');
+    expect(lastProviderError()).toBeNull();
+  });
+
+  it('saved plain-HTTP remote URL without opt-in resolves nothing but records why', async () => {
+    writeConfig({ provider: 'openai', baseUrl: 'http://129.159.226.245:20128/v1', model: 'm' });
+    writeCreds({ openai: 'sk-saved' });
+    const r = await resolveProvider();
+    expect(r).toBeNull();
+    expect(lastProviderError()).toMatch(/plaintext HTTP/);
   });
 
   it('saved model applies to local probe fallback', async () => {

@@ -41,39 +41,77 @@ const LOCAL_ENDPOINTS: Array<{ name: string; baseURL: string; defaultModel: stri
  *   4. Stored credential keys alone (provider inferred from which key exists)
  *   5. Local endpoint probe (Ollama / LM Studio / vLLM / llama.cpp)
  */
+/** Why the last resolveProvider() call found nothing (surfaced by the CLI). */
+let lastResolveError: string | null = null;
+export function lastProviderError(): string | null {
+  return lastResolveError;
+}
+
 export async function resolveProvider(): Promise<ProviderConfig | null> {
+  lastResolveError = null;
+  const reject = (reason: string): null => {
+    // Keep the FIRST (highest-precedence) rejection — that's the actionable one.
+    if (!lastResolveError) lastResolveError = reason;
+    return null;
+  };
   const envBaseURL = process.env.KLYRO_BASE_URL;
   const envKey = process.env.KLYRO_API_KEY;
   const envModel = process.env.KLYRO_MODEL;
 
+  // Persisted config loads first: it carries the allowInsecure opt-in that
+  // also governs env URLs, and supplies model/key fallbacks everywhere.
+  let cfg: Record<string, unknown> = {};
+  try {
+    const { loadMergedConfig } = await import('./cli/config.js');
+    cfg = await loadMergedConfig(process.cwd(), {});
+  } catch { /* corrupted config must not break startup */ }
+  const allowInsecure = cfg.allowInsecure === true;
+  const cfgBase = (cfg.baseUrl ?? cfg.baseURL) as string | undefined;
+  const cfgProvider = cfg.provider as string | undefined;
+  const cfgModel = (cfg.model ?? cfg['model.default']) as string | undefined;
+  const cfgKey = (cfg.apiKey ?? cfg.api_key) as string | undefined;
+
+  // An explicitly configured endpoint that fails policy is a hard error —
+  // fail loud with the reason instead of silently guessing another endpoint
+  // (which would send the user's key to the wrong host).
   if (envBaseURL) {
-    assertSafeBaseURL(envBaseURL);
-    return {
-      baseURL: normalizeBaseURL(envBaseURL),
-      apiKey: envKey ?? '',
-      model: envModel ?? 'gpt-4o-mini',
-      source: 'env',
-    };
+    try {
+      assertSafeBaseURL(envBaseURL, { allowInsecure });
+      return {
+        baseURL: normalizeBaseURL(envBaseURL),
+        apiKey: envKey ?? '',
+        model: envModel ?? cfgModel ?? 'gpt-4o-mini',
+        source: 'env',
+      };
+    } catch (err) {
+      reject(err instanceof Error ? err.message : String(err));
+      if (!cfgBase) return null;
+      // else: a valid saved endpoint may still work — try it below.
+    }
   }
 
   // Persisted config — the "set once, works in every terminal" layer.
-  try {
-    const { loadMergedConfig } = await import('./cli/config.js');
+  {
     const { getStoredKey } = await import('./cli/auth.js');
-    const cfg = await loadMergedConfig(process.cwd(), {});
-    const cfgBase = (cfg.baseUrl ?? cfg.baseURL) as string | undefined;
-    const cfgProvider = cfg.provider as string | undefined;
-    const cfgModel = (cfg.model ?? cfg['model.default']) as string | undefined;
-    const cfgKey = (cfg.apiKey ?? cfg.api_key) as string | undefined;
     if (cfgBase) {
-      assertSafeBaseURL(cfgBase);
-      const key = envKey ?? cfgKey ?? getStoredKey(cfgProvider ?? 'openai') ?? getStoredKey('openai') ?? getStoredKey('anthropic') ?? '';
-      return {
-        baseURL: normalizeBaseURL(cfgBase),
-        apiKey: key,
-        model: envModel ?? cfgModel ?? 'gpt-4o-mini',
-        source: 'config',
-      };
+      try {
+        assertSafeBaseURL(cfgBase, { allowInsecure });
+      } catch (err) {
+        reject(
+          `saved base URL rejected: ${err instanceof Error ? err.message : String(err)} — ` +
+            `allow it once with: klyro config set allowInsecure true (only for hosts you trust)`,
+        );
+        return null;
+      }
+      {
+        const key = envKey ?? cfgKey ?? getStoredKey(cfgProvider ?? 'openai') ?? getStoredKey('openai') ?? getStoredKey('anthropic') ?? '';
+        return {
+          baseURL: normalizeBaseURL(cfgBase),
+          apiKey: key,
+          model: envModel ?? cfgModel ?? 'gpt-4o-mini',
+          source: 'config',
+        };
+      }
     }
     if (cfgKey) {
       return {
@@ -110,7 +148,7 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
         source: 'config',
       };
     }
-  } catch { /* corrupted config must not break startup; probe below */ }
+  }
 
   if (envKey) {
     return {
@@ -124,24 +162,12 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
   // Probe local endpoints
   for (const ep of LOCAL_ENDPOINTS) {
     if (await probeLocal(ep.baseURL)) {
-      try {
-        const { loadMergedConfig } = await import('./cli/config.js');
-        const cfg = await loadMergedConfig(process.cwd(), {});
-        const cfgModel = (cfg.model ?? cfg['model.default']) as string | undefined;
-        return {
-          baseURL: ep.baseURL,
-          apiKey: '',
-          model: envModel ?? cfgModel ?? ep.defaultModel,
-          source: 'local-probe',
-        };
-      } catch {
-        return {
-          baseURL: ep.baseURL,
-          apiKey: '',
-          model: envModel ?? ep.defaultModel,
-          source: 'local-probe',
-        };
-      }
+      return {
+        baseURL: ep.baseURL,
+        apiKey: '',
+        model: envModel ?? cfgModel ?? ep.defaultModel,
+        source: 'local-probe',
+      };
     }
   }
   return null;

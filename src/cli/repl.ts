@@ -21,7 +21,7 @@ import { DenyAllApprovalPrompt, StdinApprovalPrompt } from '../policy/approval.j
 import { TuiApprovalBridge } from '../tui/approval.js';
 import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
-import { resolveProvider, providerHelp } from '../providers.js';
+import { resolveProvider, providerHelp, lastProviderError } from '../providers.js';
 import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE } from '../tui/mouse.js';
 import { inferProviderFromBaseURL } from '../agent/registry.js';
 import { getDefaultSessionStore } from '../persistence/session.js';
@@ -67,6 +67,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     if (!resolved) {
       process.stderr.write('klyro: no provider available.\n');
       process.stderr.write(`  ${providerHelp(null)}\n`);
+      const why = lastProviderError();
+      if (why) process.stderr.write(`  Rejected: ${why}\n`);
       process.stderr.write('  Run `klyro login` once (persists for all terminals), set KLYRO_BASE_URL and KLYRO_API_KEY, or run a local server (Ollama, LM Studio, vLLM).\n');
       return 2;
     }

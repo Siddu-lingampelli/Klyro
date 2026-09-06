@@ -18,6 +18,9 @@ export const ConfigSchema = z
     provider: z.enum(['openai', 'anthropic']).optional(),
     baseUrl: z.string().optional(),
     apiKey: z.string().optional(),
+    // Persisted opt-in for plain-HTTP remote endpoints (set once via setup /
+    // login confirmation — replaces per-terminal KLYRO_ALLOW_INSECURE=1).
+    allowInsecure: z.boolean().optional(),
     baseURL: z.string().optional(),
     api_key: z.string().optional(),
     // Global flags persisted
