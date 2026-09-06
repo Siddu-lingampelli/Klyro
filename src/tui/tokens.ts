@@ -5,33 +5,32 @@
  */
 export const tokens = {
   colors: {
-    accent: '#E8843C',
-    fg: '#E6E6E6',
-    soft: '#B3B3B3',
-    dim: '#6F6F6F',
-    guide: '#3A3A3A',
-    ok: '#6BBF6B',
+    accent: '#E8843C', // Orange — wordmark, prompt >, ●, thumb, selected
+    fg: '#FFFFFF', // White — user input, headings, file names
+    soft: '#F5F5F5', // Soft white — assistant prose
+    dim: '#9A9A9A', // Dim white — hints, durations
+    guide: '#3A3A3A', // Guide │
+    ok: '#E8843C', // Orange for success check (white+orange theme)
     err: '#E06C6C',
-    warn: '#D9A441',
-    info: '#6FA8DC',
+    warn: '#E8843C', // Orange for running/spinner
+    info: '#FFFFFF',
     diffAddBg: '#12250F',
     diffDelBg: '#2A1212',
   },
   ansi: {
-    accent: 'yellow' as const,
+    accent: 'yellow' as const, // #E8843C → 209 → yellow
     accentBold: 'yellowBright' as const,
-    fg: undefined as unknown as string | undefined,
-    soft: 'white' as const,
-    dim: 'gray' as const,
+    fg: 'white' as const, // #FFFFFF
+    soft: 'whiteBright' as const, // #F5F5F5
+    dim: 'gray' as const, // #9A9A9A
     guide: 'gray' as const,
-    ok: 'green' as const,
+    ok: 'yellow' as const, // orange for ✓ in white/orange theme
     err: 'red' as const,
-    warn: 'yellow' as const,
-    info: 'blue' as const,
+    warn: 'yellow' as const, // orange
+    info: 'white' as const,
     border: 'gray' as const,
-    // compat aliases for older components (TUI_DESIGN §24 Don'ts still happy — no boxes)
     muted: 'gray' as const,
-    success: 'green' as const,
+    success: 'yellow' as const,
     error: 'red' as const,
     warning: 'yellow' as const,
   },
