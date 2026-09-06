@@ -5,6 +5,8 @@
 import { readFileTool } from './fs/read-file.js';
 import { writeFileTool } from './fs/write-file.js';
 import { editFileTool } from './fs/edit-file.js';
+import { multiEditTool } from './fs/multi-edit.js';
+import { applyPatchTool } from './fs/apply-patch.js';
 import { listDirTool } from './fs/list-dir.js';
 import { globTool } from './search/glob.js';
 import { grepTool } from './search/grep.js';
@@ -14,6 +16,7 @@ import { dependenciesTool } from './search/dependencies.js';
 import { shellExecTool } from './shell/shell-exec.js';
 import { gitStatusTool } from './git/git-status.js';
 import { gitDiffTool } from './git/git-diff.js';
+import { gitLogTool } from './git/git-log.js';
 import { runVerifyTool } from './verify/run-verify.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { zodToJsonSchema } from './schema.js';
@@ -83,6 +86,8 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(readFileTool);
   r.register(writeFileTool);
   r.register(editFileTool);
+  r.register(multiEditTool);
+  r.register(applyPatchTool);
   r.register(listDirTool);
   r.register(globTool);
   r.register(grepTool);
@@ -92,6 +97,7 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(shellExecTool);
   r.register(gitStatusTool);
   r.register(gitDiffTool);
+  r.register(gitLogTool);
   r.register(runVerifyTool);
   return r;
 };

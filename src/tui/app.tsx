@@ -250,6 +250,41 @@ export function App(props: AppProps): React.JSX.Element {
         setInput('');
         return;
       }
+      // 4.4 — handle @path and !cmd and # note without model call
+      if (trimmedOuter.startsWith('@')) {
+        const atPath = trimmedOuter.slice(1).trim().split(' ')[0] ?? '';
+        setInput('');
+        append({ id: nextId('text'), kind: 'text', text: `Attached @${atPath} (fuzzy completion stub)`, role: 'assistant' });
+        // Still send to model as context, but mark as @ reference
+        const atText = `Reference file: ${atPath}`;
+        void props.onPrompt(atText);
+        return;
+      }
+      if (trimmedOuter.startsWith('!')) {
+        const cmdText = trimmedOuter.slice(1).trim();
+        setInput('');
+        // Run shell without model call, attach output
+        import('../tools/shell/shell-exec.js').then(async ({ shellExecTool }) => {
+          const { builtinRegistry } = await import('../tools/registry.js');
+          const reg = builtinRegistry();
+          const r = await reg.execute('shell_exec', { command: cmdText }, { cwd: props.cwd, env: process.env, nonInteractive: true });
+          const out = r.ok ? JSON.stringify(r.value).slice(0, 500) : String((r as unknown as { error: { message: string } }).error.message);
+          append({ id: nextId('text'), kind: 'text', text: `!${cmdText}\n${out}`, role: 'assistant' });
+        });
+        return;
+      }
+      if (trimmedOuter.startsWith('# ')) {
+        const note = trimmedOuter.slice(2).trim();
+        // Append to .klyro/memory/session-notes.md
+        import('node:fs/promises').then(async (fs) => {
+          const p = (await import('node:path')).join(props.cwd, '.klyro', 'memory', 'session-notes.md');
+          await fs.mkdir((await import('node:path')).dirname(p), { recursive: true });
+          await fs.appendFile(p, `- ${note}\n`, 'utf-8');
+        });
+        setInput('');
+        append({ id: nextId('text'), kind: 'text', text: `Note saved: ${note}`, role: 'assistant' });
+        return;
+      }
       // Check for Ctrl+C double at empty prompt handled below, but here handle submit
       setInput('');
       historyIndexRef.current = -1;

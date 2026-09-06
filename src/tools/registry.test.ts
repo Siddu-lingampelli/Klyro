@@ -42,8 +42,8 @@ describe('ToolRegistry', () => {
     const r = builtinRegistry();
     const names = r.list().map((t) => t.name).sort();
     expect(names).toEqual([
-      'dependencies', 'edit_file', 'git_diff', 'git_status', 'glob', 'grep',
-      'list_directory', 'read_file', 'recent_files', 'run_verify', 'search_files',
+      'apply_patch', 'dependencies', 'edit_file', 'git_diff', 'git_log', 'git_status', 'glob', 'grep',
+      'list_directory', 'multi_edit', 'read_file', 'recent_files', 'run_verify', 'search_files',
       'shell_exec', 'write_file',
     ]);
   });

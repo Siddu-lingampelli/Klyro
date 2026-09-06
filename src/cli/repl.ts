@@ -68,9 +68,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     : httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: 60_000 });
   const ctxBlock = await buildLevel6Context({ cwd });
   const ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
+  // 4.4 KLYRO.md hierarchy
+  const klyroMd = await import('../context/klyro-md.js').then((m) => m.loadKlyroMd(cwd)).catch(() => '');
+  const klyroBlock = klyroMd ? `\n\n<KLYRO.md>\n${klyroMd.slice(0, 4000)}\n</KLYRO.md>` : '';
   // 2.3 layered system prompt
   const systemPromptFn = (_ctx: { cwd: string; telemetry?: string }): string => {
-    const base = buildSystemPrompt({ cwd, model, extraSystem: opts.systemPrompt, appendSystem: ctxPrefix });
+    const base = buildSystemPrompt({ cwd, model, extraSystem: opts.systemPrompt, appendSystem: ctxPrefix + klyroBlock });
     const t = _ctx.telemetry ? '\n\n' + _ctx.telemetry : '';
     return base + t;
   };
@@ -394,6 +397,17 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         queuedAppend({ id: `think-${Date.now()}`, kind: 'text', text: 'Thinking: collapsed (use --show-thinking to expand)', role: 'assistant' });
         return;
       }
+      case 'memory': {
+        queuedAppend({ id: `mem-${Date.now()}`, kind: 'text', text: 'Memory: .klyro/memory/session-notes.md (stub) — use /memory to view', role: 'assistant' });
+        return;
+      }
+      case 'jobs': {
+        const { listJobs } = await import('../tools/shell/background.js');
+        const jobs = listJobs();
+        if (jobs.length === 0) queuedAppend({ id: `jobs-${Date.now()}`, kind: 'text', text: 'No background jobs', role: 'assistant' });
+        else queuedAppend({ id: `jobs-${Date.now()}`, kind: 'text', text: jobs.map((j) => `${j.id}: ${j.command} (${j.running ? 'running' : 'done'})`).join('\n'), role: 'assistant' });
+        return;
+      }
       case 'status': {
         if (lastStatus) {
           queuedAppend({
@@ -408,6 +422,15 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'diff': {
+        // 4.5 — try checkpoint diff first, fallback to git diff
+        try {
+          const { diff } = await import('../checkpoints/store.js');
+          const ckptDiff = await diff(cwd);
+          if (ckptDiff && ckptDiff !== 'No checkpoints' && ckptDiff !== 'No diff') {
+            queuedAppend({ id: `diff-${Date.now()}`, kind: 'text', text: ckptDiff, role: 'assistant' });
+            return;
+          }
+        } catch { /* fallback to git */ }
         const r = await registry.execute('git_diff', {}, { cwd, env: process.env, nonInteractive: true });
         if (!r.ok) {
           queuedAppend({
@@ -425,6 +448,28 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           hunks,
           summary: `${out.patchedFiles.length} file(s) changed${out.stat ? ' — ' + out.stat.split('\n').pop() : ''}`,
         });
+        return;
+      }
+      case 'undo': {
+        try {
+          const { undo } = await import('../checkpoints/store.js');
+          await undo(cwd);
+          queuedAppend({ id: `undo-${Date.now()}`, kind: 'text', text: 'Undone last checkpoint', role: 'assistant' });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          queuedAppend({ id: `undo-err-${Date.now()}`, kind: 'error', message: `undo failed: ${msg}` });
+        }
+        return;
+      }
+      case 'rewind': {
+        try {
+          const { rewind } = await import('../checkpoints/store.js');
+          await rewind(cwd);
+          queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text: 'Rewound to last checkpoint', role: 'assistant' });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          queuedAppend({ id: `rewind-err-${Date.now()}`, kind: 'error', message: `rewind failed: ${msg}` });
+        }
         return;
       }
       case 'compact':

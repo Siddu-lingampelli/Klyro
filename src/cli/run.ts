@@ -307,16 +307,22 @@ function defaultRunSystemPrompt(_ctx: { cwd: string; telemetry?: string }): stri
   return _ctx.telemetry ? base + '\n\n' + _ctx.telemetry : base;
 }
 
-/** Wrap a system-prompt fn to inject Level-6 context (project map etc.). */
+/** Wrap a system-prompt fn to inject Level-6 context (project map etc.) + KLYRO.md (4.4). */
 export async function makeRunSystemPrompt(
   cwd: string,
   base: (ctx: { cwd: string; telemetry?: string }) => string,
 ): Promise<(ctx: { cwd: string; telemetry?: string }) => string> {
   const ctxBlock = await buildLevel6Context({ cwd });
   const prefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
+  let klyroBlock = '';
+  try {
+    const { loadKlyroMd } = await import('../context/klyro-md.js');
+    const md = await loadKlyroMd(cwd);
+    if (md) klyroBlock = `\n\n<KLYRO.md>\n${md.slice(0, 4000)}\n</KLYRO.md>`;
+  } catch { /* ignore */ }
   return (ctx) => {
     const t = ctx.telemetry ? '\n\n' + ctx.telemetry : '';
-    return base(ctx) + prefix + t;
+    return base(ctx) + prefix + klyroBlock + t;
   };
 }
 

@@ -469,6 +469,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         if (fileChanged) {
           emit?.({ kind: 'file_changed', path: fileChanged.path, op: fileChanged.op });
           emitKlyro({ type: 'file.changed', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', path: fileChanged.path, op: fileChanged.op });
+          // 4.5 — checkpoint snapshot after each mutation
+          try {
+            const { snapshot } = await import('../checkpoints/store.js');
+            await snapshot(opts.cwd, [fileChanged.path]);
+          } catch { /* ignore */ }
         }
       }
     };
