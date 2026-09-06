@@ -23,6 +23,7 @@ export interface AppProps {
   approvalBridge?: TuiApprovalBridge;
   onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void }) => void;
   version?: string;
+  isFullscreen?: boolean;
 }
 
 let _id = 0;
@@ -170,6 +171,7 @@ export function App(props: AppProps): React.JSX.Element {
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
   const width = stdout?.columns ?? 100;
   const height = stdout?.rows ?? 30;
+  const isFullscreen = props.isFullscreen ?? false;
   const grouped = groupTools(transcript);
   const viewportH = Math.max(5, height - 10);
   const totalRows = grouped.length + (plan.length > 0 ? 1 : 0) + 2;
@@ -224,18 +226,18 @@ export function App(props: AppProps): React.JSX.Element {
   const totalTokens = status.usageInput + status.usageOutput;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
   const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : status.status === 'idle' && transcript.length === 0 ? 'shift+tab to cycle  ·  ↑↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
-  const hints = maxOffset > 0 ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
-  const visibleGrouped = grouped.slice(scrollOffset, scrollOffset + viewportH);
+  const hints = maxOffset > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
+  const visibleGrouped = isFullscreen ? grouped.slice(scrollOffset, scrollOffset + viewportH) : grouped;
   const trackH = viewportH;
   const thumbPos = maxOffset === 0 ? 0 : Math.round((scrollOffset / maxOffset) * (trackH - 1));
 
   return (
-    <Box flexDirection="column" width={width} height={height - 1}>
+    <Box flexDirection="column" width={width} height={isFullscreen ? height - 1 : undefined}>
       <Header cwd={props.cwd} model={status.model} version={ver} width={width} />
 
-      {/* Transcript §5 + slider line + dot */}
-      <Box flexDirection="row" flexGrow={1} overflow="hidden">
-        <Box flexDirection="column" flexGrow={1} overflow="hidden" paddingX={0}>
+      {/* Transcript §5 + slider — fullscreen: fixed viewport + slider, inline: natural grow */}
+      <Box flexDirection="row" flexGrow={isFullscreen ? 1 : 0} overflow={isFullscreen ? 'hidden' : undefined}>
+        <Box flexDirection="column" flexGrow={1} overflow={isFullscreen ? 'hidden' : undefined} paddingX={0}>
         {grouped.length === 0 ? (
           <Text color={tokens.ansi.dim as string}>{placeholder}</Text>
         ) : visibleGrouped.map((item) => {
@@ -323,12 +325,13 @@ export function App(props: AppProps): React.JSX.Element {
           <Box paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {transcript.filter((x) => x.kind === 'file_changed').length} files · /diff</Text></Box>
         ) : null}
         </Box>
-        {/* Slider — vertical line + dot for chat scroll */}
-        <Box flexDirection="column" width={1} marginLeft={1}>
-          {Array.from({ length: trackH }).map((_, i) => (
-            <Text key={i} color={i === thumbPos ? (tokens.ansi.accent as string) : (tokens.ansi.guide as string)}>{i === thumbPos ? '●' : '│'}</Text>
-          ))}
-        </Box>
+        {isFullscreen ? (
+          <Box flexDirection="column" width={1} marginLeft={1}>
+            {Array.from({ length: trackH }).map((_, i) => (
+              <Text key={i} color={i === thumbPos ? (tokens.ansi.accent as string) : (tokens.ansi.guide as string)}>{i === thumbPos ? '●' : '│'}</Text>
+            ))}
+          </Box>
+        ) : null}
       </Box>
 
       {/* Input §6 — rules + prompt */}

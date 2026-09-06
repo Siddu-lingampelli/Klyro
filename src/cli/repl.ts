@@ -129,9 +129,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   }
 
   // ── Full-screen takeover like OpenCode/Claude Code (§3) ──
-  // When useTui, enter alternate screen so `klyro` owns the whole terminal.
-  // Ctrl+C (SIGINT) + /quit both leave the alt screen and restore the shell like opencode.
-  const isAltScreen = useTui && !!process.stdout.isTTY;
+  // Detect alt-screen support (§19.5): Windows Terminal (WT_SESSION), VS Code, xterm, or non-Windows.
+  // Fallback to inline (native scroll) on conhost/mintty so text isn't clipped — degrade don't break (§1.8).
+  const supportsAlt = !!process.env.WT_SESSION || process.env.TERM_PROGRAM === 'vscode' || (process.env.TERM ?? '').includes('xterm') || process.platform !== 'win32' || process.env.KLYRO_ALT_SCREEN === '1';
+  const noAlt = process.env.KLYRO_NO_ALT === '1' || process.env.NO_ALT === '1';
+  const isAltScreen = useTui && !!process.stdout.isTTY && supportsAlt && !noAlt;
   const enterAlt = () => {
     if (!isAltScreen) return;
     try {
@@ -162,6 +164,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       cwd,
       initialStatus: { status: 'idle' },
       approvalBridge: tuiBridge,
+      isFullscreen: isAltScreen,
       onPrompt: async (text: string) => {
         inflight = runWithBridge(text);
         await inflight;
