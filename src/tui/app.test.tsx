@@ -730,6 +730,77 @@ describe('App', () => {
     await waitForAbsent(lastFrame, /weighing two approaches/);
   });
 
+  it('empty state: composer pinned to bottom, header first (TEST 1)', async () => {
+    const { lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} isFullscreen={true} />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    const rows = (lastFrame() ?? '').split('\n');
+    expect(rows[0]).toMatch(/KLYRO/);
+    const nonEmpty = rows.map((r, i) => ({ r, i })).filter((x) => x.r.trim().length > 0);
+    const last = nonEmpty[nonEmpty.length - 1]!;
+    expect(last.r).toMatch(/enter to send|for history|to attach/);
+    const placeholder = rows.findIndex((r) => r.includes('Message Klyro'));
+    expect(placeholder).toBeGreaterThanOrEqual(0);
+    expect(placeholder).toBeLessThan(last.i);
+  });
+
+  it('multiline input grows upward, status stays last (TEST 5)', async () => {
+    const { stdin, lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} isFullscreen={true} />,
+    );
+    stdin.write('build authentication');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x1b[13;2u');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('add tests');
+    await new Promise((r) => setTimeout(r, 50));
+    const rows = (lastFrame() ?? '').split('\n');
+    expect(rows.join('\n')).toContain('build authentication');
+    expect(rows.join('\n')).toContain('add tests');
+    const nonEmpty = rows.map((r, i) => ({ r, i })).filter((x) => x.r.trim().length > 0);
+    const last = nonEmpty[nonEmpty.length - 1]!;
+    expect(last.r).toMatch(/enter to send|for history|to attach/);
+    expect(rows.length).toBeLessThanOrEqual(32);
+  });
+
+  it('tool events aggregate, no raw internals leak (TEST 13)', async () => {
+    let hooks: {
+      append: (i: TranscriptItem) => void;
+      updateTool: (idCall: string, patch: { result: string; isError: boolean; latencyMs: number; status: 'done' | 'error' }) => void;
+    } | null = null;
+    const { lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={true}
+        onMounted={(h) => {
+          hooks = { append: h.append, updateTool: h.updateTool };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    const tools: Array<[string, string, string]> = [
+      ['read_file', 'c1', '{"path":"a.ts"}'],
+      ['read_file', 'c2', '{"path":"b.ts"}'],
+      ['read_file', 'c3', '{"path":"c.ts"}'],
+      ['shell_exec', 'c4', '{"command":"npm test"}'],
+      ['shell_exec', 'c5', '{"command":"npm run build"}'],
+    ];
+    for (const [name, id, args] of tools) {
+      hooks!.append({ id: `t-${id}`, kind: 'tool', name, id_call: id, args, status: 'running' });
+    }
+    await waitForMatch(lastFrame, /Read 3 files/);
+    for (const [, id] of tools) {
+      hooks!.updateTool(id, { result: 'ok', isError: false, latencyMs: 5, status: 'done' });
+    }
+    const frame = await waitForMatch(lastFrame, /Ran 2 commands/);
+    expect(frame).toContain('Read 3 files');
+    expect(frame).not.toContain('tool_call');
+    expect(frame).not.toContain('{"path"');
+    expect(frame).not.toContain('queued:');
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App

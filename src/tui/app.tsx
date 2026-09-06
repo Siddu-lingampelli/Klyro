@@ -56,7 +56,7 @@ function Header({ cwd, model, version, width }: { cwd: string; model: string; ve
   }, [cwd]);
   const showLinks = width >= 120;
   return (
-    <Box flexDirection="column" marginBottom={1}>
+    <Box flexDirection="column" marginBottom={1} flexShrink={0}>
       <Box justifyContent="space-between">
         <Text bold color={tokens.colors.accent as string}>KLYRO  v{version}</Text>
         {showLinks ? <Text color={tokens.colors.dim as string}>│  /help   /config   /clear   /exit</Text> : null}
@@ -724,14 +724,14 @@ export function App(props: AppProps): React.JSX.Element {
         ) : null}
       </Box>
       {pinned && pendingNew > 0 ? (
-        <Box justifyContent="flex-end" paddingX={1} marginTop={-1}>
+        <Box justifyContent="flex-end" paddingX={1} marginTop={-1} flexShrink={0}>
           <Text backgroundColor={tokens.colors.accentSoft as string} color={tokens.colors.accent as string} bold>
             {' ↓ '}{pendingNew >= 1000 ? '999+ new' : `${pendingNew} new`}{' '}
           </Text>
         </Box>
       ) : null}
       {slashSuggest.length > 0 ? (
-        <Box flexDirection="column" paddingLeft={2}>
+        <Box flexDirection="column" paddingLeft={2} flexShrink={0}>
           {slashSuggest.map((s, i) => (
             <Text key={s.name} color={i === 0 ? (tokens.colors.accent as string) : (tokens.colors.dim as string)}>{i === 0 ? '▸' : ' '} /{s.name}  — {s.hint}</Text>
           ))}
@@ -739,7 +739,7 @@ export function App(props: AppProps): React.JSX.Element {
         </Box>
       ) : null}
       <ApprovalModal bridge={bridge} />
-      <Box flexDirection="column">
+      <Box flexDirection="column" flexShrink={0}>
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
         <Box>
           <Text color={tokens.colors.accent as string} bold>{g('prompt')} </Text>
@@ -747,7 +747,7 @@ export function App(props: AppProps): React.JSX.Element {
         </Box>
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
       </Box>
-      <Box justifyContent="space-between">
+      <Box justifyContent="space-between" flexShrink={0}>
         <Text color={tokens.colors.dim as string}>{status.status === 'running' ? (<Text color={tokens.colors.accent as string}><Spinner type="dots" /> working  ·  </Text>) : null}{baseHints}{maxTop > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
         <Text color={tokens.colors.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct}% ctx · {status.model}{status.status === 'running' ? ' ●' : ''}</Text>
       </Box>
