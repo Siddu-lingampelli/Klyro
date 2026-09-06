@@ -63,9 +63,16 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   if (providerKind === 'anthropic' && !apiKey) {
     process.stderr.write('klyro: anthropic provider detected but KLYRO_API_KEY is empty — falling back to OpenAI-compatible adapter\n');
   }
-  const adapter = effectiveProvider === 'anthropic'
-    ? anthropicAdapter({ baseURL: baseUrl, apiKey, timeoutMs: 60_000 })
-    : httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: 60_000 });
+  let currentProvider: 'openai' | 'anthropic' = effectiveProvider;
+  let currentBaseUrl = baseUrl;
+  let currentApiKey = apiKey;
+  let currentMaxSteps = opts.maxSteps ?? 30;
+  let effortLevel = 'medium';
+  const buildAdapter = (prov: 'openai' | 'anthropic', url: string, key: string) =>
+    prov === 'anthropic'
+      ? anthropicAdapter({ baseURL: url, apiKey: key, timeoutMs: 60_000 })
+      : httpChatAdapter({ baseURL: url, apiKey: key, timeoutMs: 60_000 });
+  let adapter = buildAdapter(currentProvider, currentBaseUrl, currentApiKey);
   const ctxBlock = await buildLevel6Context({ cwd });
   const ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
   // 4.4 KLYRO.md hierarchy
@@ -106,6 +113,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         appendDelta: (text: string) => void;
         updateStatus: (s: Partial<import('../tui/status.js').StatusSnapshot>) => void;
         updatePlan: (p: import('../agent/runtime.js').PlanStep[]) => void;
+        clearTranscript: () => void;
       }
     | undefined;
 
@@ -154,10 +162,17 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
 
   if (isAltScreen) enterAlt();
 
+  const EFFORT_STEPS: Record<string, number> = { low: 10, medium: 30, high: 50, max: 100 };
+  function queuedClear(): void {
+    if (isMounted && directHooks) directHooks.clearTranscript();
+    else pendingQueue.length = 0;
+    if (isMounted && directHooks) directHooks.clearTranscript();
+  }
+
   app = render(
     React.createElement(App, {
       initialModel: model,
-      maxSteps: opts.maxSteps ?? 30,
+      maxSteps: currentMaxSteps,
       cwd,
       initialStatus: { status: 'idle' },
       approvalBridge: tuiBridge,
@@ -209,7 +224,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     let sessionId: string | undefined;
     if (!isSimpleChat) {
       try {
-        const rec = await tuiStore.create({ cwd, task: taskText, config: { model, maxSteps: opts.maxSteps ?? 30 } });
+        const rec = await tuiStore.create({ cwd, task: taskText, config: { model, maxSteps: currentMaxSteps } });
         sessionId = rec.id;
         tuiSessionId = rec.id;
         // Session info goes to status bar, not transcript (clean like Claude Code)
@@ -252,7 +267,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           task: taskText,
           cwd,
           model,
-          maxSteps: opts.maxSteps ?? 30,
+          maxSteps: currentMaxSteps,
           signal: ac.signal,
           nonInteractive: opts.nonInteractive ?? false,
           verify: { enabled: true, maxRepairAttempts: 3 },
@@ -381,21 +396,34 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         // Listener cleanup is handled by the waitUntilExit resolver below
         return;
       case 'clear':
+        queuedClear();
         queuedAppend({ id: `sep-${Date.now()}`, kind: 'text', text: '--- cleared ---', role: 'assistant' });
         return;
       case 'help': {
         const helpText = [
           'commands:',
-          '  /clear          — clear transcript marker',
-          '  /diff           — show git diff',
-          '  /status         — show session status',
-          '  /compact        — (stub) context compaction',
-          '  /model <id>     — switch model mid-session',
-          '  /config         — show config path',
-          '  /doctor         — run diagnostics',
-          '  /version        — show version',
-          '  /quit (/exit)   — exit',
-          `provider: ${effectiveProvider}  model: ${model}  cwd: ${cwd}`,
+          '  /clear            — clear transcript',
+          '  /compact [focus]  — compact context (clears transcript, keeps marker)',
+          '  /model [id]       — show or switch model mid-session',
+          '  /provider [name]  — show or switch provider (openai|anthropic)',
+          '  /effort [level]   — show or set effort (low|medium|high|max → steps)',
+          '  /diff             — show git diff',
+          '  /status           — show session status',
+          '  /plan             — show current plan/todos',
+          '  /verify           — detect + run verifiers',
+          '  /project          — project scan',
+          '  /context          — context breakdown',
+          '  /cost             — token cost',
+          '  /jobs             — background jobs',
+          '  /memory           — session notes',
+          '  /undo /rewind     — checkpoints',
+          '  /login /logout    — credentials',
+          '  /init             — create KLYRO.md',
+          '  /config           — show config path',
+          '  /doctor           — run diagnostics',
+          '  /version          — show version',
+          '  /quit (/exit)     — exit',
+          `provider: ${currentProvider}  model: ${model}  effort: ${effortLevel} (${currentMaxSteps} steps)  cwd: ${cwd}`,
         ].join('\n');
         queuedAppend({ id: `help-${Date.now()}`, kind: 'text', text: helpText, role: 'assistant' });
         return;
@@ -466,7 +494,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             role: 'assistant',
           });
         } else {
-          queuedAppend({ id: `stat2-${Date.now()}`, kind: 'text', text: `model: ${model}  provider: ${effectiveProvider}  cwd: ${cwd}`, role: 'assistant' });
+          queuedAppend({ id: `stat2-${Date.now()}`, kind: 'text', text: `model: ${model}  provider: ${currentProvider}  effort: ${effortLevel} (${currentMaxSteps} steps)  cwd: ${cwd}`, role: 'assistant' });
         }
         return;
       }
@@ -562,19 +590,112 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'compact': {
-        queuedAppend({ id: `compact-${Date.now()}`, kind: 'text', text: 'Compacting context…', role: 'assistant' });
-        queuedStatus({ status: 'running' });
+        const focus = cmd.focus?.trim();
+        queuedClear();
+        queuedAppend({
+          id: `compact-${Date.now()}`,
+          kind: 'text',
+          text: focus ? `Context compacted — transcript cleared (focus: ${focus}). Continuing fresh.` : 'Context compacted — transcript cleared. Continuing fresh.',
+          role: 'assistant',
+        });
+        queuedStatus({ status: 'done' });
         return;
       }
       case 'model': {
         const next = cmd.model?.trim();
         if (!next) {
-          queuedAppend({ id: `mdl-${Date.now()}`, kind: 'text', text: `current model: ${model}`, role: 'assistant' });
+          const { MODEL_REGISTRY } = await import('../providers/model-info.js');
+          const known = Object.keys(MODEL_REGISTRY).join(', ');
+          queuedAppend({ id: `mdl-${Date.now()}`, kind: 'text', text: `current model: ${model}\nknown: ${known}\nusage: /model <id>`, role: 'assistant' });
         } else {
           queuedStatus({ model: next });
           queuedAppend({ id: `mdl2-${Date.now()}`, kind: 'text', text: `model switched to ${next} (takes effect on next prompt)`, role: 'assistant' });
           model = next;
         }
+        return;
+      }
+      case 'provider': {
+        const next = cmd.provider?.trim().toLowerCase();
+        if (!next) {
+          queuedAppend({ id: `prov-${Date.now()}`, kind: 'text', text: `current provider: ${currentProvider}\nbaseURL: ${currentBaseUrl}\nusage: /provider <openai|anthropic>`, role: 'assistant' });
+        } else if (next !== 'openai' && next !== 'anthropic') {
+          queuedAppend({ id: `prov-err-${Date.now()}`, kind: 'error', message: `unknown provider: ${next} (expected openai|anthropic)` });
+        } else {
+          if (next === 'anthropic' && !currentApiKey) {
+            queuedAppend({ id: `prov-warn-${Date.now()}`, kind: 'text', text: 'warning: no API key set — anthropic adapter may 401. Set KLYRO_API_KEY or use /login.', role: 'assistant' });
+          }
+          currentProvider = next;
+          adapter = buildAdapter(currentProvider, currentBaseUrl, currentApiKey);
+          queuedAppend({ id: `prov2-${Date.now()}`, kind: 'text', text: `provider switched to ${next} (takes effect on next prompt)`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'effort': {
+        const level = cmd.level?.trim().toLowerCase();
+        if (!level) {
+          queuedAppend({ id: `eff-${Date.now()}`, kind: 'text', text: `current effort: ${effortLevel} (${currentMaxSteps} steps)\nlevels: low (10) | medium (30) | high (50) | max (100)\nusage: /effort <level>`, role: 'assistant' });
+        } else if (!EFFORT_STEPS[level]) {
+          queuedAppend({ id: `eff-err-${Date.now()}`, kind: 'error', message: `unknown effort: ${level} (expected low|medium|high|max)` });
+        } else {
+          effortLevel = level;
+          currentMaxSteps = EFFORT_STEPS[level]!;
+          queuedStatus({ maxSteps: currentMaxSteps });
+          queuedAppend({ id: `eff2-${Date.now()}`, kind: 'text', text: `effort set to ${level} (${currentMaxSteps} max steps)`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'login': {
+        const { runLogin } = await import('./auth.js');
+        const code = await runLogin();
+        queuedAppend({ id: `login-${Date.now()}`, kind: 'text', text: code === 0 ? 'login saved (0600)' : 'login failed', role: 'assistant' });
+        return;
+      }
+      case 'logout': {
+        const { runLogout } = await import('./auth.js');
+        const code = await runLogout();
+        queuedAppend({ id: `logout-${Date.now()}`, kind: 'text', text: code === 0 ? 'logged out' : 'logout failed', role: 'assistant' });
+        return;
+      }
+      case 'init': {
+        const { writeFileSync, existsSync } = await import('node:fs');
+        const { join } = await import('node:path');
+        const target = join(cwd, 'KLYRO.md');
+        if (existsSync(target)) {
+          queuedAppend({ id: `init-${Date.now()}`, kind: 'text', text: `KLYRO.md already exists at ${target}`, role: 'assistant' });
+        } else {
+          try {
+            const { runScan } = await import('./scan.js');
+            let out = '';
+            const orig = process.stdout.write.bind(process.stdout);
+            (process.stdout as unknown as { write: (s: string) => boolean }).write = ((c: string) => { out += String(c); return true; }) as typeof process.stdout.write;
+            await runScan({ cwd, json: false });
+            (process.stdout as unknown as { write: typeof orig }).write = orig;
+            writeFileSync(target, `# KLYRO.md\n\nProject: ${cwd}\n\n## Stack\n\n${out.slice(0, 2000)}\n\n## Conventions\n\n- Prefer smallest change that solves the task.\n- Run verification after edits.\n`);
+            queuedAppend({ id: `init2-${Date.now()}`, kind: 'text', text: `created ${target}`, role: 'assistant' });
+          } catch (err) {
+            queuedAppend({ id: `init-err-${Date.now()}`, kind: 'error', message: `init failed: ${err instanceof Error ? err.message : String(err)}` });
+          }
+        }
+        return;
+      }
+      case 'plan': {
+        try {
+          const { readFileSync, existsSync } = await import('node:fs');
+          const { join } = await import('node:path');
+          const todosPath = join(cwd, '.klyro', 'plans', 'todos.json');
+          if (!existsSync(todosPath)) {
+            queuedAppend({ id: `plan-${Date.now()}`, kind: 'text', text: 'No active plan (no .klyro/plans/todos.json). The agent creates one via todo_write when planning.', role: 'assistant' });
+          } else {
+            const raw = readFileSync(todosPath, 'utf-8').slice(0, 2000);
+            queuedAppend({ id: `plan2-${Date.now()}`, kind: 'text', text: `Plan (todos.json):\n${raw}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `plan-err-${Date.now()}`, kind: 'error', message: `plan failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'prompt': {
+        // Regular prompts never reach onSlash — no-op for exhaustiveness.
         return;
       }
       case 'unknown':

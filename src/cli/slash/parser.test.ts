@@ -26,8 +26,30 @@ describe('slash command parser', () => {
     expect(parse('/m claude-opus-5')).toEqual({ kind: 'model', model: 'claude-opus-5' });
   });
 
-  it('returns unknown for /model with no argument', () => {
-    expect(parse('/model')).toEqual({ kind: 'unknown', raw: '/model' });
+  it('returns model with empty string for /model with no argument (shows current)', () => {
+    expect(parse('/model')).toEqual({ kind: 'model', model: '' });
+  });
+
+  it('parses /provider with and without argument', () => {
+    expect(parse('/provider')).toEqual({ kind: 'provider', provider: '' });
+    expect(parse('/provider anthropic')).toEqual({ kind: 'provider', provider: 'anthropic' });
+  });
+
+  it('parses /effort with and without argument', () => {
+    expect(parse('/effort')).toEqual({ kind: 'effort', level: '' });
+    expect(parse('/effort high')).toEqual({ kind: 'effort', level: 'high' });
+  });
+
+  it('parses /compact with optional focus', () => {
+    expect(parse('/compact')).toEqual({ kind: 'compact', focus: undefined });
+    expect(parse('/compact focus on tests')).toEqual({ kind: 'compact', focus: 'focus on tests' });
+  });
+
+  it('parses /plan, /login, /logout, /init', () => {
+    expect(parse('/plan').kind).toBe('plan');
+    expect(parse('/login').kind).toBe('login');
+    expect(parse('/logout').kind).toBe('logout');
+    expect(parse('/init').kind).toBe('init');
   });
 
   it('parses /diff', () => {

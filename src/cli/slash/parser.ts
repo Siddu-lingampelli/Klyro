@@ -17,8 +17,10 @@
 
 export type SlashCommand =
   | { kind: 'clear' }
-  | { kind: 'compact' }
+  | { kind: 'compact'; focus?: string }
   | { kind: 'model'; model: string }
+  | { kind: 'provider'; provider: string }
+  | { kind: 'effort'; level: string }
   | { kind: 'diff' }
   | { kind: 'undo' }
   | { kind: 'rewind' }
@@ -36,11 +38,13 @@ export type SlashCommand =
   | { kind: 'verify' }
   | { kind: 'project' }
   | { kind: 'context' }
-  | { kind: 'compact'; focus?: string }
+  | { kind: 'login' }
+  | { kind: 'logout' }
+  | { kind: 'init' }
   | { kind: 'prompt'; text: string }
   | { kind: 'unknown'; raw: string };
 
-const KNOWN = ['clear', 'compact', 'model', 'diff', 'undo', 'rewind', 'plan', 'status', 'quit', 'help', 'config', 'doctor', 'version', 'cost', 'thinking', 'memory', 'jobs', 'verify', 'project', 'context', 'compact', 'exit', 'clear'] as const;
+const KNOWN = ['clear', 'compact', 'model', 'm', 'provider', 'effort', 'diff', 'undo', 'rewind', 'plan', 'status', 'quit', 'exit', 'q', 'help', 'config', 'doctor', 'version', 'cost', 'thinking', 'memory', 'jobs', 'verify', 'project', 'context', 'login', 'logout', 'init'] as const;
 
 export function parse(input: string): SlashCommand {
   const trimmed = input.trim();
@@ -52,7 +56,7 @@ export function parse(input: string): SlashCommand {
   const rest = space === -1 ? '' : trimmed.slice(space + 1).trim();
   switch (name) {
     case 'clear':   return { kind: 'clear' };
-    case 'compact': return { kind: 'compact' };
+    case 'compact': return { kind: 'compact', focus: rest || undefined };
     case 'diff':    return { kind: 'diff' };
     case 'undo':    return { kind: 'undo' };
     case 'rewind':  return { kind: 'rewind' };
@@ -65,7 +69,9 @@ export function parse(input: string): SlashCommand {
     case 'verify':  return { kind: 'verify' };
     case 'project': return { kind: 'project' };
     case 'context': return { kind: 'context' };
-    case 'compact': return { kind: 'compact', focus: rest || undefined };
+    case 'login':   return { kind: 'login' };
+    case 'logout':  return { kind: 'logout' };
+    case 'init':    return { kind: 'init' };
     case 'quit':
     case 'exit':
     case 'q':       return { kind: 'quit' };
@@ -74,9 +80,16 @@ export function parse(input: string): SlashCommand {
     case 'config':  return { kind: 'config' };
     case 'doctor':  return { kind: 'doctor' };
     case 'version': return { kind: 'version' };
+    case 'provider':
+    case 'p': {
+      return { kind: 'provider', provider: rest };
+    }
+    case 'effort':
+    case 'e': {
+      return { kind: 'effort', level: rest };
+    }
     case 'model':
     case 'm': {
-      if (!rest) return { kind: 'unknown', raw: trimmed };
       return { kind: 'model', model: rest };
     }
     default:        return { kind: 'unknown', raw: trimmed };
