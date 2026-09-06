@@ -465,3 +465,71 @@ Global flags `src/index.ts:60` `--cwd/--config/--debug/--verbose/--quiet/--json/
 
 Run: `pnpm build && pnpm test && node dist/index.js --help` → `klyro -p "fix login test" --output json` → `klyro doctor`.
 
+---
+
+## 20. Session Ledger v0.1.39 → v0.1.61 (what was done, what failed)
+
+All work below was done live against user-reported production issues, verified with
+`typecheck 0` + full `vitest` + built-`dist` smoke tests before every publish.
+Current: **`klyro@0.1.61` `latest`, 51 test files, 442/442 tests, commits as
+`siddu-lingampelli`** (history rewritten from `Mythicai-lab`, tags moved, §20.6).
+
+### 20.1 Release history
+
+| Version | Commit | What shipped |
+|---|---|---|
+| 0.1.39 | base | Single-column Klyro TUI, true `#E8843C` orange via 24-bit, hello Direct-LLM (no tools) |
+| 0.1.40 | `ca85d56` | True `#FF6B1A` orange, clean single-column, no `g`-letter corruption |
+| 0.1.41 | `1884807` | `useChatScroll` hook (pin/unpin, snap-to-message, new-messages pill) |
+| 0.1.42 | `50c84dc` | Audit batch: git-blame argv+path validation, `NODE_OPTIONS`/`LD_PRELOAD` block, ordered transcript, configurable `rerunOnce` timeout, model-aware `estimateCost`, Buffer-based (non-O(n²)) verify collectors, deleted empty `packages/cli+core`, `snippets.ts`, `util/log.ts`, `stuckCount`; TUI ellipsis `…`→`...`, mojibake purge |
+| 0.1.43 | `04bd24e` | Slash groundwork: `/provider` `/effort` `/model` `/compact` `/plan` `/login` `/logout` `/init` handlers |
+| 0.1.44 | `81d9627` | **Priority 1 per `commands.md`** (~39 cmds): session/model/project/perms/auth groups; TUI orphan-file reconciliation (deleted `app.inline/banner/input-box/activity-line/thinking-block/components/Header`) |
+| 0.1.45 | `feb30ff` | **Priority 2 per `commands.md`** (~70 cmds): review/build/git/files/agents/config/misc; `/` autocomplete popup + Tab |
+| 0.1.46 | `b8947d1` | **`scroll.md` S1–S9 Ink adaptation**: `measure.ts` (display-width/wrap/cache/line-index), `scroll-model.ts` (anchor reducer), input history + contextual ↑/↓, run-length activity merge, console-patch, exit transcript replay |
+| 0.1.47 | `c440bc3` | **Dead scroll trap fix** (directional epsilon — line/wheel up from bottom could never escape) + mouse-wheel capture + `Ctrl+F/B` pager keys |
+| 0.1.48 | `1e7f85c` | **Set-once auth**: persisted provider resolution (env → config+credentials → probe), first-run setup, `/model` `/provider` persist, `/reload` rebuilds adapter |
+| 0.1.49 | `f0e840d` + `262b8fc` | Plain-HTTP endpoints explain+confirm with persisted `allowInsecure` opt-in, loud rejections (`lastProviderError`), prefilled setup, keep-saved-key; (+ separate commit preserving a concurrent working-tree `scroll.md` rewrite) |
+| 0.1.50 | `5b3d3ee` | **`design.md` conformance**: half-page keys, Esc/Ctrl+C/Shift+Enter semantics, full Markdown renderer, header/statusbar/plan restyle |
+| 0.1.51 | `6ba47de` | **`scroll.md` command architecture**: `transcript-commands.ts` keybind mapper + 4-command handle, submit-key settle effect |
+| 0.1.52 | `db09e5f` | **Markdown columns bug**: `MarkdownText` fragment rendered lines as side-by-side columns — back to single `<Text>` |
+| 0.1.53 | `5f9fa84` | Root `overflow:hidden` I1 guard (input can never be pushed out), tool results patch start-items in place (no forever-`running` spinners), narrow-terminal hints |
+| 0.1.54 | `1ec3d0c` | **Full audit application** (P0+P1, §20.3) |
+| 0.1.55 | `eb8776f` | Live working spinner (Thinking row, running tool groups, status bar) |
+| 0.1.56 | `cf1a94d` | **Thinking channel**: `reasoning_content`/Anthropic-thinking capture → dim display → cleared on response |
+| 0.1.57 | `f6fd749` | Composer audit: `flexShrink={0}` chrome, position/multiline/aggregation tests |
+| 0.1.58 | `a57d526` | Abort clears thinking, `/clear` resets scroll anchor, badge overlap fix |
+| 0.1.59 | `bbe9ba6` | Scroll position readout (`⇅ top/max`) in status bar |
+| 0.1.60 | `6627b5b` | **Wheel tap fix**: intercept `stdin.read` (Ink7 paused mode), not `data` events that never fire |
+| 0.1.61 | `5a1a97f` | Brand sweep: Claude naming removed, `CLAUDE.md` fallback dropped (Klyro-only) |
+
+### 20.2 What was built (by area)
+
+- **Slash commands (113, all smoke-tested on built `dist`)**: session (`/new` `/resume` `/sessions` `/rename` `/fork` `/branch` `/export` `/copy`), model (`/model` `/models` `/provider` `/effort` `/fast`), project (`/init` `/status` `/context` `/diff` `/plan` `/todos` `/memory`), perms (`/permissions` `/mode` `/sandbox` `/approve` `/deny`), app (`/login` `/logout` `/auth` `/version` `/update` `/cancel` `/shell` `!` `/mention` `@` `/tools`), workflow (`/review` `/code-review` `/security-review` `/simplify` `/test` `/lint` `/build` `/run` `/fix` `/explain` `/format` `/ask`), checkpoints (`/undo` `/redo`→honest-noop `/rewind` `/checkpoint` `/accept` `/reject`), activity (`/details` `/verbose` `/raw` `/activity` `/tasks` `/ps` `/stop` `/queue` `/retry` `/kill`), agents+MCP, files (`/attach`→in-context `/drop` `/files` `/image` `/paste` `/ls` `/tree` `/search` `/web` `/read` `/map` `/tokens`), git (`/commit` via temp file `/push` `/pull` `/pr` `/issue`), config UI (`/editor` argv-spawn `/keymap` `/vim` `/theme` `/statusline` `/output-style`), diagnostics (`/doctor` `/debug` `/whoami` `/reload` `/reset` `/bug` `/changelog`), library (`/prompt` `/alias`→auto-expand `/commands` `/env` (injection keys blocked) `/deps` `/install`).
+- **Scroll system** (`src/tui/scroll-model.ts` + `measure.ts` + `mouse.ts` + `transcript-commands.ts`): anchor `{itemId,lineInItem}` (never raw rows), measured wrapped display lines (CJK=2/emoji=2/combining=0), `MeasureCache`, follow-at-bottom / freeze-when-pinned / `↓ N new` badge, `End`/`Ctrl+G`/empty-Enter dismiss, wheel ±3, PageUp/Dn half-page, Home/End first/last, exit transcript replay, degraded tiny-terminal mode.
+- **Auth persistence**: `~/.klyro/settings.json` + `credentials.json` (0600); resolution env → config → stored keys → local probe; `KLYRO_CONFIG`/`KLYRO_CONFIG_DIR`/`KLYRO_CREDENTIALS_FILE` overrides (also used by tests); persisted `allowInsecure` replaces per-terminal `KLYRO_ALLOW_INSECURE=1`.
+- **Verification**: denylist (destructive-only; metachars allowed since commands are user/config-sourced), sanity checks fail-fast *before* the suite, scoped→full, flaky rerun with configured timeout, `hasEdits` drives `--require-verify` (exit 8 only when edits exist).
+- **Safety**: `resolveAndFollowSymlinks` everywhere incl. checkpoints (traversal-contained undo that also restores deletions), `wasRead` guards on all four mutators with normalized + per-task history, `readFileSizeRule` stats real files, `clonePolicyConfig` per engine, `setByPath` proto-pollution guard, shell full-output caps + POSIX process-group kill, `startBackgroundArgv` (shell:false), secret redaction before model/summary paths.
+
+### 20.3 Audit application (the big diagnostic)
+
+Every claim was verified against code before touching. **Confirmed + fixed (P0)**: ApprovalModal never rendered (+ single-listener bridge deafened it — also the flake root cause); Anthropic `role:tool` flattened to empty turns; duplicate `message_end`; edit-file fuzzy rewriting whole files (plus a dead line-window tier); apply-patch append-only stub → real hunk applier; `require()` in ESM (`run-verify`, later all touched files → static imports). **Confirmed + fixed (P1)**: shared policy config; `inferFileChanged` gaps; tokenizer pair orphans; klyro-md import escape + no caps; verify-order waste + `$()` overblock; unbounded full buffers; `/web` caps; checkpoint traversal/undo; store locking + `delete()`/`fork()` with messages; SIGINT-once; silent-mode newline; retry sleep ignores abort; read-history normalization; dotfile flag; `read_fileBody` shape bug in `/attach` `/mention` `/read` `/review` `/explain`; Ctrl+C-safe login/setup; `isToolErrorCode` swallowing custom codes; read-size rule via stat; multi-edit guards; `last.diff` writer; dry-run real prompt; debug.log rotation; `/cd` cwd reset; cost/context single source; headless URL policy. **Deliberately not changed**: `isSimpleChat` fast-path (intended UX); Ink-vs-OpenTUI architecture (approved); eval/MCP/L10–L20 (roadmap); `$EDITOR`/user-typed shell passthrough (user's own intent); trace paths; `isToolErrorCode`-adjacent churn that worked.
+
+### 20.4 What FAILED along the way (honest log)
+
+- **Markdown columns regression (shipped 0.1.50, caught by user screenshot, fixed 0.1.52)**: fragment of `<Text>` in a row `Box` laid lines out as columns. Lesson: frame-level regression test added (fails on old code, passes on new).
+- **Dead scroll trap (mine)**: symmetric follow-epsilon made line/wheel-up from bottom re-stick forever. Found by tracing, fixed directional, regression-tested.
+- **Deaf wheel tap (mine)**: intercepted `data` events; Ink7 only uses `readable`+`read()`. Found by reading installed Ink source, rewrote + tested the wrapper contract.
+- **Silent setup loop (mine)**: saved-but-rejected base URLs were swallowed → infinite first-run. Fixed with recorded reasons + prefilled recovery.
+- **`require()` in ESM**: would have thrown `ReferenceError` in production `dist` while passing under `tsx`/`vitest` shims. Converted everything touched to static imports.
+- **My own test-math errors**: indent tier (4sp→2 tabs), wheel maxTop, badge line counts, half-page expectations — each caught by running tests, fixed, and (for scroll-reset) proven discriminating by noop-check.
+- **Infra friction**: npm `E409` staging + `E404` propagation delays (60–150s waits per publish); PowerShell mangling inline `python`/`node` quoting (rule learned: script files only); `git add -A` twice scooped a concurrent agent's doc rewrites (split into separate commits; own files only since); vitest load flakes under parallel sessions (fixed sleeps → poll-with-timeout; one residual publish-gate flake at 0.1.59, green on rerun).
+- **Authorship**: 49 commits + 10 tags rewritten to `siddu-lingampelli` (force-with-lease, trees verified identical); repo-local git identity set.
+
+### 20.5 Environment notes for future sessions
+
+- Windows PowerShell 5.1: chain with `;`, never `&&`; quote paths; never inline `python -c` with brackets/quotes (write temp scripts under `C:\Users\L.Siddhartha\AppData\Local\Temp\opencode`).
+- Never `git add -A` blindly — another agent rewrites `design.md`/`scroll.md`/`TUI_DESIGN.md`/`commands.md` concurrently; stage own files explicitly.
+- `npm publish` runs `typecheck && test && build`; expect CDN delays; `latest` flips ~1–3 min after `+ klyro@x`.
+- Test isolation for anything reading `~/.klyro`: set `KLYRO_CONFIG` + `KLYRO_CONFIG_DIR` + `KLYRO_CREDENTIALS_FILE` to temp dirs.
+- `ink-testing-library` has fixed terminal geometry (no resize tests) and normalizes keys like production Ink; production-only paths (stdin tap, alt-screen) need contract tests, not frame tests.
+
