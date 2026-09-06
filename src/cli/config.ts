@@ -215,6 +215,25 @@ export async function loadConfig(): Promise<Record<string, unknown>> {
   return {};
 }
 
+// --- Synchronous single-file load (for sync call sites like buildProvider) ---
+export function loadConfigSync(): Record<string, unknown> {
+  const files = [getConfigPath(), getLegacyConfigPath()];
+  for (const file of files) {
+    try {
+      const raw = fsSync.readFileSync(file, 'utf-8');
+      const obj = parseJsonc(raw, file);
+      return validateConfig(obj, file);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException & { code?: string };
+      if (e.code === 'ENOENT') continue;
+      // Corrupt config must not crash provider resolution — ignore here
+      // (klyro config/doctor surface the error properly).
+      return {};
+    }
+  }
+  return {};
+}
+
 // --- Merged load with 5-layer precedence ---
 export async function loadMergedConfig(cwd = process.cwd(), flags: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const layers: Record<string, unknown>[] = [];

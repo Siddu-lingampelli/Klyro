@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { buildProvider, buildProviderFromCli, inferProviderFromBaseURL } from './registry.js';
 import { httpChatAdapter } from './provider-adapter.js';
 import { anthropicAdapter } from './anthropic-adapter.js';
@@ -23,13 +26,23 @@ describe('inferProviderFromBaseURL', () => {
 
 describe('buildProvider', () => {
   const originalEnv = { ...process.env };
+  // Isolate from the developer's real ~/.klyro (persisted fallback must not leak in).
+  const isoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-reg-'));
+  const isoConfig = path.join(isoDir, 'settings.json');
+  const isoCreds = path.join(isoDir, 'credentials.json');
   beforeEach(() => {
     delete process.env.KLYRO_PROVIDER;
     delete process.env.KLYRO_BASE_URL;
     delete process.env.KLYRO_API_KEY;
+    process.env.KLYRO_CONFIG = isoConfig;
+    process.env.KLYRO_CREDENTIALS_FILE = isoCreds;
+    fs.rmSync(isoConfig, { force: true });
+    fs.rmSync(isoCreds, { force: true });
   });
   afterEach(() => {
     process.env = { ...originalEnv };
+    fs.rmSync(isoConfig, { force: true });
+    fs.rmSync(isoCreds, { force: true });
   });
 
   it('throws when openai adapter lacks credentials', () => {
@@ -105,5 +118,21 @@ describe('buildProvider', () => {
   it('exports the underlying adapter factories', () => {
     expect(typeof httpChatAdapter).toBe('function');
     expect(typeof anthropicAdapter).toBe('function');
+  });
+
+  it('falls back to persisted settings.json + credentials (fresh terminal, zero env)', () => {
+    fs.writeFileSync(isoConfig, JSON.stringify({ provider: 'openai', baseUrl: 'https://saved.example.com/v1', model: 'm' }));
+    fs.writeFileSync(isoCreds, JSON.stringify({ openai: 'sk-saved' }));
+    const a = buildProvider();
+    expect(a.id).toBe('http-chat+retry');
+  });
+
+  it('env still wins over persisted settings', () => {
+    fs.writeFileSync(isoConfig, JSON.stringify({ baseUrl: 'https://saved.example.com/v1' }));
+    fs.writeFileSync(isoCreds, JSON.stringify({ openai: 'sk-saved' }));
+    process.env.KLYRO_BASE_URL = 'http://localhost:11434/v1';
+    process.env.KLYRO_API_KEY = 'dummy';
+    const a = buildProvider();
+    expect(a.id).toBe('http-chat+retry');
   });
 });

@@ -7,6 +7,8 @@
  */
 
 import React from 'react';
+import * as fsSync from 'node:fs';
+import * as nodePath from 'node:path';
 import { render } from 'ink';
 import { App } from '../tui/app.js';
 import { httpChatAdapter } from '../agent/provider-adapter.js';
@@ -40,16 +42,34 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // Reuse the same provider resolution as legacy repl.ts — probes local
   // Ollama / LM Studio / vLLM when env is not fully set, so bare `klyro`
   // works with a local model just like `klyro chat` does.
-  const resolved = await resolveProvider();
+  let resolved = await resolveProvider();
   if (!resolved) {
-    process.stderr.write('klyro: no provider available.\n');
-    process.stderr.write(`  ${providerHelp(null)}\n`);
-    process.stderr.write('  Set KLYRO_BASE_URL and KLYRO_API_KEY, or run a local server (Ollama, LM Studio, vLLM).\n');
-    process.stderr.write('  Examples:\n');
-    process.stderr.write('    set KLYRO_BASE_URL=https://api.openai.com/v1\n');
-    process.stderr.write('    set KLYRO_API_KEY=sk-...\n');
-    process.stderr.write('    ollama serve   # then KLYRO_BASE_URL=http://localhost:11434/v1 KLYRO_MODEL=llama3.2\n');
-    return 2;
+    // First-run setup: ask ONCE (stdin is free — the Ink App is not mounted
+    // yet), persist to ~/.klyro, and continue. Every future terminal — this
+    // one, new windows, `klyro run` — picks it up with zero env vars.
+    const interactive = !opts.nonInteractive && (opts.forceTty || process.stdin.isTTY);
+    if (interactive) {
+      const { runFirstRunSetup } = await import('./setup.js');
+      const readline = await import('node:readline/promises');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        const ans = await runFirstRunSetup((q) => rl.question(q));
+        if (!ans) {
+          process.stderr.write('klyro: setup aborted — run `klyro login` when ready.\n');
+          return 2;
+        }
+        process.stderr.write('klyro: saved — this and all future terminals will use it (change via /provider /model or `klyro config`).\n');
+      } finally {
+        rl.close();
+      }
+      resolved = await resolveProvider();
+    }
+    if (!resolved) {
+      process.stderr.write('klyro: no provider available.\n');
+      process.stderr.write(`  ${providerHelp(null)}\n`);
+      process.stderr.write('  Run `klyro login` once (persists for all terminals), set KLYRO_BASE_URL and KLYRO_API_KEY, or run a local server (Ollama, LM Studio, vLLM).\n');
+      return 2;
+    }
   }
   const baseUrl = resolved.baseURL;
   const apiKey = resolved.apiKey;
@@ -227,12 +247,10 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       consoleRing.push(line);
       if (consoleRing.length > 200) consoleRing.splice(0, consoleRing.length - 200);
       try {
-        const fs = require('node:fs') as typeof import('node:fs');
-        const path = require('node:path') as typeof import('node:path');
         const home = process.env.HOME ?? process.env.USERPROFILE ?? cwd;
-        const dir = path.join(home, '.klyro');
-        fs.mkdirSync(dir, { recursive: true });
-        fs.appendFileSync(path.join(dir, 'debug.log'), line + '\n');
+        const dir = nodePath.join(home, '.klyro');
+        fsSync.mkdirSync(dir, { recursive: true });
+        fsSync.appendFileSync(nodePath.join(dir, 'debug.log'), line + '\n');
       } catch { /* ignore */ }
     };
     console.log = sink;
@@ -252,6 +270,19 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   installMouseTap();
 
   const EFFORT_STEPS: Record<string, number> = { low: 10, medium: 30, high: 50, max: 100 };
+  // Persisted provider settings: /model /provider write through to
+  // ~/.klyro/settings.json so new terminals inherit them. Touch flags keep
+  // /reload from clobbering explicit in-session switches.
+  let modelTouched = false;
+  let providerTouched = false;
+  async function persistProviderPatch(patch: Record<string, unknown>): Promise<void> {
+    try {
+      const { loadConfig, saveConfig } = await import('./config.js');
+      const cfg = await loadConfig();
+      Object.assign(cfg, patch);
+      await saveConfig(cfg);
+    } catch { /* best-effort */ }
+  }
   // P1 session/permission state (commands.md Priority 1)
   let sessionLabel = '';
   let currentBranch = '';
@@ -285,10 +316,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   } catch { /* best-effort */ }
   function persistMap(file: string, m: Map<string, string>): void {
     try {
-      const fs = require('node:fs') as typeof import('node:fs');
-      const path = require('node:path') as typeof import('node:path');
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify(Object.fromEntries(m), null, 2), 'utf-8');
+      fsSync.mkdirSync(nodePath.dirname(file), { recursive: true });
+      fsSync.writeFileSync(file, JSON.stringify(Object.fromEntries(m), null, 2), 'utf-8');
     } catch { /* best-effort */ }
   }
   /** Truncation budget honoring /verbose and /raw. */
@@ -766,8 +795,10 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           queuedAppend({ id: `mdl-${Date.now()}`, kind: 'text', text: `current model: ${model}\nknown: ${known}\nusage: /model <id>`, role: 'assistant' });
         } else {
           queuedStatus({ model: next });
-          queuedAppend({ id: `mdl2-${Date.now()}`, kind: 'text', text: `model switched to ${next} (takes effect on next prompt)`, role: 'assistant' });
+          queuedAppend({ id: `mdl2-${Date.now()}`, kind: 'text', text: `model switched to ${next} (saved — new terminals inherit it)`, role: 'assistant' });
           model = next;
+          modelTouched = true;
+          await persistProviderPatch({ model: next });
         }
         return;
       }
@@ -783,7 +814,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           }
           currentProvider = next;
           adapter = buildAdapter(currentProvider, currentBaseUrl, currentApiKey);
-          queuedAppend({ id: `prov2-${Date.now()}`, kind: 'text', text: `provider switched to ${next} (takes effect on next prompt)`, role: 'assistant' });
+          providerTouched = true;
+          await persistProviderPatch({ provider: next });
+          queuedAppend({ id: `prov2-${Date.now()}`, kind: 'text', text: `provider switched to ${next} (saved — new terminals inherit it)`, role: 'assistant' });
         }
         return;
       }
@@ -802,9 +835,15 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'login': {
-        const { runLogin } = await import('./auth.js');
-        const code = await runLogin();
-        queuedAppend({ id: `login-${Date.now()}`, kind: 'text', text: code === 0 ? 'login saved (0600)' : 'login failed', role: 'assistant' });
+        // NOTE: readline login cannot run inside the TUI (Ink owns stdin —
+        // prompts would garble). Secrets must also never echo into the
+        // transcript, so login lives outside: run it once, /reload picks it up.
+        queuedAppend({
+          id: `login-${Date.now()}`,
+          kind: 'text',
+          text: 'To sign in, run `klyro login` in any terminal (asks once, saves for all terminals), then /reload here.\n(Interactive prompts cannot run inside the TUI — Ink owns stdin.)',
+          role: 'assistant',
+        });
         return;
       }
       case 'logout': {
@@ -1842,11 +1881,37 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
       case 'reload': {
         try {
+          // Re-resolve the provider so `klyro login` (or config edits) in
+          // another terminal take effect here. Explicit in-session switches
+          // (/model, /provider) are never clobbered.
+          const fresh = await resolveProvider();
+          const notes: string[] = [];
+          if (fresh) {
+            if (!modelTouched && fresh.model && fresh.model !== model) {
+              model = fresh.model;
+              queuedStatus({ model });
+              notes.push(`model → ${model}`);
+            }
+            if (!providerTouched) {
+              const { inferProviderFromBaseURL: infer } = await import('../agent/registry.js');
+              const prov = infer(fresh.baseURL);
+              currentProvider = prov;
+              currentBaseUrl = fresh.baseURL;
+              currentApiKey = fresh.apiKey;
+              adapter = buildAdapter(currentProvider, currentBaseUrl, currentApiKey);
+              notes.push(`provider → ${prov} (${fresh.baseURL}, ${fresh.source})`);
+            }
+          }
           const ctx = await buildLevel6Context({ cwd });
           ctxPrefix = ctx.formatted ? `\n\n<context>\n${ctx.formatted}\n</context>` : '';
           const md = await import('../context/klyro-md.js').then((m) => m.loadKlyroMd(cwd)).catch(() => '');
           klyroBlock = md ? `\n\n<KLYRO.md>\n${md.slice(0, 4000)}\n</KLYRO.md>` : '';
-          queuedAppend({ id: `reload-${Date.now()}`, kind: 'text', text: 'reloaded project context + KLYRO.md', role: 'assistant' });
+          queuedAppend({
+            id: `reload-${Date.now()}`,
+            kind: 'text',
+            text: notes.length > 0 ? `reloaded: ${notes.join(', ')} + project context + KLYRO.md` : 'reloaded project context + KLYRO.md (provider unchanged)',
+            role: 'assistant',
+          });
         } catch (err) {
           queuedAppend({ id: `reload-err-${Date.now()}`, kind: 'error', message: String(err) });
         }

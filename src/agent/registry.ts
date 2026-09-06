@@ -17,6 +17,9 @@
  * { retry: false } to skip.
  */
 
+import * as fsSync from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import type { ProviderAdapter } from './provider-adapter.js';
 import { httpChatAdapter } from './provider-adapter.js';
 import { anthropicAdapter } from './anthropic-adapter.js';
@@ -75,9 +78,57 @@ function normalizeProviderName(name: string | undefined): ProviderName | undefin
   return PROVIDER_ALIASES[lower];
 }
 
+/**
+ * Persisted provider settings (sync read — for CLIs that must not go async).
+ * Env still wins; ~/.klyro/settings.json + credentials are the fallback so
+ * `klyro run` works in fresh terminals with zero env vars.
+ *
+ * Reads the files directly (no module imports) to avoid any import cycle
+ * between agent/ and cli/ layers.
+ */
+function persistedProviderSettings(): { baseURL?: string; apiKey?: string; provider?: string; model?: string } {
+  try {
+    const home = process.env.KLYRO_CONFIG_DIR ?? (os.homedir() || process.cwd());
+    const cfgPaths = process.env.KLYRO_CONFIG
+      ? [process.env.KLYRO_CONFIG]
+      : [path.join(home, '.klyro', 'settings.json'), path.join(home, '.klyro', 'config.json')];
+    let cfg: Record<string, unknown> = {};
+    for (const p of cfgPaths) {
+      try {
+        const parsed = JSON.parse(fsSync.readFileSync(p, 'utf-8')) as Record<string, unknown>;
+        if (parsed && typeof parsed === 'object') {
+          cfg = parsed;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+    const credFile = process.env.KLYRO_CREDENTIALS_FILE ?? path.join(home, '.klyro', 'credentials.json');
+    let creds: Record<string, string> = {};
+    try {
+      creds = JSON.parse(fsSync.readFileSync(credFile, 'utf-8')) as Record<string, string>;
+    } catch { /* none */ }
+    const keyOf = (p: string): string | undefined =>
+      typeof creds[p] === 'string' && creds[p].length > 0 ? creds[p] : undefined;
+    const baseURL = (cfg.baseUrl ?? cfg.baseURL) as string | undefined;
+    const provider = cfg.provider as string | undefined;
+    const model = (cfg.model ?? cfg['model.default']) as string | undefined;
+    const apiKey =
+      (cfg.apiKey ?? cfg.api_key) as string | undefined ??
+      (provider ? keyOf(provider) : undefined) ??
+      keyOf('openai') ??
+      keyOf('anthropic');
+    return { baseURL, apiKey, provider, model };
+  } catch {
+    return {};
+  }
+}
+
 export function buildProvider(opts: BuildProviderOptions = {}): ProviderAdapter {
-  const baseURL = opts.baseURL ?? process.env.KLYRO_BASE_URL;
-  const apiKey = opts.apiKey ?? process.env.KLYRO_API_KEY;
+  const saved = persistedProviderSettings();
+  const baseURL = opts.baseURL ?? process.env.KLYRO_BASE_URL ?? saved.baseURL;
+  const apiKey = opts.apiKey ?? process.env.KLYRO_API_KEY ?? saved.apiKey;
   const timeoutMs = opts.timeoutMs ?? 60_000;
 
   // Resolve provider (with aliases like 9router -> openrouter -> openai)
