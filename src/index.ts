@@ -225,7 +225,20 @@ async function main(): Promise<void> {
 
   program
     .action(async (promptArg?: string) => {
-      const opts = program.opts<{ tui?: boolean; chat?: boolean; print?: string; outputFormat?: string; json?: boolean; maxTokens?: number; stream?: boolean }>();
+      const opts = program.opts<{ tui?: boolean; chat?: boolean; print?: string; outputFormat?: string; json?: boolean; maxTokens?: number; stream?: boolean; continue?: boolean; resume?: string | boolean }>();
+      // 9.2 — --continue / --resume handling
+      if (opts.continue || typeof opts.resume === 'string') {
+        const { getDefaultSessionStore } = await import('./persistence/session.js');
+        const store = getDefaultSessionStore();
+        const all = (await store.list()).filter((r) => r.cwd === process.cwd()).sort((a, b) => b.updatedAt - a.updatedAt);
+        const target = typeof opts.resume === 'string' ? all.find((r) => r.id.startsWith(opts.resume as string)) ?? all[0] : all[0];
+        if (!target) { process.stderr.write('klyro: no session to continue in this cwd (try klyro session list)\n'); process.exit(2); }
+        process.stderr.write(`klyro: continuing session ${target.id.slice(0, 8)} — ${target.task}\n`);
+        const model = process.env.KLYRO_MODEL ?? target.config.model;
+        if (!model) { process.stderr.write('klyro: KLYRO_MODEL not set\n'); process.exit(2); }
+        const code = await runOnce({ task: target.task, cwd: target.cwd, model, maxSteps: target.config.maxSteps, sessionId: target.id });
+        process.exit(code);
+      }
       // Headless via -p / --print or positional prompt
       const headlessPrompt = opts.print ?? promptArg;
       if (headlessPrompt) {
