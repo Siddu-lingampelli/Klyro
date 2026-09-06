@@ -20,6 +20,10 @@ import { gitLogTool } from './git/git-log.js';
 import { runVerifyTool } from './verify/run-verify.js';
 import { todoWriteTool } from './plan/todo-write.js';
 import { askUserTool } from './plan/ask-user.js';
+import { repoMapTool } from './repo-map.js';
+import { importsOfTool, importersOfTool } from './search/imports.js';
+import { findSymbolTool } from './symbols/find-symbol.js';
+import { lspDiagnosticsTool, lspGotoDefinitionTool } from './lsp/diagnostics.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { zodToJsonSchema } from './schema.js';
 
@@ -103,5 +107,11 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(runVerifyTool);
   r.register(todoWriteTool);
   r.register(askUserTool);
+  r.register(repoMapTool);
+  r.register(importsOfTool);
+  r.register(importersOfTool);
+  r.register(findSymbolTool);
+  r.register(lspDiagnosticsTool);
+  r.register(lspGotoDefinitionTool);
   return r;
 };

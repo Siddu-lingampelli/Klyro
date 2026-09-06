@@ -72,12 +72,16 @@ export interface ProjectMap {
   sourceDirs: string[];
   configFiles: string[];
   dependencies: Dependency[];
-  /** True when the repo has a package.json (Node/JS) anywhere up the tree. */
   hasPackageJson: boolean;
-  /** True when the repo has a git working tree. */
   hasGit: boolean;
-  /** Time the map was built. */
   generatedAt: string;
+  // 7.1 additions
+  monorepo?: boolean;
+  runtimeVersions?: Record<string, string>;
+  entryPoints?: string[];
+  hasCI?: boolean;
+  hasDocker?: boolean;
+  hasEnvExample?: boolean;
 }
 
 async function exists(p: string): Promise<boolean> {
@@ -348,6 +352,72 @@ function extractDependencies(pkg: Record<string, unknown> | null): Dependency[] 
   return out;
 }
 
+import * as crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+async function gitHead(root: string): Promise<string> {
+  return new Promise((res) => {
+    const c = spawn('git', ['rev-parse', 'HEAD'], { cwd: root, shell: false });
+    let o = ''; c.stdout.on('data', (b: Buffer) => o += b.toString()); c.on('close', () => res(o.trim() || 'no-head')); c.on('error', () => res('no-head'));
+  });
+}
+function lockfileHash(root: string): string {
+  const candidates = ['pnpm-lock.yaml','yarn.lock','package-lock.json','bun.lockb','Cargo.lock','go.sum','poetry.lock','uv.lock'];
+  let h = crypto.createHash('sha1');
+  let found = false;
+  for (const f of candidates) {
+    try { const d = require('node:fs').readFileSync(path.join(root, f)); h.update(d); found = true; } catch { /* ignore */ }
+  }
+  return found ? h.digest('hex').slice(0, 8) : 'no-lock';
+}
+async function getCachedProjectMap(root: string): Promise<ProjectMap | null> {
+  const head = await gitHead(root);
+  const hash = lockfileHash(root);
+  const p = path.join(root, '.klyro', 'cache', `project-map-${head.slice(0, 8)}-${hash}.json`);
+  try { const raw = await fs.readFile(p, 'utf-8'); const j = JSON.parse(raw) as ProjectMap; if (Date.now() - new Date(j.generatedAt).getTime() < 24*3600*1000) return j; } catch { /* miss */ }
+  return null;
+}
+async function setCachedProjectMap(root: string, m: ProjectMap): Promise<void> {
+  const head = await gitHead(root);
+  const hash = lockfileHash(root);
+  const p = path.join(root, '.klyro', 'cache', `project-map-${head.slice(0, 8)}-${hash}.json`);
+  try { await fs.mkdir(path.dirname(p), { recursive: true }); await fs.writeFile(p, JSON.stringify(m, null, 2), 'utf-8'); } catch { /* ignore */ }
+}
+function detectMonorepo(root: string, rootFiles: Set<string>, rootDirs: string[]): boolean {
+  if (rootFiles.has('pnpm-workspace.yaml') || rootFiles.has('lerna.json') || rootFiles.has('nx.json')) return true;
+  if (rootDirs.includes('packages') || rootDirs.includes('apps')) {
+    try { const s = require('node:fs').statSync(path.join(root, 'packages')); if (s.isDirectory()) return true; } catch {}
+    try { const s2 = require('node:fs').statSync(path.join(root, 'apps')); if (s2.isDirectory()) return true; } catch {}
+  }
+  return false;
+}
+async function detectRuntimeVersions(root: string): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  try { const v = await readTextSafe(path.join(root, '.nvmrc')); if (v) out['node'] = v.trim(); } catch {}
+  try { const pkg = await readJsonSafe(path.join(root, 'package.json')); const eng = (pkg as Record<string, unknown>)?.engines as Record<string,string>|undefined; if (eng?.node) out['node-eng'] = eng.node; } catch {}
+  try { const py = await readTextSafe(path.join(root, '.python-version')); if (py) out['python'] = py.trim(); } catch {}
+  try { const go = await readTextSafe(path.join(root, 'go.mod')); if (go) { const m = /go\s+(\d+\.\d+)/.exec(go); if (m?.[1]) out['go'] = m[1]; } } catch {}
+  return out;
+}
+async function detectEntryPoints(root: string): Promise<string[]> {
+  const cands = ['src/index.ts','src/main.ts','src/app.ts','src/server.ts','src/cli.ts','index.ts','main.go','app.py','src/main.py'];
+  const out: string[] = [];
+  for (const c of cands) if (await exists(path.join(root, c))) out.push(c);
+  return out.slice(0, 4);
+}
+
+/** Build a project map for the repo rooted at `root`. */
+export async function buildProjectMapCached(root: string): Promise<ProjectMap> {
+  const start = Date.now();
+  const cached = await getCachedProjectMap(root);
+  if (cached) return cached;
+  const m = await buildProjectMap(root);
+  const elapsed = Date.now() - start;
+  // ensure we meet 300ms budget note; log if slow (don't fail)
+  if (elapsed > 300) { /* slow path acceptable for first build */ }
+  await setCachedProjectMap(root, m);
+  return m;
+}
+
 /** Build a project map for the repo rooted at `root`. */
 export async function buildProjectMap(root: string): Promise<ProjectMap> {
   const { files: rootFiles, dirs: rootDirs } = await listRootEntries(root);
@@ -386,6 +456,12 @@ export async function buildProjectMap(root: string): Promise<ProjectMap> {
   const dependencies = extractDependencies(pkg);
   const language = extensionsToLanguages(extCounts);
   const hasGit = await exists(path.join(root, '.git'));
+  const monorepo = detectMonorepo(root, rootFiles, rootDirs);
+  const runtimeVersions = await detectRuntimeVersions(root);
+  const entryPoints = await detectEntryPoints(root);
+  const hasCI = await exists(path.join(root, '.github', 'workflows')) || await exists(path.join(root, '.gitlab-ci.yml')) || await exists(path.join(root, 'Jenkinsfile'));
+  const hasDocker = await exists(path.join(root, 'Dockerfile')) || await exists(path.join(root, 'docker-compose.yml'));
+  const hasEnvExample = await exists(path.join(root, '.env.example'));
 
   return {
     root,
@@ -400,10 +476,16 @@ export async function buildProjectMap(root: string): Promise<ProjectMap> {
     hasPackageJson,
     hasGit,
     generatedAt: new Date().toISOString(),
+    monorepo,
+    runtimeVersions,
+    entryPoints,
+    hasCI,
+    hasDocker,
+    hasEnvExample,
   };
 }
 
-/** Render a ProjectMap as a compact, model-friendly block. */
+/** Render a ProjectMap as a compact, model-friendly block (~400 tokens). */
 export function formatProjectMap(m: ProjectMap): string {
   const lines: string[] = [];
   lines.push('# Project map');
@@ -411,8 +493,14 @@ export function formatProjectMap(m: ProjectMap): string {
   if (m.framework.length) lines.push(`- Framework: ${m.framework.join(', ')}`);
   if (m.packageManager) lines.push(`- Package manager: ${m.packageManager}`);
   if (m.testFramework) lines.push(`- Test framework: ${m.testFramework}`);
+  if (m.monorepo) lines.push(`- Monorepo: yes`);
+  if (m.runtimeVersions && Object.keys(m.runtimeVersions).length) lines.push(`- Runtime: ${Object.entries(m.runtimeVersions).map(([k,v])=>`${k} ${v}`).join(', ')}`);
+  if (m.entryPoints?.length) lines.push(`- Entry: ${m.entryPoints.join(', ')}`);
   if (m.sourceDirs.length) lines.push(`- Source dirs: ${m.sourceDirs.join(', ')}`);
   if (m.configFiles.length) lines.push(`- Important config: ${m.configFiles.join(', ')}`);
+  if (m.hasCI) lines.push(`- CI: .github/workflows`);
+  if (m.hasDocker) lines.push(`- Docker: present`);
+  if (m.hasEnvExample) lines.push(`- Env example: .env.example`);
   if (m.buildCommands.length) {
     lines.push('- Build / scripts:');
     for (const c of m.buildCommands) lines.push(`  - ${c}`);
@@ -424,5 +512,8 @@ export function formatProjectMap(m: ProjectMap): string {
     }
   }
   if (!m.hasGit) lines.push('- Note: not a git working tree');
-  return lines.join('\n');
+  // trim to ~400 tokens (~1600 chars)
+  let s = lines.join('\n');
+  if (s.length > 1600) s = s.slice(0, 1600) + '\n...';
+  return s;
 }

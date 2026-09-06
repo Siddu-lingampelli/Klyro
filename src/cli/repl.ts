@@ -495,6 +495,16 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         }
         return;
       }
+      case 'project': {
+        const { runScan } = await import('./scan.js');
+        let out = '';
+        const orig = process.stdout.write.bind(process.stdout);
+        (process.stdout as unknown as { write: (s: string) => boolean }).write = ((c: string) => { out += String(c); return true; }) as typeof process.stdout.write;
+        await runScan({ cwd, json: false });
+        (process.stdout as unknown as { write: typeof orig }).write = orig;
+        queuedAppend({ id: `proj-${Date.now()}`, kind: 'text', text: out.slice(0, 4000), role: 'assistant' });
+        return;
+      }
       case 'compact':
         queuedAppend({
           id: `stub-${Date.now()}`,

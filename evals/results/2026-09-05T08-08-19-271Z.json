@@ -1,0 +1,40 @@
+{
+  "suite": "locate",
+  "results": [
+    {
+      "id": "locate-auth",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 671
+    },
+    {
+      "id": "locate-config",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 593
+    },
+    {
+      "id": "locate-db",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 464
+    },
+    {
+      "id": "locate-errors",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 423
+    },
+    {
+      "id": "locate-routing",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 438
+    }
+  ]
+}
