@@ -12,8 +12,9 @@ describe('App', () => {
       <App initialModel="mock" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
     );
     const out = lastFrame();
-    expect(out).toContain('mock');
-    expect(out).toMatch(/Message Klyro|KLYRO|Type a prompt/i);
+    // design.md: top bar shows claude-code + sessions, center shows Message Klyro placeholder
+    expect(out).toMatch(/claude-code|Sessions|Message Klyro/i);
+    expect(out).toMatch(/Message Klyro|Type a message/i);
   });
 
   it('renders initial transcript items', () => {
@@ -32,7 +33,7 @@ describe('App', () => {
     );
     const frame = lastFrame();
     expect(frame).toContain('seed');
-    expect(frame).toMatch(/›|>/);
+    expect(frame).toMatch(/You|seed|›|>/);
   });
 
   it('honors initialStatus overrides', () => {

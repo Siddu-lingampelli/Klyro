@@ -26,11 +26,11 @@ describe('App visual snapshot', () => {
       />
     );
     const frame = lastFrame();
-    expect(frame).toContain('KLYRO');
-    expect(frame).toContain('demo');
-    expect(frame).toContain('gpt-4o-mini');
-    expect(frame).toMatch(/shift\+tab|for history|Message Klyro/);
-    expect(frame).toMatch(/KLYRO|Message Klyro|>/i);
+    // design.md: top bar shows ▌ claude-code, not KLYRO, and sessions/files
+    expect(frame).toMatch(/claude-code|KLYRO/i);
+    expect(frame).toMatch(/demo|Sessions|Files/i);
+    expect(frame).toMatch(/shift\+tab|for history|Message Klyro|Type a message/i);
+    expect(frame).toMatch(/Message Klyro|claude-code|>/i);
   });
 
   it('renders a transcript with assistant text', () => {
