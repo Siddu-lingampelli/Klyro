@@ -33,11 +33,11 @@ function Header({ cwd, model, version, width }: { cwd: string; model: string; ve
   return (
     <Box flexDirection="column" marginBottom={1}>
       <Box justifyContent="space-between">
-        <Text bold color={tokens.ansi.accent as string}>KLYRO  v{version}</Text>
-        {showLinks ? <Text color={tokens.ansi.dim as string}>│  /help   /config   /clear   /exit</Text> : null}
+        <Text bold color={tokens.colors.accent}>KLYRO  v{version}</Text>
+        {showLinks ? <Text color={tokens.colors.dim}>│  /help   /config   /clear   /exit</Text> : null}
       </Box>
-      <Text color={tokens.ansi.dim as string}>{model}[200k]  ·  API Usage Billing</Text>
-      <Text color={tokens.ansi.dim as string}>{cwd}{branch ? `  ·  ${branch}` : ''}</Text>
+      <Text color={tokens.colors.dim}>{model}[200k]  ·  API Usage Billing</Text>
+      <Text color={tokens.colors.dim}>{cwd}{branch ? `  ·  ${branch}` : ''}</Text>
     </Box>
   );
 }
@@ -82,12 +82,12 @@ function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width
   let m: RegExpExecArray | null;
   let idx = 0;
   while ((m = re.exec(text))) {
-    if (m.index > last) parts.push(<Text key={`t-${idx++}`} color={dim ? tokens.ansi.dim as string : undefined} wrap="wrap">{text.slice(last, m.index)}</Text>);
-    parts.push(<Text key={`b-${idx++}`} bold color={dim ? undefined : tokens.ansi.soft as string} wrap="wrap">{m[1]}</Text>);
+    if (m.index > last) parts.push(<Text key={`t-${idx++}`} color={dim ? tokens.colors.dim as string : undefined} wrap="wrap">{text.slice(last, m.index)}</Text>);
+    parts.push(<Text key={`b-${idx++}`} bold color={dim ? undefined : tokens.colors.soft as string} wrap="wrap">{m[1]}</Text>);
     last = m.index + m[0].length;
   }
-  if (last < text.length) parts.push(<Text key={`t-${idx++}`} color={dim ? tokens.ansi.dim as string : undefined} wrap="wrap">{text.slice(last)}</Text>);
-  if (parts.length === 0) return <Text color={dim ? tokens.ansi.dim as string : undefined} wrap="wrap">{text}</Text>;
+  if (last < text.length) parts.push(<Text key={`t-${idx++}`} color={dim ? tokens.colors.dim as string : undefined} wrap="wrap">{text.slice(last)}</Text>);
+  if (parts.length === 0) return <Text color={dim ? tokens.colors.dim as string : undefined} wrap="wrap">{text}</Text>;
   // Render as single line with bold segments — Ink will wrap the parent Box
   return <Text wrap="wrap">{parts}</Text>;
 }
@@ -189,7 +189,7 @@ export function App(props: AppProps): React.JSX.Element {
       <Box flexDirection="row" flexGrow={isFullscreen ? 1 : 0} overflow={isFullscreen ? 'hidden' : undefined}>
         <Box flexDirection="column" flexGrow={1} overflow={isFullscreen ? 'hidden' : undefined} paddingX={0}>
           {grouped.length === 0 ? (
-            <Text color={tokens.ansi.dim as string}>Message Klyro…</Text>
+            <Text color={tokens.colors.dim as string}>Message Klyro…</Text>
           ) : visibleGrouped.map((item) => {
             if ((item as Group).verb) {
               const gr = item as Group;
@@ -204,48 +204,48 @@ export function App(props: AppProps): React.JSX.Element {
               })();
               const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? '✗' : `${gr.totalMs}ms`;
               const marker = isExpanded ? '▼' : '✓';
-              const markerColor = gr.status === 'error' ? tokens.ansi.err as string : gr.status === 'running' ? tokens.ansi.warn as string : tokens.ansi.ok as string;
+              const markerColor = gr.status === 'error' ? tokens.colors.err as string : gr.status === 'running' ? tokens.colors.warn as string : tokens.colors.ok as string;
               return (
                 <Box key={gr.id} flexDirection="column" marginBottom={1}>
                   <Box>
-                    <Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text>
+                    <Text color={tokens.colors.guide}>  {g('guide')}   </Text>
                     <Text color={markerColor}>{marker} {verbLine}</Text>
-                    <Text color={tokens.ansi.dim as string}>  {right}</Text>
+                    <Text color={tokens.colors.dim}>  {right}</Text>
                   </Box>
                   {isExpanded ? gr.items.map((it) => {
                     let friendly = '';
                     try { const a = JSON.parse(it.args) as Record<string, unknown>; const p = (a.path as string) ?? (a.pattern as string) ?? (a.command as string) ?? ''; const short = p ? String(p).split('/').pop()?.slice(0, 40) ?? p : ''; if (it.name === 'read_file' && short) friendly = `${short}`; else if (it.name === 'shell_exec' && p) friendly = `$ ${String(p).slice(0, 40)}`; else if (short) friendly = short; else friendly = it.args.slice(0, 40); } catch { friendly = it.args.slice(0, 40); }
-                    return (<Box key={it.id} paddingLeft={4}><Text color={tokens.ansi.guide as string}>{g('end')} </Text><Text color={tokens.ansi.dim as string}>{friendly}</Text></Box>);
+                    return (<Box key={it.id} paddingLeft={4}><Text color={tokens.colors.guide as string}>{g('end')} </Text><Text color={tokens.colors.dim as string}>{friendly}</Text></Box>);
                   }) : null}
                 </Box>
               );
             }
             const it = item as TranscriptItem;
             if (it.kind === 'text' && it.role === 'user') {
-              return <Box key={it.id} marginBottom={1}><Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text><Text wrap="wrap">{it.text}</Text></Box>;
+              return <Box key={it.id} marginBottom={1}><Text color={tokens.colors.accent as string} bold>{g('prompt')} </Text><Text wrap="wrap">{it.text}</Text></Box>;
             }
             if (it.kind === 'text') {
               // prose — render markdown, not raw **, with proper wrap and guide
               return (
                 <Box key={it.id} flexDirection="column" marginBottom={1}>
-                  <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.accent as string}>{g('agentBullet')} Klyro</Text></Box>
+                  <Box><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.accent as string}>{g('agentBullet')} Klyro</Text></Box>
                   <Box paddingLeft={2} flexDirection="column">
-                    <Box><Text color={tokens.ansi.dim as string}>  {g('guide')}   </Text><Box flexGrow={1}><MarkdownText text={it.text} /></Box></Box>
+                    <Box><Text color={tokens.colors.dim as string}>  {g('guide')}   </Text><Box flexGrow={1}><MarkdownText text={it.text} /></Box></Box>
                   </Box>
                 </Box>
               );
             }
-            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.err as string}>  {g('guide')}   ✗ {it.message}</Text></Box>;
+            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.err as string}>  {g('guide')}   ✗ {it.message}</Text></Box>;
             if (it.kind === 'policy') return null;
-            if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
+            if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
             if (it.kind === 'diff') return (
               <Box key={it.id} flexDirection="column" paddingLeft={2} marginBottom={1}>
-                <Text bold color={tokens.ansi.soft as string}>{it.summary ?? 'Diff'}</Text>
+                <Text bold color={tokens.colors.soft as string}>{it.summary ?? 'Diff'}</Text>
                 {it.hunks.map((h, i) => (
                   <Box key={i} flexDirection="column" marginTop={0}>
-                    <Text color={tokens.ansi.soft as string}>{h.path}</Text>
+                    <Text color={tokens.colors.soft as string}>{h.path}</Text>
                     {h.lines.map((l, j) => (
-                      <Text key={j} wrap="wrap" color={l.kind === 'add' ? tokens.ansi.ok as string : l.kind === 'remove' ? tokens.ansi.err as string : tokens.ansi.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}</Text>
+                      <Text key={j} wrap="wrap" color={l.kind === 'add' ? tokens.colors.ok as string : l.kind === 'remove' ? tokens.colors.err as string : tokens.colors.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}</Text>
                     ))}
                   </Box>
                 ))}
@@ -254,20 +254,20 @@ export function App(props: AppProps): React.JSX.Element {
             return null;
           })}
           {status.status === 'running' && !streamingIdRef.current ? (
-            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.dim as string}>Thinking...</Text><Text color={tokens.ansi.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
+            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.dim as string}>Thinking...</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
           ) : null}
           {plan.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
-              <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
+              <Box><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
               {plan.slice(0, 8).map((p) => (
-                <Box key={p.id}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.ansi.ok as string : p.status === 'in_progress' ? tokens.ansi.accent as string : tokens.ansi.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {p.title}</Text></Box>
+                <Box key={p.id}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.colors.ok as string : p.status === 'in_progress' ? tokens.colors.accent as string : tokens.colors.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {p.title}</Text></Box>
               ))}
             </Box>
           ) : null}
           {queuedInputs.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
               {queuedInputs.map((q, i) => (
-                <Text key={i} color={tokens.ansi.dim as string}>queued: {q.slice(0, 60)}{i === 0 ? '  esc to drop' : ''}</Text>
+                <Text key={i} color={tokens.colors.dim as string}>queued: {q.slice(0, 60)}{i === 0 ? '  esc to drop' : ''}</Text>
               ))}
             </Box>
           ) : null}
@@ -275,22 +275,22 @@ export function App(props: AppProps): React.JSX.Element {
         {isFullscreen ? (
           <Box flexDirection="column" width={1} marginLeft={1}>
             {Array.from({ length: trackH }).map((_, i) => (
-              <Text key={i} color={i === thumbPos ? (tokens.ansi.accent as string) : (tokens.ansi.guide as string)}>{i === thumbPos ? '●' : '│'}</Text>
+              <Text key={i} color={i === thumbPos ? (tokens.colors.accent as string) : (tokens.colors.guide as string)}>{i === thumbPos ? '●' : '│'}</Text>
             ))}
           </Box>
         ) : null}
       </Box>
       <Box flexDirection="column">
-        <Text color={tokens.ansi.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
+        <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
         <Box>
-          <Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text>
-          <Text wrap="wrap">{input || <Text color={tokens.ansi.dim as string}>Message Klyro…</Text> as unknown as string}▏</Text>
+          <Text color={tokens.colors.accent as string} bold>{g('prompt')} </Text>
+          <Text wrap="wrap">{input || <Text color={tokens.colors.dim as string}>Message Klyro…</Text> as unknown as string}▏</Text>
         </Box>
-        <Text color={tokens.ansi.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
+        <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
       </Box>
       <Box justifyContent="space-between">
-        <Text color={tokens.ansi.dim as string}>{baseHints}{maxOffset > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
-        <Text color={tokens.ansi.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct > 0 ? `${ctxPct}% ctx · ` : ''}{status.status === 'running' ? 'auto mode on ●' : ''}</Text>
+        <Text color={tokens.colors.dim as string}>{baseHints}{maxOffset > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
+        <Text color={tokens.colors.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct > 0 ? `${ctxPct}% ctx · ` : ''}{status.status === 'running' ? 'auto mode on ●' : ''}</Text>
       </Box>
     </Box>
   );
