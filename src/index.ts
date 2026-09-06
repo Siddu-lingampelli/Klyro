@@ -359,13 +359,39 @@ async function main(): Promise<void> {
     });
 
   program
-    .command('eval <input>')
-    .description('Run scripted scenarios from a JSONL file against the agent runtime. Exits 0 if all pass, 1 otherwise.')
+    .command('eval [input]')
+    .description('Run eval harness: klyro eval --suite smoke | klyro eval <input.jsonl>')
     .option('--output <mode>', 'Output mode: human (default), json (one JSON per line)')
-    .action(async (input: string, opts: { output?: string }) => {
+    .option('--suite <name>', 'Suite name (smoke, core, etc.) — loads from evals/fixtures')
+    .option('--filter <str>', 'Filter fixtures by name substring')
+    .option('--runs <n>', 'Runs per fixture (default 1)', (v) => parsePositiveInt('--runs', v))
+    .option('--parallel <n>', 'Parallelism (default 1)', (v) => parsePositiveInt('--parallel', v))
+    .option('--model <id>', 'Model for eval')
+    .action(async (input: string | undefined, opts: { output?: string; suite?: string; filter?: string; runs?: number; parallel?: number; model?: string }) => {
       const output = (opts.output ?? 'human') as 'human' | 'json' | 'silent';
-      const code = await runEval({ inputPath: input, output });
+      if (opts.suite) {
+        const code = await runEval({ inputPath: input ?? '-', output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model });
+        process.exit(code);
+      }
+      if (!input) {
+        process.stderr.write('klyro eval: missing input (provide <input> or --suite)\n');
+        process.exit(2);
+      }
+      const code = await runEval({ inputPath: input, output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model });
       process.exit(code);
+    });
+
+  program
+    .command('eval:compare <a> <b>')
+    .description('Compare two eval results JSON files')
+    .action(async (a: string, b: string) => {
+      const { compareReports } = await import('./eval/harness.js');
+      const fs = await import('node:fs/promises');
+      const ra = JSON.parse(await fs.readFile(a, 'utf-8'));
+      const rb = JSON.parse(await fs.readFile(b, 'utf-8'));
+      const out = compareReports(ra, rb);
+      process.stdout.write(out + '\n');
+      process.exit(0);
     });
 
   // Level 9 — Session management

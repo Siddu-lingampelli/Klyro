@@ -59,19 +59,42 @@ function isLoopbackBaseURL(url: string | undefined): boolean {
   }
 }
 
+const PROVIDER_ALIASES: Record<string, ProviderName> = {
+  '9router': 'openai',
+  'openrouter': 'openai',
+  'groq': 'openai',
+  'ollama': 'openai',
+  'vllm': 'openai',
+  'lmstudio': 'openai',
+};
+
+function normalizeProviderName(name: string | undefined): ProviderName | undefined {
+  if (!name) return undefined;
+  const lower = name.toLowerCase().trim();
+  if (lower === 'openai' || lower === 'anthropic') return lower as ProviderName;
+  return PROVIDER_ALIASES[lower];
+}
+
 export function buildProvider(opts: BuildProviderOptions = {}): ProviderAdapter {
   const baseURL = opts.baseURL ?? process.env.KLYRO_BASE_URL;
   const apiKey = opts.apiKey ?? process.env.KLYRO_API_KEY;
   const timeoutMs = opts.timeoutMs ?? 60_000;
 
-  // Resolve provider.
+  // Resolve provider (with aliases like 9router -> openrouter -> openai)
   let provider: ProviderName;
-  if (opts.provider) {
-    provider = opts.provider;
-  } else if (process.env.KLYRO_PROVIDER === 'anthropic' || process.env.KLYRO_PROVIDER === 'openai') {
-    provider = process.env.KLYRO_PROVIDER;
+  const normalizedOpt = normalizeProviderName(opts.provider);
+  if (normalizedOpt) {
+    provider = normalizedOpt;
+  } else if (opts.provider) {
+    // Fallback: treat any unknown as openai (OpenAI-compatible)
+    provider = 'openai';
   } else {
-    provider = inferProviderFromBaseURL(baseURL);
+    const envProvider = normalizeProviderName(process.env.KLYRO_PROVIDER);
+    if (envProvider) provider = envProvider;
+    else if (process.env.KLYRO_PROVIDER) {
+      // Unknown provider string -> treat as openai
+      provider = 'openai';
+    } else provider = inferProviderFromBaseURL(baseURL);
   }
 
   let inner: ProviderAdapter;
@@ -107,9 +130,13 @@ export function buildProviderFromCli(args: {
   apiKey?: string;
   timeoutMs?: number;
 }): ProviderAdapter {
-  const provider = args.provider as ProviderName | undefined;
-  if (provider && provider !== 'openai' && provider !== 'anthropic') {
-    throw new Error(`klyro: invalid --provider: ${provider} (expected openai|anthropic)`);
+  const raw = args.provider?.toLowerCase().trim();
+  const normalized = raw ? normalizeProviderName(raw) ?? (raw ? 'openai' as ProviderName : undefined) : undefined;
+  const provider = normalized as ProviderName | undefined;
+  // No longer throws for unknown — treat as openai (e.g. 9router, groq)
+  if (raw && !normalized && raw !== 'openai' && raw !== 'anthropic') {
+    // Silently treat as openai, but log hint
+    process.stderr.write(`klyro: unknown provider "${raw}" — treating as openai-compatible\n`);
   }
   return buildProvider({
     provider,

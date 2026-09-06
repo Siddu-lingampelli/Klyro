@@ -18,6 +18,8 @@ import { gitStatusTool } from './git/git-status.js';
 import { gitDiffTool } from './git/git-diff.js';
 import { gitLogTool } from './git/git-log.js';
 import { runVerifyTool } from './verify/run-verify.js';
+import { todoWriteTool } from './plan/todo-write.js';
+import { askUserTool } from './plan/ask-user.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { zodToJsonSchema } from './schema.js';
 
@@ -99,5 +101,7 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(gitDiffTool);
   r.register(gitLogTool);
   r.register(runVerifyTool);
+  r.register(todoWriteTool);
+  r.register(askUserTool);
   return r;
 };

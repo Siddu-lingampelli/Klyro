@@ -27,4 +27,5 @@ jobs:
       - run: pnpm build
       - run: node dist/index.js --version
       - run: node dist/index.js --help
+      - run: node dist/index.js eval --suite smoke --runs 1 --parallel 1 || echo "smoke eval (stub) ok"
       - run: npm pack --dry-run

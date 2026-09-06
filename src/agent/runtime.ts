@@ -43,6 +43,8 @@ export interface RuntimeDeps {
   systemPrompt: (ctx: { cwd: string; telemetry?: string }) => string;
 }
 
+export type Phase = 'understanding' | 'exploring' | 'planning' | 'implementing' | 'verifying' | 'done' | 'blocked' | 'limit';
+
 export interface RunOptions {
   task: string;
   cwd: string;
@@ -50,6 +52,8 @@ export interface RunOptions {
   maxSteps?: number;
   /** Alias for maxSteps (3.5) */
   maxTurns?: number;
+  maxCost?: number;
+  maxTimeMs?: number;
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;
@@ -124,7 +128,7 @@ export type RuntimeEvent =
   | { kind: 'checkpoint_saved'; sessionId: string };
 
 export interface RunResult {
-  status: 'complete' | 'max_steps' | 'aborted' | 'no_final' | 'verify_failed';
+  status: 'complete' | 'max_steps' | 'aborted' | 'no_final' | 'verify_failed' | 'limit' | 'blocked';
   steps: number;
   toolCalls: number;
   finalText: string;
@@ -134,6 +138,8 @@ export interface RunResult {
   repairs?: number;
   /** Verification outcome (Level 8) */
   verification?: { ok: boolean; command?: string; attempts: number; failureType?: string };
+  /** 5.1 phase */
+  phase?: Phase;
 }
 
 const DEFAULT_MAX_STEPS = 30;
@@ -192,7 +198,19 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     try { await tracer?.close(); } catch { /* ignore */ }
   };
 
-  // Level 9 — persistence helpers
+  // 5.1 — phases and limits
+  const maxCost = opts.maxCost;
+  const maxTimeMs = opts.maxTimeMs;
+  const startTime = Date.now();
+  let phase: Phase = 'understanding';
+  const setPhase = (p: Phase) => {
+    if (p !== phase) {
+      phase = p;
+      // Emit as any (RuntimeEvent extension) + KlyroEvent
+      (emit as unknown as ((ev: unknown) => void))?.({ kind: 'phase_changed', phase });
+      emitKlyro({ type: 'phase.changed', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', phase } as unknown as import('../events/catalog.js').KlyroEvent);
+    }
+  };
   const store = opts.persist?.store;
   const sessionId = opts.persist?.sessionId;
   async function checkpoint(msg?: Message, obs?: { toolCallId: string; toolName: string; input: unknown; output: unknown; isError: boolean }): Promise<void> {
@@ -224,16 +242,42 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     void checkpoint(transcript[transcript.length - 1]);
   }
 
+  // 5.2 — stuck detection state
+  const callHistory: string[] = [];
+  const fileEditCounts = new Map<string, number>();
+  let stuckCount = 0;
+  let lastSignal: AbortSignal | undefined;
+
   outer: while (steps < maxSteps) {
+    // 5.1 limits: max-cost, max-time
+    if (maxCost !== undefined) {
+      const cost = (usage.input / 1000) * 0.003 + (usage.output / 1000) * 0.015;
+      if (cost >= maxCost) {
+        setPhase('limit');
+        await closeTracer();
+        return { status: 'limit', steps, toolCalls: toolCallCount, finalText: `Stopped: max cost $${maxCost} reached (cost $${cost.toFixed(2)})`, transcript, usage, repairs, phase: 'limit' };
+      }
+    }
+    if (maxTimeMs !== undefined && Date.now() - startTime >= maxTimeMs) {
+      setPhase('limit');
+      await closeTracer();
+      return { status: 'limit', steps, toolCalls: toolCallCount, finalText: `Stopped: max time ${maxTimeMs}ms reached`, transcript, usage, repairs, phase: 'limit' };
+    }
     if (opts.signal?.aborted) {
       emit?.({ kind: 'aborted' });
       if (store && sessionId) {
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
       await closeTracer();
-      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined, phase: 'blocked' };
     }
     steps++;
+    // 5.1 phase transitions (model-narrated)
+    if (steps === 1) setPhase('understanding');
+    else if (steps === 2) setPhase('exploring');
+    else if (steps === 3) setPhase('planning');
+    else if (hasEdits) setPhase('implementing');
+    else if (steps > 3) setPhase('verifying');
     emit?.({ kind: 'step_start', step: steps });
     telemetry.recordStepStart(steps);
 
@@ -474,7 +518,25 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             const { snapshot } = await import('../checkpoints/store.js');
             await snapshot(opts.cwd, [fileChanged.path]);
           } catch { /* ignore */ }
+          // 5.2 file edit count
+          const cnt = (fileEditCounts.get(fileChanged.path) ?? 0) + 1;
+          fileEditCounts.set(fileChanged.path, cnt);
+          if (cnt > 8) {
+            emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: `same file edited >8×: ${fileChanged.path}` } as unknown as import('../events/catalog.js').KlyroEvent);
+          }
         }
+      }
+      // 5.2 identical call ×3
+      const sig = `${call.name}:${JSON.stringify(call.input).slice(0, 200)}`;
+      callHistory.push(sig);
+      if (callHistory.length > 10) callHistory.shift();
+      const last3 = callHistory.slice(-3);
+      if (last3.length === 3 && last3[0] === last3[1] && last3[1] === last3[2]) {
+        emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: `identical call ×3: ${sig}` } as unknown as import('../events/catalog.js').KlyroEvent);
+        // Inject system note for next turn
+        const note: Message = { role: 'user', content: [text(`[system note] Stuck detected: identical call ×3: ${sig}. Try a different approach.`)] };
+        transcript.push(note);
+        await checkpoint(note);
       }
     };
 

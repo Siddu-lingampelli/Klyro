@@ -79,9 +79,68 @@ export interface EvalResult {
 export interface RunEvalOptions {
   inputPath: string;
   output: 'human' | 'json' | 'silent';
+  suite?: string;
+  filter?: string;
+  runs?: number;
+  parallel?: number;
+  model?: string;
 }
 
 export async function runEval(opts: RunEvalOptions): Promise<number> {
+  // 5.4 — suite mode: load from evals/fixtures
+  if (opts.suite) {
+    const { runHarness, loadFileFixture } = await import('../eval/harness.js');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const suiteDir = path.join(process.cwd(), 'evals', 'fixtures', opts.suite === 'smoke' ? '' : opts.suite);
+    // For smoke, use the 10 fixtures directly
+    const fixturesDir = path.join(process.cwd(), 'evals', 'fixtures');
+    let tasks: import('../eval/harness.js').ScriptedTask[] = [];
+    try {
+      const entries = await fs.readdir(fixturesDir);
+      for (const e of entries) {
+        if (opts.filter && !e.includes(opts.filter)) continue;
+        const taskPath = path.join(fixturesDir, e, 'task.md');
+        try {
+          const task = await fs.readFile(taskPath, 'utf-8');
+          tasks.push({
+            id: e,
+            description: e,
+            task: task.trim(),
+            script: [],
+            expectStatus: 'complete',
+          });
+        } catch { /* ignore */ }
+      }
+    } catch { /* no fixtures */ }
+    if (tasks.length === 0) {
+      stderr.write(`klyro eval: no fixtures for suite ${opts.suite}\n`);
+      return 2;
+    }
+    // Simple harness for suite: just run check.sh via file fixtures
+    const { runFileFixture, loadFileFixture: loadFF } = await import('../eval/harness.js');
+    const results = [];
+    for (const t of tasks) {
+      const fixture = await loadFF(path.join(fixturesDir, t.id));
+      const r = await runFileFixture(fixture, { runs: opts.runs, parallel: opts.parallel });
+      results.push(r);
+      const tag = r.status === 'pass' ? 'PASS' : 'FAIL';
+      if (opts.output === 'json') stdout.write(JSON.stringify({ kind: 'eval_result', ...r }) + '\n');
+      else stdout.write(`[${tag}] ${r.id}\n`);
+    }
+    const passed = results.filter((r) => r.status === 'pass').length;
+    if (opts.output === 'json') stdout.write(JSON.stringify({ kind: 'eval_summary', total: results.length, passed, failed: results.length - passed }) + '\n');
+    else stdout.write(`\n${passed}/${results.length} passed\n`);
+    // Save results
+    try {
+      const outDir = path.join(process.cwd(), 'evals', 'results');
+      await fs.mkdir(outDir, { recursive: true });
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      await fs.writeFile(path.join(outDir, `${ts}.json`), JSON.stringify({ suite: opts.suite, results }, null, 2));
+    } catch { /* ignore */ }
+    return passed === results.length ? 0 : 1;
+  }
+
   const scenarios = await readScenarios(opts.inputPath);
   if (scenarios.length === 0) {
     stderr.write('klyro eval: no scenarios in input\n');

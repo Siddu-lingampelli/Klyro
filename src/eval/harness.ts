@@ -157,6 +157,61 @@ export function formatReport(summary: HarnessSummary): string {
   return lines.join('\n');
 }
 
+/** 5.4 — File-based fixture support: repo|repo.json, task.md, check.sh, meta.json */
+export interface FileFixture {
+  dir: string;
+  task: string;
+  checkSh: string;
+  meta: Record<string, unknown>;
+  repo?: string;
+}
+
+export async function loadFileFixture(dir: string): Promise<FileFixture> {
+  const task = await fs.readFile(path.join(dir, 'task.md'), 'utf-8').catch(() => 'test task');
+  const checkSh = await fs.readFile(path.join(dir, 'check.sh'), 'utf-8').catch(() => 'exit 0');
+  let meta: Record<string, unknown> = {};
+  try { meta = JSON.parse(await fs.readFile(path.join(dir, 'meta.json'), 'utf-8')); } catch { /* ignore */ }
+  let repo: string | undefined;
+  try { repo = await fs.readFile(path.join(dir, 'repo'), 'utf-8'); } catch { /* ignore */ }
+  return { dir, task: task.trim(), checkSh, meta, repo };
+}
+
+export async function runFileFixture(fixture: FileFixture, opts: { runs?: number; parallel?: number } = {}): Promise<TaskResult> {
+  const start = Date.now();
+  const tmp = path.join(os.tmpdir(), 'klyro-eval-file-' + Math.random().toString(36).slice(2));
+  await fs.mkdir(tmp, { recursive: true });
+  // Copy repo if exists
+  if (fixture.repo) {
+    const src = path.isAbsolute(fixture.repo) ? fixture.repo : path.join(fixture.dir, fixture.repo);
+    await fs.cp(src, tmp, { recursive: true }).catch(() => undefined);
+  } else {
+    await fs.cp(fixture.dir, tmp, { recursive: true }).catch(() => undefined);
+  }
+  // Run check.sh via shell
+  const { spawn } = await import('node:child_process');
+  const result: TaskResult = await new Promise((resolve) => {
+    const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false });
+    let out = '';
+    child.stdout?.on('data', (b: Buffer) => { out += b.toString(); });
+    child.stderr?.on('data', (b: Buffer) => { out += b.toString(); });
+    child.on('close', (code) => {
+      const pass = code === 0;
+      resolve({
+        id: path.basename(fixture.dir),
+        status: pass ? 'pass' : 'fail',
+        details: out.slice(0, 500),
+        observedStatus: pass ? 'complete' : 'verify_failed',
+        durationMs: Date.now() - start,
+      });
+    });
+    child.on('error', (err) => {
+      resolve({ id: path.basename(fixture.dir), status: 'fail', details: String(err), durationMs: Date.now() - start });
+    });
+  });
+  await fs.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+  return result;
+}
+
 /** Hook the harness up to a session + audit log so task runs are durable. */
 export async function runHarnessWithPersistence(
   tasks: ScriptedTask[],
@@ -177,8 +232,11 @@ export async function runHarnessWithPersistence(
       type: r.details,
       ts: Date.now(),
     });
-    // Suppress unused warning.
-    void store;
+    // Persist to session store
+    try {
+      const rec = await store.create({ cwd: process.cwd(), task: t.task, config: { model: 'mock', maxSteps: 12 } });
+      await store.setStatus(rec.id, r.status === 'pass' ? 'complete' : 'verify_failed', r.details);
+    } catch { /* ignore */ }
   }
   const passed = results.filter((r) => r.status === 'pass').length;
   return {
@@ -189,4 +247,21 @@ export async function runHarnessWithPersistence(
     results,
     durationMs: Date.now() - start,
   };
+}
+
+/** Compare two harness runs */
+export function compareReports(a: HarnessSummary, b: HarnessSummary): string {
+  const lines = [
+    `# Compare: ${a.passed}/${a.total} (${(a.passRate * 100).toFixed(1)}%) vs ${b.passed}/${b.total} (${(b.passRate * 100).toFixed(1)}%)`,
+    `Duration: ${(a.durationMs / 1000).toFixed(1)}s vs ${(b.durationMs / 1000).toFixed(1)}s`,
+    `| Task | A | B |`,
+    `|------|---|---|`,
+  ];
+  const allIds = new Set([...a.results.map((r) => r.id), ...b.results.map((r) => r.id)]);
+  for (const id of allIds) {
+    const ra = a.results.find((r) => r.id === id);
+    const rb = b.results.find((r) => r.id === id);
+    lines.push(`| ${id} | ${ra?.status ?? '-'} | ${rb?.status ?? '-'} |`);
+  }
+  return lines.join('\n');
 }

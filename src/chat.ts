@@ -44,18 +44,23 @@ export function assertSafeBaseURL(url: string): void {
   }
   if (parsed.protocol === 'https:') return;
   if (parsed.protocol === 'http:') {
+    // Allow insecure HTTP if explicitly opted in (for remote Ollama etc.)
+    if (process.env.KLYRO_ALLOW_INSECURE === '1') return;
     const host = parsed.hostname.toLowerCase();
-    // Allow loopback equivalents: localhost, 127.0.0.1, ::1, 0.0.0.0, ::, 127.x.x.x is NOT allowed without https
-    // Note: hostnames that resolve to loopback (e.g. nip.io) still require https — we check hostname, not DNS.
+    // Allow loopback and private networks without extra flag
     if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0' || host === '::' || host === '[::]') return;
-    // Also allow 127.0.0.0/8 range via prefix check (e.g. 127.0.0.2)
     if (host.startsWith('127.')) {
       const parts = host.split('.');
       if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) return;
     }
+    // Private ranges 10/8, 192.168/16, 172.16-31/12
+    if (/^10\.\d+\.\d+\.\d+$/.test(host)) return;
+    if (/^192\.168\.\d+\.\d+$/.test(host)) return;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+$/.test(host)) return;
     throw new Error(
       `Refusing to send KLYRO_API_KEY over plaintext HTTP to ${host}. ` +
-        `Use https:// or a localhost URL (localhost, 127.0.0.1, ::1, 0.0.0.0).`,
+        `Use https:// or a localhost/private URL, or set KLYRO_ALLOW_INSECURE=1 to allow insecure HTTP (not recommended). ` +
+        `Example: $Env:KLYRO_ALLOW_INSECURE=\"1\"; klyro`,
     );
   }
   throw new Error(`Unsupported KLYRO_BASE_URL protocol: ${parsed.protocol}`);

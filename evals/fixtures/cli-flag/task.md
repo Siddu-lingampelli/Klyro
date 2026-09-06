@@ -1,0 +1,1 @@
+Add CLI flag --verbose
