@@ -211,6 +211,7 @@ function useChatScroll(opts: {
     pageDown: () => dispatch({ type: 'BY_HALF_PAGE', dir: 1 }),
     jumpTop: () => dispatch({ type: 'TO_TOP' }),
     jumpBottom: () => dispatch({ type: 'TO_BOTTOM' }),
+    reset: () => dispatch({ type: 'TO_BOTTOM' }),
   }), [dispatch]);
 
   const resolved = resolveTopRow(state, ctx);
@@ -274,6 +275,7 @@ export function App(props: AppProps): React.JSX.Element {
     bottom: () => {},
     halfPage: (_dir: -1 | 1) => {},
     top: () => {},
+    reset: () => {},
   });
 
   const width = stdout?.columns ?? 100;
@@ -412,6 +414,7 @@ export function App(props: AppProps): React.JSX.Element {
       }
     },
     bottom: () => commands.jumpBottom(),
+    reset: () => commands.reset(),
     halfPage: (dir: -1 | 1) => {
       if (dir < 0) commands.pageUp();
       else commands.pageDown();
@@ -450,7 +453,15 @@ export function App(props: AppProps): React.JSX.Element {
     thinkingIdRef.current = null;
     setTranscript((prev) => (prev.some((x) => x.kind === 'thinking') ? prev.filter((x) => x.kind !== 'thinking') : prev));
   }, []);
-  useEffect(() => { if (status.status !== 'running') { streamingIdRef.current = null; thinkingIdRef.current = null; } }, [status.status]);
+  useEffect(() => {
+    if (status.status !== 'running') {
+      streamingIdRef.current = null;
+      thinkingIdRef.current = null;
+      // Runs that end without final_text (abort/cancel/error) must not leave
+      // stale thinking blocks behind — only the response may remain.
+      setTranscript((prev) => (prev.some((x) => x.kind === 'thinking') ? prev.filter((x) => x.kind !== 'thinking') : prev));
+    }
+  }, [status.status]);
   const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
   const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
   // Tool results patch the running start-item IN PLACE (no second item, so a
@@ -469,7 +480,15 @@ export function App(props: AppProps): React.JSX.Element {
       return copy;
     });
   }, []);
-  const clearTranscript = useCallback(() => { streamingIdRef.current = null; setTranscript([]); setPlan([]); }, []);
+  const clearTranscript = useCallback(() => {
+    streamingIdRef.current = null;
+    thinkingIdRef.current = null;
+    setTranscript([]);
+    setPlan([]);
+    // Fresh content → fresh scroll (a pruned anchor would otherwise stick to
+    // the bottom with a stale newSinceUnstick badge count).
+    scrollCmdsRef.current.reset();
+  }, []);
   // Scroll control for external drivers (mouse-wheel tap in repl.ts, §8.4).
   // Stored in refs so the callbacks stay stable while acting on latest state.
   const scrollLines = useCallback((delta: number) => { scrollCmdsRef.current.line(delta); }, []);
@@ -724,7 +743,7 @@ export function App(props: AppProps): React.JSX.Element {
         ) : null}
       </Box>
       {pinned && pendingNew > 0 ? (
-        <Box justifyContent="flex-end" paddingX={1} marginTop={-1} flexShrink={0}>
+        <Box justifyContent="flex-end" paddingX={1} flexShrink={0}>
           <Text backgroundColor={tokens.colors.accentSoft as string} color={tokens.colors.accent as string} bold>
             {' ↓ '}{pendingNew >= 1000 ? '999+ new' : `${pendingNew} new`}{' '}
           </Text>

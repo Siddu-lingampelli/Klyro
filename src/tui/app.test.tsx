@@ -801,6 +801,67 @@ describe('App', () => {
     expect(frame).not.toContain('queued:');
   });
 
+  it('aborted run leaves no thinking behind (only response may remain)', async () => {
+    let hooks: {
+      appendThinkingDelta: (t: string) => void;
+      updateStatus: (s: Partial<StatusSnapshot>) => void;
+    } | null = null;
+    const { lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={true}
+        initialStatus={{ status: 'running' }}
+        onMounted={(h) => {
+          hooks = { appendThinkingDelta: h.appendThinkingDelta, updateStatus: h.updateStatus };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    hooks!.appendThinkingDelta('half-formed thought...');
+    await waitForMatch(lastFrame, /half-formed thought/);
+    // Abort (no final_text): thinking must be cleaned up, not linger.
+    hooks!.updateStatus({ status: 'aborted' });
+    await waitForAbsent(lastFrame, /half-formed thought/);
+  });
+
+  it('clearTranscript resets scroll state (no stale badge count)', async () => {
+    let hooks: {
+      append: (i: TranscriptItem) => void;
+      clearTranscript: () => void;
+    } | null = null;
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+        onMounted={(h) => {
+          hooks = { append: h.append, clearTranscript: h.clearTranscript };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 50));
+    hooks!.append({ id: 'late-1', kind: 'text', text: 'LATE-1-tag', role: 'assistant' });
+    // Badge counts lines grown while pinned.
+    await waitForMatch(lastFrame, /↓ \d+ new/);
+    hooks!.clearTranscript();
+    await new Promise((r) => setTimeout(r, 50));
+    // Fresh session: seed 25 more, pin, grow by one 2-line item → badge is exactly 2.
+    for (let i = 0; i < 25; i++) {
+      hooks!.append({ id: `n-${i}`, kind: 'text', text: `NEW-${i.toString().padStart(2, '0')}-tag`, role: 'user' });
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 50));
+    hooks!.append({ id: 'n-late', kind: 'text', text: 'NEWLATE-tag', role: 'assistant' });
+    // Assistant block = header + text + margin = 3 fresh lines, no stale count.
+    const badge = await waitForMatch(lastFrame, /↓ \d+ new/);
+    expect(badge).toMatch(/↓ 3 new/);
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App
