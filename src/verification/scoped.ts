@@ -62,6 +62,12 @@ export function buildScopedCommand(cwd: string, baseCommand: string, relatedTest
   return null;
 }
 
+const MAX_SCOPED_BYTES = 256 * 1024;
+function appendCappedScoped(cur: string, chunk: string): string {
+  if (cur.length >= MAX_SCOPED_BYTES) return cur;
+  const n = cur + chunk;
+  return n.length > MAX_SCOPED_BYTES ? n.slice(0, MAX_SCOPED_BYTES) + '\n... [truncated]' : n;
+}
 export async function runScopedVerify(cwd: string, command: string, timeoutMs = 45_000): Promise<{ ok: boolean; exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, shell: true, env: process.env });
@@ -74,8 +80,8 @@ export async function runScopedVerify(cwd: string, command: string, timeoutMs = 
       try { child.kill(); } catch { /* ignore */ }
       resolve({ ok: false, exitCode: -1, stdout, stderr: stderr + '\n[scoped timeout]' });
     }, timeoutMs);
-    child.stdout.on('data', (b: Buffer) => { stdout += b.toString(); });
-    child.stderr.on('data', (b: Buffer) => { stderr += b.toString(); });
+    child.stdout.on('data', (b: Buffer) => { stdout = appendCappedScoped(stdout, b.toString()); });
+    child.stderr.on('data', (b: Buffer) => { stderr = appendCappedScoped(stderr, b.toString()); });
     child.on('close', (code) => {
       if (done) return;
       done = true;
@@ -103,9 +109,8 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
       // minimal check: try to parse via new Function (for js) or just check no obvious syntax error via tsc
       // For now, use tsc --noEmit --skipLibCheck on single file quickly
       if (ext === '.ts') {
-        // spawn tsc --noEmit --skipLibCheck <file> with 10s timeout
         const ok = await new Promise<boolean>((resolve) => {
-          const child = spawn(`npx tsc --noEmit --skipLibCheck "${full}"`, { cwd, shell: true, env: process.env });
+          const child = spawn('npx', ['tsc', '--noEmit', '--skipLibCheck', full], { cwd, shell: false, env: process.env });
           let done = false;
           const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 10_000);
           child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
@@ -114,9 +119,8 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
         if (!ok) return { ok: false, error: `syntax error in ${file} (tsc)` };
         return { ok: true };
       }
-      // js: node --check
       const ok2 = await new Promise<boolean>((resolve) => {
-        const child = spawn(`node --check "${full}"`, { cwd, shell: true, env: process.env });
+        const child = spawn(process.execPath, ['--check', full], { cwd, shell: false, env: process.env });
         let done = false;
         const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 5000);
         child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
@@ -130,11 +134,11 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
   }
   if (ext === '.py') {
     const ok = await new Promise<boolean>((resolve) => {
-      const child = spawn(`python -m py_compile "${full}"`, { cwd, shell: true, env: process.env });
+      const child = spawn('python', ['-m', 'py_compile', full], { cwd, shell: false, env: process.env });
       let done = false;
       const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 5000);
       child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
-      child.on('error', () => { if (done) return; done = true; clearTimeout(t); resolve(true); }); // python may not exist → skip
+      child.on('error', () => { if (done) return; done = true; clearTimeout(t); resolve(true); });
     });
     if (!ok) return { ok: false, error: `syntax error in ${file} (py_compile)` };
   }

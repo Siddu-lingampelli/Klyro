@@ -1,0 +1,75 @@
+{
+  "suite": "smoke",
+  "results": [
+    {
+      "id": "add-fn-test",
+      "status": "fail",
+      "details": "/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 1076
+    },
+    {
+      "id": "ambiguous-ask",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 734
+    },
+    {
+      "id": "cli-flag",
+      "status": "fail",
+      "details": "grep: src/index.ts: No such file or directory\n/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 767
+    },
+    {
+      "id": "dedupe",
+      "status": "fail",
+      "details": "/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 694
+    },
+    {
+      "id": "dep-update",
+      "status": "fail",
+      "details": "grep: package.json: No such file or directory\n/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 770
+    },
+    {
+      "id": "fix-failing-test",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 1829
+    },
+    {
+      "id": "read-answer",
+      "status": "fail",
+      "details": "/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 675
+    },
+    {
+      "id": "readme",
+      "status": "fail",
+      "details": "grep: README.md: No such file or directory\n/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 666
+    },
+    {
+      "id": "rename",
+      "status": "fail",
+      "details": "grep: src/: No such file or directory\n/bin/bash: line 3: $'\\r': command not found\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 736
+    },
+    {
+      "id": "type-error",
+      "status": "fail",
+      "details": "node:internal/modules/cjs/loader:1520\n  throw err;\n  ^\n\nError: Cannot find module '/mnt/c/Users/L7F0C~1.SID/node_modules/typescript/bin/tsc'\n    at Module._resolveFilename (node:internal/modules/cjs/loader:1517:15)\n    at wrapResolveFilename (node:internal/modules/cjs/loader:1071:27)\n    at defaultResolveImplForCJSLoading (node:internal/modules/cjs/loader:1095:10)\n    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1122:12)\n    at Module._load (node:internal/modules/cjs/loader:1294:5",
+      "observedStatus": "verify_failed",
+      "durationMs": 2904
+    }
+  ]
+}

@@ -1,0 +1,75 @@
+{
+  "suite": "smoke",
+  "results": [
+    {
+      "id": "add-fn-test",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 475
+    },
+    {
+      "id": "ambiguous-ask",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 393
+    },
+    {
+      "id": "cli-flag",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 390
+    },
+    {
+      "id": "dedupe",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 414
+    },
+    {
+      "id": "dep-update",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 411
+    },
+    {
+      "id": "fix-failing-test",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 403
+    },
+    {
+      "id": "read-answer",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 381
+    },
+    {
+      "id": "readme",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 374
+    },
+    {
+      "id": "rename",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 363
+    },
+    {
+      "id": "type-error",
+      "status": "pass",
+      "details": "/bin/bash: line 1: ﻿#!/bin/bash: No such file or directory\npass\n",
+      "observedStatus": "complete",
+      "durationMs": 375
+    }
+  ]
+}

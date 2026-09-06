@@ -75,18 +75,16 @@ export async function resolveAndFollowSymlinks(cwd: string, requested: string): 
     real = await fs.realpath(resolved);
     realParent = path.dirname(real);
   } catch {
-    // File doesn't exist yet (e.g. write_file). realpath would fail; fall
-    // back to realpath-ing the parent.
     const parent = path.dirname(resolved);
     try {
       realParent = await fs.realpath(parent);
+      real = path.join(realParent, path.basename(resolved));
     } catch {
-      // Parent doesn't exist either. Don't trust the unresolved parent —
-      // re-validate it against cwd and bail if it's not inside.
-      const { resolved: parentResolved } = resolveWithinCwd(cwd, parent);
-      realParent = parentResolved;
+      // Parent doesn't exist either — no symlink to follow, so lexical check
+      // done by resolveWithinCwd above is sufficient. Return lexical resolved.
+      // Avoid realpath(cwd) vs lexical mismatch on Windows short-names.
+      return { resolved };
     }
-    real = path.join(realParent, path.basename(resolved));
   }
   const absCwd = await fs.realpath(cwd).catch(() => path.resolve(cwd));
   const cmpReal = normalizeForCompare(real);

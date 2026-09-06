@@ -10,6 +10,7 @@
 
 import { spawn } from 'node:child_process';
 import { detect, summarize, type Failure, type FailureType } from './detect.js';
+import { redact } from '../policy/secret-redactor.js';
 
 export interface VerifyOptions {
   cwd: string;
@@ -23,6 +24,13 @@ export interface VerifyResult {
   stdout: string;
   stderr: string;
   failure?: Failure;
+}
+
+const MAX_VERIFY_BYTES = 256 * 1024;
+function appendCapped(current: string, chunk: string): string {
+  if (current.length >= MAX_VERIFY_BYTES) return current;
+  const next = current + chunk;
+  return next.length > MAX_VERIFY_BYTES ? next.slice(0, MAX_VERIFY_BYTES) + '\n... [truncated]' : next;
 }
 
 export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
@@ -46,8 +54,8 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
       });
     }, timeout);
 
-    child.stdout.on('data', (b: Buffer) => { stdout += b.toString(); });
-    child.stderr.on('data', (b: Buffer) => { stderr += b.toString(); });
+    child.stdout.on('data', (b: Buffer) => { stdout = appendCapped(stdout, b.toString()); });
+    child.stderr.on('data', (b: Buffer) => { stderr = appendCapped(stderr, b.toString()); });
     child.on('close', (code) => {
       if (done) return;
       done = true;
@@ -67,5 +75,8 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
 export function diagnosticForModel(result: VerifyResult): string {
   if (result.ok) return 'Verification passed.';
   if (!result.failure) return `Verification failed with exit ${result.exitCode}.`;
-  return summarize(result.failure);
+  // redact raw before summarizing so secrets don't enter transcript
+  const redactedRaw = redact(result.failure.raw);
+  const redactedFailure: Failure = { ...result.failure, raw: redactedRaw, files: result.failure.files.map((f) => ({ ...f, message: redact(f.message) })) };
+  return summarize(redactedFailure);
 }

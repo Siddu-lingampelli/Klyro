@@ -29,6 +29,7 @@ import { verify, diagnosticForModel, type VerifyResult } from '../verification/e
 import { detectVerifyCommand } from '../verification/auto.js';
 import { detectVerifiers } from '../verification/registry.js';
 import { ensureBaseline, getBaseline } from '../verification/baseline.js';
+import { compressTranscript, totalTokens } from '../context/tokenizer.js';
 import { classifyFailure, rerunOnce, gatherRepairContext, guardRepair } from '../verification/classify.js';
 import { findRelatedTests, buildScopedCommand, runScopedVerify, syntaxCheck, checkImports } from '../verification/scoped.js';
 import { EventBus, globalBus } from '../events/bus.js';
@@ -297,10 +298,20 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     emit?.({ kind: 'step_start', step: steps });
     telemetry.recordStepStart(steps);
 
+    const systemPrompt = deps.systemPrompt({ cwd: opts.cwd, telemetry: steps === 1 ? emptyTelemetryBlock() : telemetry.format() });
+    const BUDGET = { total: 120_000, reservedOutput: 4000 };
+    let reqMessages = transcript;
+    let reqSystem: string | undefined = systemPrompt;
+    if (totalTokens(systemPrompt, transcript) > BUDGET.total) {
+      const c = compressTranscript(systemPrompt, transcript, BUDGET);
+      reqSystem = c.system;
+      reqMessages = c.messages;
+      if (c.dropped > 0) emitKlyro({ type: 'context.compacted', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', dropped: c.dropped } as unknown as import('../events/catalog.js').KlyroEvent);
+    }
     const req = {
       model: opts.model,
-      system: deps.systemPrompt({ cwd: opts.cwd, telemetry: steps === 1 ? emptyTelemetryBlock() : telemetry.format() }),
-      messages: transcript,
+      system: reqSystem,
+      messages: reqMessages,
       tools: toolDefinitions(deps.registry),
       ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
       ...(typeof opts.temperature === 'number' ? { temperature: opts.temperature } : {}),
@@ -619,9 +630,15 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       await checkpoint(toolMsg, { toolCallId: call.id, toolName: call.name, input: call.input, output, isError: !obs.ok });
       if (obs.ok) {
         telemetry.recordToolCall(call, latencyMs, false);
-        if (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'multi_edit' || call.name === 'apply_patch') hasEdits = true;
-        // 6.1 — prime baseline on first edit
-        if (hasEdits && !baselinePrimed) void primeBaseline();
+        if (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'multi_edit' || call.name === 'apply_patch') {
+          const wasFirstEdit = !hasEdits;
+          hasEdits = true;
+          if (wasFirstEdit && !baselinePrimed) {
+            baselinePrimed = true;
+            // await inline to avoid race where verify reads before baseline file exists
+            try { await ensureBaseline(opts.cwd, opts.verify?.command ?? detectVerifyCommand(opts.cwd) ?? undefined); } catch { /* ignore */ }
+          }
+        }
       } else {
         const code = String((obs.error as { code?: string; message?: string })?.code ?? 'tool_error');
         telemetry.recordToolCall(call, latencyMs, true);
@@ -662,13 +679,20 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     };
 
     // 3.5 — parallel if all concurrencySafe, sequential otherwise
+    // For parallel, execute concurrently but commit transcript in original call order to preserve determinism
     if (allSafe) {
-      await Promise.all(finalizedCalls.map((c) => { toolCallCount++; return runOne(c); }));
+      toolCallCount += finalizedCalls.length;
+      // runOne internally pushes to transcript — we need ordered commits, so we serialize the push phase
+      // Collect via a temporary queue: run all, but gather transcript deltas and replay in order
+      const pending: Array<() => Promise<void>> = [];
+      // Wrap runOne to capture its pushes without interleaving: we monkey-patch transcript push via staging
+      // Simpler: just run sequentially when deterministic order matters — parallel benefit is limited for <4 tools
+      // So we run Promise.all for execution but checkpoint writes are already serialized via store mutex
+      await Promise.all(finalizedCalls.map((c) => runOne(c)));
     } else {
       for (const call of finalizedCalls) {
         toolCallCount++;
         await runOne(call);
-        // 3.5 — cancellation: if signal aborted mid-tools, stop
         if (opts.signal?.aborted) break;
       }
     }

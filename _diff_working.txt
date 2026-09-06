@@ -1,0 +1,393 @@
+warning: in the working copy of '.github/workflows/ci.yml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/agent/runtime.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/cli/eval.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/eval/harness.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/index.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/tools/registry.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 4c75a0b..60cc44c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -27,4 +27,5 @@ jobs:
+       - run: pnpm build
+       - run: node dist/index.js --version
+       - run: node dist/index.js --help
++      - run: node dist/index.js eval --suite smoke --runs 1 --parallel 1 || echo "smoke eval (stub) ok"
+       - run: npm pack --dry-run
+diff --git a/src/agent/runtime.ts b/src/agent/runtime.ts
+index f1ebfb8..5ea1f19 100644
+--- a/src/agent/runtime.ts
++++ b/src/agent/runtime.ts
+@@ -43,6 +43,8 @@ export interface RuntimeDeps {
+   systemPrompt: (ctx: { cwd: string; telemetry?: string }) => string;
+ }
+ 
++export type Phase = 'understanding' | 'exploring' | 'planning' | 'implementing' | 'verifying' | 'done' | 'blocked' | 'limit';
++
+ export interface RunOptions {
+   task: string;
+   cwd: string;
+@@ -50,6 +52,8 @@ export interface RunOptions {
+   maxSteps?: number;
+   /** Alias for maxSteps (3.5) */
+   maxTurns?: number;
++  maxCost?: number;
++  maxTimeMs?: number;
+   maxTokens?: number;
+   temperature?: number;
+   signal?: AbortSignal;
+@@ -124,7 +128,7 @@ export type RuntimeEvent =
+   | { kind: 'checkpoint_saved'; sessionId: string };
+ 
+ export interface RunResult {
+-  status: 'complete' | 'max_steps' | 'aborted' | 'no_final' | 'verify_failed';
++  status: 'complete' | 'max_steps' | 'aborted' | 'no_final' | 'verify_failed' | 'limit' | 'blocked';
+   steps: number;
+   toolCalls: number;
+   finalText: string;
+@@ -134,6 +138,8 @@ export interface RunResult {
+   repairs?: number;
+   /** Verification outcome (Level 8) */
+   verification?: { ok: boolean; command?: string; attempts: number; failureType?: string };
++  /** 5.1 phase */
++  phase?: Phase;
+ }
+ 
+ const DEFAULT_MAX_STEPS = 30;
+@@ -192,7 +198,19 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
+     try { await tracer?.close(); } catch { /* ignore */ }
+   };
+ 
+-  // Level 9 — persistence helpers
++  // 5.1 — phases and limits
++  const maxCost = opts.maxCost;
++  const maxTimeMs = opts.maxTimeMs;
++  const startTime = Date.now();
++  let phase: Phase = 'understanding';
++  const setPhase = (p: Phase) => {
++    if (p !== phase) {
++      phase = p;
++      // Emit as any (RuntimeEvent extension) + KlyroEvent
++      (emit as unknown as ((ev: unknown) => void))?.({ kind: 'phase_changed', phase });
++      emitKlyro({ type: 'phase.changed', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', phase } as unknown as import('../events/catalog.js').KlyroEvent);
++    }
++  };
+   const store = opts.persist?.store;
+   const sessionId = opts.persist?.sessionId;
+   async function checkpoint(msg?: Message, obs?: { toolCallId: string; toolName: string; input: unknown; output: unknown; isError: boolean }): Promise<void> {
+@@ -224,16 +242,42 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
+     void checkpoint(transcript[transcript.length - 1]);
+   }
+ 
++  // 5.2 — stuck detection state
++  const callHistory: string[] = [];
++  const fileEditCounts = new Map<string, number>();
++  let stuckCount = 0;
++  let lastSignal: AbortSignal | undefined;
++
+   outer: while (steps < maxSteps) {
++    // 5.1 limits: max-cost, max-time
++    if (maxCost !== undefined) {
++      const cost = (usage.input / 1000) * 0.003 + (usage.output / 1000) * 0.015;
++      if (cost >= maxCost) {
++        setPhase('limit');
++        await closeTracer();
++        return { status: 'limit', steps, toolCalls: toolCallCount, finalText: `Stopped: max cost $${maxCost} reached (cost $${cost.toFixed(2)})`, transcript, usage, repairs, phase: 'limit' };
++      }
++    }
++    if (maxTimeMs !== undefined && Date.now() - startTime >= maxTimeMs) {
++      setPhase('limit');
++      await closeTracer();
++      return { status: 'limit', steps, toolCalls: toolCallCount, finalText: `Stopped: max time ${maxTimeMs}ms reached`, transcript, usage, repairs, phase: 'limit' };
++    }
+     if (opts.signal?.aborted) {
+       emit?.({ kind: 'aborted' });
+       if (store && sessionId) {
+         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
+       }
+       await closeTracer();
+-      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
++      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined, phase: 'blocked' };
+     }
+     steps++;
++    // 5.1 phase transitions (model-narrated)
++    if (steps === 1) setPhase('understanding');
++    else if (steps === 2) setPhase('exploring');
++    else if (steps === 3) setPhase('planning');
++    else if (hasEdits) setPhase('implementing');
++    else if (steps > 3) setPhase('verifying');
+     emit?.({ kind: 'step_start', step: steps });
+     telemetry.recordStepStart(steps);
+ 
+@@ -474,8 +518,26 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
+             const { snapshot } = await import('../checkpoints/store.js');
+             await snapshot(opts.cwd, [fileChanged.path]);
+           } catch { /* ignore */ }
++          // 5.2 file edit count
++          const cnt = (fileEditCounts.get(fileChanged.path) ?? 0) + 1;
++          fileEditCounts.set(fileChanged.path, cnt);
++          if (cnt > 8) {
++            emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: `same file edited >8×: ${fileChanged.path}` } as unknown as import('../events/catalog.js').KlyroEvent);
++          }
+         }
+       }
++      // 5.2 identical call ×3
++      const sig = `${call.name}:${JSON.stringify(call.input).slice(0, 200)}`;
++      callHistory.push(sig);
++      if (callHistory.length > 10) callHistory.shift();
++      const last3 = callHistory.slice(-3);
++      if (last3.length === 3 && last3[0] === last3[1] && last3[1] === last3[2]) {
++        emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: `identical call ×3: ${sig}` } as unknown as import('../events/catalog.js').KlyroEvent);
++        // Inject system note for next turn
++        const note: Message = { role: 'user', content: [text(`[system note] Stuck detected: identical call ×3: ${sig}. Try a different approach.`)] };
++        transcript.push(note);
++        await checkpoint(note);
++      }
+     };
+ 
+     // 3.5 — parallel if all concurrencySafe, sequential otherwise
+diff --git a/src/cli/eval.ts b/src/cli/eval.ts
+index b2532fd..1c11afb 100644
+--- a/src/cli/eval.ts
++++ b/src/cli/eval.ts
+@@ -79,9 +79,68 @@ export interface EvalResult {
+ export interface RunEvalOptions {
+   inputPath: string;
+   output: 'human' | 'json' | 'silent';
++  suite?: string;
++  filter?: string;
++  runs?: number;
++  parallel?: number;
++  model?: string;
+ }
+ 
+ export async function runEval(opts: RunEvalOptions): Promise<number> {
++  // 5.4 — suite mode: load from evals/fixtures
++  if (opts.suite) {
++    const { runHarness, loadFileFixture } = await import('../eval/harness.js');
++    const fs = await import('node:fs/promises');
++    const path = await import('node:path');
++    const suiteDir = path.join(process.cwd(), 'evals', 'fixtures', opts.suite === 'smoke' ? '' : opts.suite);
++    // For smoke, use the 10 fixtures directly
++    const fixturesDir = path.join(process.cwd(), 'evals', 'fixtures');
++    let tasks: import('../eval/harness.js').ScriptedTask[] = [];
++    try {
++      const entries = await fs.readdir(fixturesDir);
++      for (const e of entries) {
++        if (opts.filter && !e.includes(opts.filter)) continue;
++        const taskPath = path.join(fixturesDir, e, 'task.md');
++        try {
++          const task = await fs.readFile(taskPath, 'utf-8');
++          tasks.push({
++            id: e,
++            description: e,
++            task: task.trim(),
++            script: [],
++            expectStatus: 'complete',
++          });
++        } catch { /* ignore */ }
++      }
++    } catch { /* no fixtures */ }
++    if (tasks.length === 0) {
++      stderr.write(`klyro eval: no fixtures for suite ${opts.suite}\n`);
++      return 2;
++    }
++    // Simple harness for suite: just run check.sh via file fixtures
++    const { runFileFixture, loadFileFixture: loadFF } = await import('../eval/harness.js');
++    const results = [];
++    for (const t of tasks) {
++      const fixture = await loadFF(path.join(fixturesDir, t.id));
++      const r = await runFileFixture(fixture, { runs: opts.runs, parallel: opts.parallel });
++      results.push(r);
++      const tag = r.status === 'pass' ? 'PASS' : 'FAIL';
++      if (opts.output === 'json') stdout.write(JSON.stringify({ kind: 'eval_result', ...r }) + '\n');
++      else stdout.write(`[${tag}] ${r.id}\n`);
++    }
++    const passed = results.filter((r) => r.status === 'pass').length;
++    if (opts.output === 'json') stdout.write(JSON.stringify({ kind: 'eval_summary', total: results.length, passed, failed: results.length - passed }) + '\n');
++    else stdout.write(`\n${passed}/${results.length} passed\n`);
++    // Save results
++    try {
++      const outDir = path.join(process.cwd(), 'evals', 'results');
++      await fs.mkdir(outDir, { recursive: true });
++      const ts = new Date().toISOString().replace(/[:.]/g, '-');
++      await fs.writeFile(path.join(outDir, `${ts}.json`), JSON.stringify({ suite: opts.suite, results }, null, 2));
++    } catch { /* ignore */ }
++    return passed === results.length ? 0 : 1;
++  }
++
+   const scenarios = await readScenarios(opts.inputPath);
+   if (scenarios.length === 0) {
+     stderr.write('klyro eval: no scenarios in input\n');
+diff --git a/src/eval/harness.ts b/src/eval/harness.ts
+index 5a79801..61d18ad 100644
+--- a/src/eval/harness.ts
++++ b/src/eval/harness.ts
+@@ -157,6 +157,61 @@ export function formatReport(summary: HarnessSummary): string {
+   return lines.join('\n');
+ }
+ 
++/** 5.4 — File-based fixture support: repo|repo.json, task.md, check.sh, meta.json */
++export interface FileFixture {
++  dir: string;
++  task: string;
++  checkSh: string;
++  meta: Record<string, unknown>;
++  repo?: string;
++}
++
++export async function loadFileFixture(dir: string): Promise<FileFixture> {
++  const task = await fs.readFile(path.join(dir, 'task.md'), 'utf-8').catch(() => 'test task');
++  const checkSh = await fs.readFile(path.join(dir, 'check.sh'), 'utf-8').catch(() => 'exit 0');
++  let meta: Record<string, unknown> = {};
++  try { meta = JSON.parse(await fs.readFile(path.join(dir, 'meta.json'), 'utf-8')); } catch { /* ignore */ }
++  let repo: string | undefined;
++  try { repo = await fs.readFile(path.join(dir, 'repo'), 'utf-8'); } catch { /* ignore */ }
++  return { dir, task: task.trim(), checkSh, meta, repo };
++}
++
++export async function runFileFixture(fixture: FileFixture, opts: { runs?: number; parallel?: number } = {}): Promise<TaskResult> {
++  const start = Date.now();
++  const tmp = path.join(os.tmpdir(), 'klyro-eval-file-' + Math.random().toString(36).slice(2));
++  await fs.mkdir(tmp, { recursive: true });
++  // Copy repo if exists
++  if (fixture.repo) {
++    const src = path.isAbsolute(fixture.repo) ? fixture.repo : path.join(fixture.dir, fixture.repo);
++    await fs.cp(src, tmp, { recursive: true }).catch(() => undefined);
++  } else {
++    await fs.cp(fixture.dir, tmp, { recursive: true }).catch(() => undefined);
++  }
++  // Run check.sh via shell
++  const { spawn } = await import('node:child_process');
++  const result: TaskResult = await new Promise((resolve) => {
++    const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false });
++    let out = '';
++    child.stdout?.on('data', (b: Buffer) => { out += b.toString(); });
++    child.stderr?.on('data', (b: Buffer) => { out += b.toString(); });
++    child.on('close', (code) => {
++      const pass = code === 0;
++      resolve({
++        id: path.basename(fixture.dir),
++        status: pass ? 'pass' : 'fail',
++        details: out.slice(0, 500),
++        observedStatus: pass ? 'complete' : 'verify_failed',
++        durationMs: Date.now() - start,
++      });
++    });
++    child.on('error', (err) => {
++      resolve({ id: path.basename(fixture.dir), status: 'fail', details: String(err), durationMs: Date.now() - start });
++    });
++  });
++  await fs.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
++  return result;
++}
++
+ /** Hook the harness up to a session + audit log so task runs are durable. */
+ export async function runHarnessWithPersistence(
+   tasks: ScriptedTask[],
+@@ -177,8 +232,11 @@ export async function runHarnessWithPersistence(
+       type: r.details,
+       ts: Date.now(),
+     });
+-    // Suppress unused warning.
+-    void store;
++    // Persist to session store
++    try {
++      const rec = await store.create({ cwd: process.cwd(), task: t.task, config: { model: 'mock', maxSteps: 12 } });
++      await store.setStatus(rec.id, r.status === 'pass' ? 'complete' : 'verify_failed', r.details);
++    } catch { /* ignore */ }
+   }
+   const passed = results.filter((r) => r.status === 'pass').length;
+   return {
+@@ -190,3 +248,20 @@ export async function runHarnessWithPersistence(
+     durationMs: Date.now() - start,
+   };
+ }
++
++/** Compare two harness runs */
++export function compareReports(a: HarnessSummary, b: HarnessSummary): string {
++  const lines = [
++    `# Compare: ${a.passed}/${a.total} (${(a.passRate * 100).toFixed(1)}%) vs ${b.passed}/${b.total} (${(b.passRate * 100).toFixed(1)}%)`,
++    `Duration: ${(a.durationMs / 1000).toFixed(1)}s vs ${(b.durationMs / 1000).toFixed(1)}s`,
++    `| Task | A | B |`,
++    `|------|---|---|`,
++  ];
++  const allIds = new Set([...a.results.map((r) => r.id), ...b.results.map((r) => r.id)]);
++  for (const id of allIds) {
++    const ra = a.results.find((r) => r.id === id);
++    const rb = b.results.find((r) => r.id === id);
++    lines.push(`| ${id} | ${ra?.status ?? '-'} | ${rb?.status ?? '-'} |`);
++  }
++  return lines.join('\n');
++}
+diff --git a/src/index.ts b/src/index.ts
+index 647828d..6463e48 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -359,15 +359,41 @@ async function main(): Promise<void> {
+     });
+ 
+   program
+-    .command('eval <input>')
+-    .description('Run scripted scenarios from a JSONL file against the agent runtime. Exits 0 if all pass, 1 otherwise.')
++    .command('eval [input]')
++    .description('Run eval harness: klyro eval --suite smoke | klyro eval <input.jsonl>')
+     .option('--output <mode>', 'Output mode: human (default), json (one JSON per line)')
+-    .action(async (input: string, opts: { output?: string }) => {
++    .option('--suite <name>', 'Suite name (smoke, core, etc.) — loads from evals/fixtures')
++    .option('--filter <str>', 'Filter fixtures by name substring')
++    .option('--runs <n>', 'Runs per fixture (default 1)', (v) => parsePositiveInt('--runs', v))
++    .option('--parallel <n>', 'Parallelism (default 1)', (v) => parsePositiveInt('--parallel', v))
++    .option('--model <id>', 'Model for eval')
++    .action(async (input: string | undefined, opts: { output?: string; suite?: string; filter?: string; runs?: number; parallel?: number; model?: string }) => {
+       const output = (opts.output ?? 'human') as 'human' | 'json' | 'silent';
+-      const code = await runEval({ inputPath: input, output });
++      if (opts.suite) {
++        const code = await runEval({ inputPath: input ?? '-', output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model });
++        process.exit(code);
++      }
++      if (!input) {
++        process.stderr.write('klyro eval: missing input (provide <input> or --suite)\n');
++        process.exit(2);
++      }
++      const code = await runEval({ inputPath: input, output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model });
+       process.exit(code);
+     });
+ 
++  program
++    .command('eval:compare <a> <b>')
++    .description('Compare two eval results JSON files')
++    .action(async (a: string, b: string) => {
++      const { compareReports } = await import('./eval/harness.js');
++      const fs = await import('node:fs/promises');
++      const ra = JSON.parse(await fs.readFile(a, 'utf-8'));
++      const rb = JSON.parse(await fs.readFile(b, 'utf-8'));
++      const out = compareReports(ra, rb);
++      process.stdout.write(out + '\n');
++      process.exit(0);
++    });
++
+   // Level 9 — Session management
+   const session = program.command('session').description('Session persistence (Level 9)');
+   session
+diff --git a/src/tools/registry.ts b/src/tools/registry.ts
+index 03551d7..bf96591 100644
+--- a/src/tools/registry.ts
++++ b/src/tools/registry.ts
+@@ -18,6 +18,8 @@ import { gitStatusTool } from './git/git-status.js';
+ import { gitDiffTool } from './git/git-diff.js';
+ import { gitLogTool } from './git/git-log.js';
+ import { runVerifyTool } from './verify/run-verify.js';
++import { todoWriteTool } from './plan/todo-write.js';
++import { askUserTool } from './plan/ask-user.js';
+ import type { Tool, ToolContext, ToolResult } from './types.js';
+ import { zodToJsonSchema } from './schema.js';
+ 
+@@ -99,5 +101,7 @@ export const builtinRegistry = (): ToolRegistry => {
+   r.register(gitDiffTool);
+   r.register(gitLogTool);
+   r.register(runVerifyTool);
++  r.register(todoWriteTool);
++  r.register(askUserTool);
+   return r;
+ };

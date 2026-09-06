@@ -83,7 +83,7 @@ export function zodToJsonSchema(schema: z.ZodType<unknown>): Record<string, unkn
 }
 
 function zodFieldSchema(s: z.ZodType<unknown>): Record<string, unknown> {
-  const def = (s as unknown as { _def?: { typeName?: string; innerType?: z.ZodType<unknown> } })._def;
+  const def = (s as unknown as { _def?: { typeName?: string; innerType?: z.ZodType<unknown>; options?: z.ZodType<unknown>[]; value?: unknown } })._def;
   const name = def?.typeName;
   switch (name) {
     case 'ZodString':
@@ -96,13 +96,32 @@ function zodFieldSchema(s: z.ZodType<unknown>): Record<string, unknown> {
       const inner = def?.innerType;
       return { type: 'array', items: inner ? zodFieldSchema(inner) : { type: 'string' } };
     }
-    case 'ZodOptional': {
+    case 'ZodOptional':
+    case 'ZodNullable':
+    case 'ZodDefault': {
       const inner = def?.innerType;
       return inner ? zodFieldSchema(inner) : { type: 'string' };
     }
     case 'ZodEnum': {
       const values = (s as unknown as { _def: { values: readonly string[] } })._def.values;
       return { type: 'string', enum: [...values] };
+    }
+    case 'ZodNativeEnum': {
+      const vals = Object.values((s as unknown as { _def: { values: Record<string, unknown> } })._def.values);
+      return { enum: [...vals] };
+    }
+    case 'ZodLiteral': {
+      const v = def?.value;
+      return { enum: [v], type: typeof v === 'string' ? 'string' : typeof v === 'number' ? 'number' : 'boolean' };
+    }
+    case 'ZodUnion':
+    case 'ZodDiscriminatedUnion': {
+      const opts = (def as unknown as { options?: z.ZodType<unknown>[] }).options ?? [];
+      return { anyOf: opts.map((o) => zodFieldSchema(o)) };
+    }
+    case 'ZodIntersection': {
+      const parts = [def?.innerType].filter(Boolean) as z.ZodType<unknown>[];
+      return { allOf: parts.map((p) => zodFieldSchema(p)) };
     }
     case 'ZodObject':
       return zodToJsonSchema(s);
@@ -297,7 +316,7 @@ async function* streamChatCompletions(
                 toolIds.set(tc.index, tc.id);
               }
               if (tc.function?.arguments) {
-                const id = toolIds.get(tc.index) ?? `call_${tc.index}`;
+                const id = toolIds.get(tc.index) ?? `call_${tc.index}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
                 yield { kind: 'tool_call_delta', id, argsJson: tc.function.arguments };
               }
             }

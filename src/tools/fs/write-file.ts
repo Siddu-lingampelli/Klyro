@@ -10,7 +10,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
-import { resolveWithinCwd } from '../../policy/path-guard.js';
+import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
 import { safe } from '../normalize.js';
 
 const InputSchema = z.object({
@@ -36,7 +36,7 @@ export const writeFileTool = defineTool<z.infer<typeof InputSchema>, WriteFileOu
   renderResult: (output) => `${output.path} written ${output.bytesWritten} bytes`,
   execute: async (input, ctx) => {
     return safe(async () => {
-      const { resolved } = resolveWithinCwd(ctx.cwd, input.path);
+      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
       const parent = path.dirname(resolved);
       await fs.mkdir(parent, { recursive: true });
 

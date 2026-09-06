@@ -78,6 +78,13 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /curl.*\|\s*(sh|bash|zsh|python|python3|perl|ruby|php)/i, reason: 'curl|sh to unknown host' },
   { pattern: /wget.*\|\s*(sh|bash|python|perl|ruby)/i, reason: 'wget|sh pipe' },
   { pattern: /rm\s+-rf\s+--no-preserve-root\s+\//, reason: 'recursive delete --no-preserve-root' },
+  // Shell metacharacter escapes — block command substitution and chaining of dangerous cmds
+  { pattern: /\$\(/, reason: 'command substitution $()' },
+  { pattern: /`[^`]*`/, reason: 'command substitution via backticks' },
+  { pattern: /\|\s*bash\b|\|\s*sh\b/, reason: 'pipe to shell' },
+  { pattern: /;\s*rm\s+-rf/, reason: 'chained rm -rf' },
+  { pattern: /&&\s*rm\s+-rf/, reason: 'chained rm -rf' },
+  { pattern: /\|\|\s*rm\s+-rf/, reason: 'chained rm -rf' },
 ];
 
 export interface ShellOutput {

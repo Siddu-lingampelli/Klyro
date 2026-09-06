@@ -1,0 +1,61 @@
+{
+  "suite": "l6",
+  "results": [
+    {
+      "id": "l6-introduce-1",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 477
+    },
+    {
+      "id": "l6-introduce-2",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 389
+    },
+    {
+      "id": "l6-introduce-3",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 415
+    },
+    {
+      "id": "l6-introduce-4",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 383
+    },
+    {
+      "id": "l6-introduce-5",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 412
+    },
+    {
+      "id": "l6-introduce-6",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 415
+    },
+    {
+      "id": "l6-introduce-7",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 387
+    },
+    {
+      "id": "l6-introduce-8",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 397
+    }
+  ]
+}

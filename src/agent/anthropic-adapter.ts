@@ -290,18 +290,13 @@ function findToolIdByIndex(
   indexToToolId?: Map<number, string>,
 ): string | undefined {
   if (index === undefined) return undefined;
-  // Preferred: direct index → id mapping from content_block_start
   if (indexToToolId) {
     const direct = indexToToolId.get(index);
     if (direct) return direct;
   }
-  // Fallback heuristic for older streams without index on start
-  let i = 0;
-  for (const id of buffers.keys()) {
-    if (i === index) return id;
-    i++;
-  }
+  // Single-buffer fallback: if only one in-flight tool, any delta belongs to it
   if (buffers.size === 1) return buffers.keys().next().value;
+  // No reliable mapping — drop the delta rather than misroute to wrong tool (prevents _parse_error loops)
   return undefined;
 }
 

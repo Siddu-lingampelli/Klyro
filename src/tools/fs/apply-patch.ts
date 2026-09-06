@@ -6,7 +6,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
-import { resolveWithinCwd } from '../../policy/path-guard.js';
+import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
 import { safe } from '../normalize.js';
 
 const InputSchema = z.object({
@@ -31,7 +31,7 @@ export const applyPatchTool = defineTool({
         if (line.startsWith('*** Update File:')) {
           // Flush previous
           if (currentFile && fileContent !== null) {
-            const { resolved } = resolveWithinCwd(ctx.cwd, currentFile);
+            const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, currentFile);
             await fs.mkdir(path.dirname(resolved), { recursive: true });
             await fs.writeFile(resolved, fileContent, 'utf-8');
             patchedFiles.push(currentFile);
@@ -39,7 +39,7 @@ export const applyPatchTool = defineTool({
           currentFile = line.replace('*** Update File:', '').trim();
           if (currentFile) {
             try {
-              const { resolved } = resolveWithinCwd(ctx.cwd, currentFile);
+              const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, currentFile);
               fileContent = await fs.readFile(resolved, 'utf-8');
             } catch { fileContent = ''; }
           }
@@ -47,7 +47,7 @@ export const applyPatchTool = defineTool({
         }
         if (line.startsWith('*** Add File:')) {
           if (currentFile && fileContent !== null) {
-            const { resolved } = resolveWithinCwd(ctx.cwd, currentFile);
+            const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, currentFile);
             await fs.mkdir(path.dirname(resolved), { recursive: true });
             await fs.writeFile(resolved, fileContent, 'utf-8');
             patchedFiles.push(currentFile);
@@ -64,7 +64,7 @@ export const applyPatchTool = defineTool({
         }
       }
       if (currentFile && fileContent !== null) {
-        const { resolved } = resolveWithinCwd(ctx.cwd, currentFile);
+        const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, currentFile);
         await fs.mkdir(path.dirname(resolved), { recursive: true });
         await fs.writeFile(resolved, fileContent, 'utf-8');
         patchedFiles.push(currentFile);

@@ -52,10 +52,25 @@ export interface StoredObservation {
 export class SessionStore {
   private readonly dir: string;
   private readonly indexPath: string;
+  private readonly locks = new Map<string, Promise<void>>();
 
   constructor(dir: string) {
     this.dir = dir;
     this.indexPath = path.join(dir, 'sessions.json');
+  }
+
+  private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.locks.get(key) ?? Promise.resolve();
+    let release: () => void;
+    const next = new Promise<void>((r) => { release = r; });
+    this.locks.set(key, prev.then(() => next));
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release!();
+      if (this.locks.get(key) === next) this.locks.delete(key);
+    }
   }
 
   private async ensureDir(): Promise<void> {
@@ -141,22 +156,28 @@ export class SessionStore {
   }
 
   async appendMessage(id: string, message: StoredMessage): Promise<void> {
-    const data = await this.readSession(id);
-    data.messages.push(message);
-    await this.writeSession(id, data);
+    return this.withLock(id, async () => {
+      const data = await this.readSession(id);
+      data.messages.push(message);
+      await this.writeSession(id, data);
+    });
   }
 
   async appendObservation(id: string, obs: StoredObservation): Promise<void> {
-    const data = await this.readSession(id);
-    data.observations.push(obs);
-    await this.writeSession(id, data);
+    return this.withLock(id, async () => {
+      const data = await this.readSession(id);
+      data.observations.push(obs);
+      await this.writeSession(id, data);
+    });
   }
 
   async setStatus(id: string, status: SessionStatus, finalText?: string): Promise<void> {
-    const data = await this.readSession(id);
-    data.record.status = status;
-    if (finalText !== undefined) data.record.finalText = finalText;
-    await this.writeSession(id, data);
+    return this.withLock(id, async () => {
+      const data = await this.readSession(id);
+      data.record.status = status;
+      if (finalText !== undefined) data.record.finalText = finalText;
+      await this.writeSession(id, data);
+    });
   }
 
   async loadMessages(id: string): Promise<StoredMessage[]> {

@@ -76,6 +76,12 @@ export async function runBaseline(cwd: string, command?: string, timeoutMs = 90_
   return baseline;
 }
 
+const MAX_BASELINE_BYTES = 256 * 1024;
+function cap(cur: string, chunk: string): string {
+  if (cur.length >= MAX_BASELINE_BYTES) return cur;
+  const n = cur + chunk;
+  return n.length > MAX_BASELINE_BYTES ? n.slice(0, MAX_BASELINE_BYTES) + '\n... [truncated]' : n;
+}
 function runCmd(cwd: string, command: string, timeoutMs: number): Promise<{ ok: boolean; exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, shell: true, env: process.env });
@@ -88,8 +94,8 @@ function runCmd(cwd: string, command: string, timeoutMs: number): Promise<{ ok: 
       try { child.kill(); } catch { /* ignore */ }
       resolve({ ok: false, exitCode: -1, stdout, stderr: stderr + '\n[baseline timeout]' });
     }, timeoutMs);
-    child.stdout.on('data', (b: Buffer) => { stdout += b.toString(); });
-    child.stderr.on('data', (b: Buffer) => { stderr += b.toString(); });
+    child.stdout.on('data', (b: Buffer) => { stdout = cap(stdout, b.toString()); });
+    child.stderr.on('data', (b: Buffer) => { stderr = cap(stderr, b.toString()); });
     child.on('close', (code) => {
       if (done) return;
       done = true;

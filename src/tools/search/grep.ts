@@ -43,6 +43,13 @@ export const grepTool = defineTool({
   inputSchema: InputSchema,
   execute: async (input, ctx) => {
     return safe(async () => {
+      if (input.pattern.length > 200) {
+        return { ok: false, error: { code: TOOL_ERROR_CODES.INVALID_INPUT, message: 'Pattern too long (max 200 chars)' } } as const;
+      }
+      // reject catastrophic backtracking patterns (nested quantifiers like (a+)+ )
+      if (/\([^)]*\+[^)]*\)\+|\(\.\*\)\*|\{[0-9]+,[0-9]*\}\s*\+/.test(input.pattern)) {
+        return { ok: false, error: { code: TOOL_ERROR_CODES.INVALID_INPUT, message: 'Pattern rejected (potential ReDoS)' } } as const;
+      }
       const base = input.cwd ? resolveWithinCwd(ctx.cwd, input.cwd).resolved : ctx.cwd;
       let re: RegExp;
       try {

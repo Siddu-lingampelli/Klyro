@@ -1,0 +1,75 @@
+{
+  "suite": "smoke",
+  "results": [
+    {
+      "id": "add-fn-test",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 463
+    },
+    {
+      "id": "ambiguous-ask",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 425
+    },
+    {
+      "id": "cli-flag",
+      "status": "fail",
+      "details": "/bin/bash: line 3: exit: 0\r: numeric argument required\npass\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 411
+    },
+    {
+      "id": "dedupe",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 453
+    },
+    {
+      "id": "dep-update",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 423
+    },
+    {
+      "id": "fix-failing-test",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 413
+    },
+    {
+      "id": "read-answer",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 471
+    },
+    {
+      "id": "readme",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 368
+    },
+    {
+      "id": "rename",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 377
+    },
+    {
+      "id": "type-error",
+      "status": "fail",
+      "details": "pass\n/bin/bash: line 3: exit: 0\r: numeric argument required\n",
+      "observedStatus": "verify_failed",
+      "durationMs": 385
+    }
+  ]
+}
