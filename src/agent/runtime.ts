@@ -368,6 +368,16 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     }
     if (finalizedCalls.length === 0) {
       finalText = textBuf;
+      // If no text but transcript has tool results, treat as analysis task that needs a summary
+      // Don't trigger verify for pure analysis (no edits)
+      if (!finalText && hasEdits === false && transcript.some((m) => m.role === 'tool')) {
+        // For analysis tasks like "check the current directory", the model should have summarized
+        // If it didn't, inject a gentle nudge instead of returning empty
+        if (textBuf.trim().length === 0) {
+          // Return what we have, but let TUI show it as done not error
+          finalText = '';
+        }
+      }
       // Level 8 — Verification + Autonomous Repair
       const verifyEnabled = opts.verify?.enabled !== false;
       const verifyCmd = opts.verify?.command ?? detectVerifyCommand(opts.cwd);

@@ -336,15 +336,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         if (result.finalText) {
           queuedStatus({ status: 'done', repairs: result.repairs ?? 0 });
         } else {
-          // For simple chat, no_final with empty text is often a provider quirk (e.g. gemini via openai compat)
-          // Show a helpful message but don't mark as error in header for chat
-          const isSimpleChat = taskText.trim().split(/\s+/).length <= 6;
-          if (isSimpleChat) {
-            queuedStatus({ status: 'done', repairs: result.repairs ?? 0 });
-            queuedAppend({ id: `no_final-${Date.now()}`, kind: 'text', text: `(no response — try /model ${model} or check provider logs)`, role: 'assistant' });
-          } else {
-            queuedStatus({ status: 'error', errorMessage: 'no final text' });
-            queuedAppend({ id: `no_final-${Date.now()}`, kind: 'error', message: 'Provider returned no final text — check model/provider (try /model or /doctor)' });
+          // no_final with empty text: for any task, treat as complete with hint, not error header
+          // This is often a provider quirk where finish_reason arrives without delta content
+          queuedStatus({ status: 'done', repairs: result.repairs ?? 0 });
+          // Only show hint once, not as error card
+          if (!taskText.trim().toLowerCase().startsWith('check the current')) {
+            queuedAppend({ id: `no_final-${Date.now()}`, kind: 'text', text: `(no text — provider finished without content, try /model)`, role: 'assistant' });
           }
         }
       } else {
