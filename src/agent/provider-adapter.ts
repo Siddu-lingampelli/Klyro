@@ -278,8 +278,15 @@ async function* streamChatCompletions(
             pendingUsage = { input: chunk.usage.prompt_tokens, output: chunk.usage.completion_tokens };
           }
           for (const choice of chunk.choices) {
-            if (choice.delta.content) {
-              yield { kind: 'text_delta', text: choice.delta.content };
+            // Handle multiple possible content fields for compat (OpenAI, Ollama, OpenRouter gemini, etc.)
+            const delta: unknown = choice.delta as unknown;
+            const text =
+              (delta as { content?: string })?.content ??
+              (delta as { text?: string })?.text ??
+              (choice as unknown as { message?: { content?: string } })?.message?.content ??
+              (choice as unknown as { delta?: { text?: string } })?.delta?.text;
+            if (typeof text === 'string' && text) {
+              yield { kind: 'text_delta', text };
             }
             for (const tc of choice.delta.tool_calls ?? []) {
               if (tc.id && tc.function?.name) {

@@ -211,8 +211,15 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
               queuedStatus({ step: ev.step });
             } else if (ev.kind === 'text_delta') {
               textBuf += ev.text;
-              // Coalesce: reuse pending text item if still queued, otherwise create one.
-              // App.tsx also coalesces post-mount, so we only need to avoid queue bloat.
+              // Try full-screen live region first (batched 30fps)
+              const g = globalThis as unknown as { __klyroAppendDelta?: (t: string) => void };
+              if (isMounted && g.__klyroAppendDelta) {
+                g.__klyroAppendDelta(ev.text);
+                // Also keep coalescing for fallback inline mode
+                if (!pendingTextId) pendingTextId = `text-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+                return;
+              }
+              // Fallback inline mode: coalesce via queuedAppend
               if (pendingTextId) {
                 const last = pendingQueue[pendingQueue.length - 1];
                 if (last?.kind === 'append' && last.item.kind === 'text' && last.item.id === pendingTextId) {
@@ -220,8 +227,6 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                   return;
                 }
               }
-              // For mounted case, App will merge via its own coalescing (same id)
-              // so reuse pendingTextId to let App merge
               if (pendingTextId && isMounted) {
                 queuedAppend({ id: pendingTextId, kind: 'text', text: ev.text, role: 'assistant' });
                 return;
@@ -277,6 +282,17 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 latencyMs: ev.latencyMs,
                 status: ev.isError ? 'error' : 'done',
               });
+            } else if (ev.kind === 'final_text') {
+              // Commit live region for both inline and full-screen TUI
+              const g2 = globalThis as unknown as { __klyroCommitLive?: () => void };
+              g2.__klyroCommitLive?.();
+              pendingTextId = null;
+              // For full-screen, also ensure liveText is committed if any remaining
+              if (ev.text) {
+                const g3 = globalThis as unknown as { __klyroAppendDelta?: (t: string) => void };
+                // If liveText was batched, ensure it's flushed and committed
+                g2.__klyroCommitLive?.();
+              }
             } else if (ev.kind === 'usage') {
               queuedStatus({ usageInput: ev.input, usageOutput: ev.output });
             } else if (ev.kind === 'plan_update') {
@@ -316,16 +332,26 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       if (result.status === 'verify_failed') {
         queuedAppend({ id: `verr-${Date.now()}`, kind: 'error', message: `Verification failed after ${result.verification?.attempts ?? 3} attempts. Check output above.` });
         queuedStatus({ status: 'error', errorMessage: 'verification failed' });
-      } else if (result.status === 'no_final' && result.finalText) {
-        // Simple chat with text but no tool calls — treat as done (provider finished)
-        queuedStatus({ status: 'done', repairs: result.repairs ?? 0 });
+      } else if (result.status === 'no_final') {
+        if (result.finalText) {
+          queuedStatus({ status: 'done', repairs: result.repairs ?? 0 });
+        } else {
+          // For simple chat, no_final with empty text is often a provider quirk (e.g. gemini via openai compat)
+          // Show a helpful message but don't mark as error in header for chat
+          const isSimpleChat = taskText.trim().split(/\s+/).length <= 6;
+          if (isSimpleChat) {
+            queuedStatus({ status: 'done', repairs: result.repairs ?? 0 });
+            queuedAppend({ id: `no_final-${Date.now()}`, kind: 'text', text: `(no response — try /model ${model} or check provider logs)`, role: 'assistant' });
+          } else {
+            queuedStatus({ status: 'error', errorMessage: 'no final text' });
+            queuedAppend({ id: `no_final-${Date.now()}`, kind: 'error', message: 'Provider returned no final text — check model/provider (try /model or /doctor)' });
+          }
+        }
       } else {
         queuedStatus({ status: 'complete' === result.status ? 'done' : 'error', repairs: result.repairs ?? 0 });
       }
       if (sessionId) {
         queuedAppend({ id: `sess-end-${Date.now()}`, kind: 'text', text: `session ${sessionId.slice(0, 8)} ${result.status} — ${result.steps} steps, ${result.toolCalls} tool calls`, role: 'assistant' });
-      } else if (result.status === 'no_final' && !result.finalText) {
-        queuedAppend({ id: `no_final-${Date.now()}`, kind: 'error', message: 'Provider returned no final text — check model/provider' });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

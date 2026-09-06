@@ -52,6 +52,29 @@ export function App(props: AppProps): React.JSX.Element {
   });
   const [elapsed, setElapsed] = useState(0);
   const [queued, setQueued] = useState<string | null>(null);
+  const [liveText, setLiveText] = useState('');
+  const batchRef = useRef<string>('');
+  const batchTimer = useRef<NodeJS.Timeout | null>(null);
+  const flushBatch = useCallback(() => {
+    if (batchRef.current) {
+      const chunk = batchRef.current;
+      batchRef.current = '';
+      setLiveText((prev) => prev + chunk);
+    }
+    if (batchTimer.current) { clearTimeout(batchTimer.current); batchTimer.current = null; }
+  }, []);
+  const appendDeltaBatched = useCallback((text: string) => {
+    batchRef.current += text;
+    if (!batchTimer.current) batchTimer.current = setTimeout(flushBatch, 33);
+  }, [flushBatch]);
+  const commitLive = useCallback(() => {
+    flushBatch();
+    if (liveText) {
+      const item: TranscriptItem = { id: nextId('text'), kind: 'text', text: liveText, role: 'assistant' };
+      setTranscript((prev) => [...prev, item]);
+      setLiveText('');
+    }
+  }, [liveText, flushBatch]);
 
   useEffect(() => bridge.subscribe((p) => setAwaitingApproval(p !== null)), [bridge]);
 
@@ -94,12 +117,16 @@ export function App(props: AppProps): React.JSX.Element {
     (globalThis as unknown as { __klyroAppAppend?: unknown }).__klyroAppAppend = append;
     (globalThis as unknown as { __klyroAppStatus?: unknown }).__klyroAppStatus = updateStatus;
     (globalThis as unknown as { __klyroAppPlan?: unknown }).__klyroAppPlan = updatePlan;
+    (globalThis as unknown as { __klyroAppendDelta?: unknown }).__klyroAppendDelta = appendDeltaBatched;
+    (globalThis as unknown as { __klyroCommitLive?: unknown }).__klyroCommitLive = commitLive;
     return () => {
       delete (globalThis as unknown as { __klyroAppAppend?: unknown }).__klyroAppAppend;
       delete (globalThis as unknown as { __klyroAppStatus?: unknown }).__klyroAppStatus;
       delete (globalThis as unknown as { __klyroAppPlan?: unknown }).__klyroAppPlan;
+      delete (globalThis as unknown as { __klyroAppendDelta?: unknown }).__klyroAppendDelta;
+      delete (globalThis as unknown as { __klyroCommitLive?: unknown }).__klyroCommitLive;
     };
-  }, [append, updateStatus, updatePlan]);
+  }, [append, updateStatus, updatePlan, appendDeltaBatched, commitLive]);
 
   // Single useInput owner — handles queued when running (2.4)
   useInput((inputStr, key) => {
@@ -144,7 +171,7 @@ export function App(props: AppProps): React.JSX.Element {
     <Box flexDirection="column" width={width} height={height - 1}>
       {/* Header — compact, per §3 — shows version, model, cwd, step, status */}
       <Box flexDirection="column" borderStyle="single" borderColor={tokens.ansi.border as unknown as string} paddingX={1}>
-        <Text bold>KLYRO v0.1.13</Text>
+        <Text bold>KLYRO v0.1.14</Text>
         <Text color={tokens.ansi.muted as unknown as string}>{status.model} · API Usage Billing · step {status.step}/{status.maxSteps} · {status.status} · repairs {status.repairs}</Text>
         <Text color={tokens.ansi.muted as unknown as string}>{props.cwd}</Text>
       </Box>
@@ -187,7 +214,11 @@ export function App(props: AppProps): React.JSX.Element {
             </Box>
           ))
         )}
-        {status.status === 'running' ? (
+        {liveText ? (
+          <Box paddingLeft={2} marginBottom={1}>
+            <Text>{liveText}▍</Text>
+          </Box>
+        ) : status.status === 'running' ? (
           <Box>
             <Text color={tokens.ansi.info as unknown as string}>✦ Thinking...</Text>
             <Text color={tokens.ansi.muted as unknown as string}> · {Math.round(elapsed / 1000)}s</Text>
