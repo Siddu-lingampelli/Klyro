@@ -127,4 +127,215 @@ describe('App', () => {
     const call = (onSlash.mock.calls[0] as unknown as [SlashCommand] | undefined)?.[0];
     expect(call?.kind).toBe('quit');
   });
+
+  // --- Chat scroll behavior (TUI_DESIGN chat_scroll.md) -----------------
+
+  // Build a 25-item initial transcript. Each item has a unique tag so we can
+  // grep `lastFrame()` for it.
+  function makeInitialTranscript(n: number): TranscriptItem[] {
+    const out: TranscriptItem[] = [];
+    for (let i = 0; i < n; i++) {
+      out.push({
+        id: `seed-${i}`,
+        kind: 'text',
+        text: `MSG-${i.toString().padStart(2, '0')}-tag`,
+        role: 'user',
+      });
+    }
+    return out;
+  }
+
+  // ANSI sequences Ink's parse-keypress recognizes.
+  const KEY_HOME = '\x1b[H';
+  const KEY_END = '\x1b[F';
+  const KEY_PGUP = '\x1b[5~';
+  const KEY_PGDN = '\x1b[6~';
+  const KEY_SHIFT_UP = '\x1b[1;2A';
+  const KEY_SHIFT_DOWN = '\x1b[1;2B';
+
+  it('starts at the bottom (follow-tail) when initial content fills the viewport', async () => {
+    const { lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    const frame = lastFrame() ?? '';
+    // The viewport is 20 rows; the last few seeded items (MSG-22..MSG-24) should
+    // be in the visible window. The first item (MSG-00) should NOT be visible.
+    expect(frame).toMatch(/MSG-24-tag/);
+    expect(frame).toMatch(/MSG-23-tag/);
+    expect(frame).not.toMatch(/MSG-00-tag/);
+  });
+
+  it('Home jumps to the top; End re-engages follow-tail', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 30));
+    const top = lastFrame() ?? '';
+    expect(top).toMatch(/MSG-00-tag/);
+    expect(top).not.toMatch(/MSG-24-tag/);
+    // End re-engages follow-tail.
+    stdin.write(KEY_END);
+    await new Promise((r) => setTimeout(r, 30));
+    const bottom = lastFrame() ?? '';
+    expect(bottom).toMatch(/MSG-24-tag/);
+    expect(bottom).not.toMatch(/MSG-00-tag/);
+  });
+
+  it('PageUp/PageDown snap to message boundaries', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    // Go to top, then PageDown 3 times. Each PageDown should land on a message
+    // boundary, so visible window starts at one of the seeded indices.
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write(KEY_PGDN);
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write(KEY_PGDN);
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write(KEY_PGDN);
+    await new Promise((r) => setTimeout(r, 30));
+    const frame = lastFrame() ?? '';
+    // After 3 PageDowns from top, the earliest visible item should be MSG-03
+    // (snap-to-message keeps the boundary on the first visible row). We assert
+    // that MSG-03 is visible and MSG-00 is not.
+    expect(frame).toMatch(/MSG-03-tag/);
+    expect(frame).not.toMatch(/MSG-00-tag/);
+  });
+
+  it('pins to top: new content does NOT auto-scroll when user has scrolled up', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    // Pin: scroll up to top.
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 100));
+    const before = lastFrame() ?? '';
+    expect(before).toMatch(/MSG-00-tag/);
+    expect(before).not.toMatch(/MSG-24-tag/);
+    // New content arrives while pinned.
+    const g = globalThis as unknown as { __klyroAppAppend?: (i: TranscriptItem) => void };
+    g.__klyroAppAppend!({
+      id: 'late-1',
+      kind: 'text',
+      text: 'LATE-1-tag',
+      role: 'assistant',
+    });
+    g.__klyroAppAppend!({
+      id: 'late-2',
+      kind: 'text',
+      text: 'LATE-2-tag',
+      role: 'assistant',
+    });
+    g.__klyroAppAppend!({
+      id: 'late-3',
+      kind: 'text',
+      text: 'LATE-3-tag',
+      role: 'assistant',
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    const after = lastFrame() ?? '';
+    // Still pinned at top: MSG-00 visible, LATE items not in viewport.
+    expect(after).toMatch(/MSG-00-tag/);
+    expect(after).not.toMatch(/LATE-1-tag/);
+  });
+
+  it('pressing End re-engages follow-tail and reveals new content', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 100));
+    const g = globalThis as unknown as { __klyroAppAppend?: (i: TranscriptItem) => void };
+    g.__klyroAppAppend!({
+      id: 'late-1',
+      kind: 'text',
+      text: 'LATE-1-tag',
+      role: 'assistant',
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(lastFrame() ?? '').not.toMatch(/LATE-1-tag/);
+    // End re-engages follow-tail and shows the new content.
+    stdin.write(KEY_END);
+    await new Promise((r) => setTimeout(r, 100));
+    const frame = lastFrame() ?? '';
+    expect(frame).toMatch(/LATE-1-tag/);
+  });
+
+  it('Shift+Up / Shift+Down scroll by one line', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    // Jump to top, then shift+down a few times, then back with shift+up.
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write(KEY_SHIFT_DOWN);
+    stdin.write(KEY_SHIFT_DOWN);
+    await new Promise((r) => setTimeout(r, 30));
+    const frame = lastFrame() ?? '';
+    // Shift+Down from scrollOffset=0 moves us down by 2. The visible window
+    // is now [2..22). MSG-00 should be off-screen, MSG-02 should be on-screen.
+    expect(frame).not.toMatch(/MSG-00-tag/);
+    expect(frame).toMatch(/MSG-02-tag/);
+    // Shift+Up once: scrollOffset back to 1, MSG-01 visible, MSG-02 still visible.
+    stdin.write(KEY_SHIFT_UP);
+    await new Promise((r) => setTimeout(r, 30));
+    const frame2 = lastFrame() ?? '';
+    expect(frame2).toMatch(/MSG-01-tag/);
+  });
 });

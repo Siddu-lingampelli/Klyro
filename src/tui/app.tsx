@@ -2,7 +2,7 @@
  * Klyro TUI â€” opencode-clean â€” no clumsy words, correct wrap, markdown, scroll
  * Header 3 rows, guide â”‚ at col2, â— Klyro accent, prose wrapped at word boundaries
  */
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
 import type { StatusSnapshot } from './status.js';
 import type { TranscriptItem } from './transcript.js';
@@ -92,6 +92,84 @@ function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width
   return <Text wrap="wrap">{parts}</Text>;
 }
 
+// Chat scroll state: scrollOffset, pinned (user scrolled away from bottom),
+// pendingNew (rows arrived while pinned), and a commands bag for key handlers.
+// The `tick` prop is a monotonic value that increments on every content mutation,
+// including in-place text growth during streaming (appendDelta mutates by index,
+// so transcript.length does not change on a delta — the effect must fire anyway).
+function useChatScroll(opts: {
+  totalRows: number;
+  viewportH: number;
+  messageBoundaries: number[];
+  tick: number;
+}) {
+  const { totalRows, viewportH, messageBoundaries, tick } = opts;
+  const [scrollOffset, setScrollOffset] = useState(0);
+  const [pinned, setPinned] = useState(false);
+  const [pendingNew, setPendingNew] = useState(0);
+  const pinnedRef = useRef(false);
+
+  const maxOffset = Math.max(0, totalRows - viewportH);
+  // 1-line tolerance: maxOffset can shift by 1 during streaming and leave us
+  // at maxOffset - 1, which would otherwise be "not at bottom". The +1 tolerance
+  // keeps follow-tail engaged through that off-by-one.
+  const isAtBottom = scrollOffset + 1 >= maxOffset;
+
+  const recomputePinned = useCallback((next: number) => {
+    const atBottom = next + 1 >= maxOffset;
+    pinnedRef.current = !atBottom;
+    setPinned(!atBottom);
+    if (atBottom) setPendingNew(0);
+  }, [maxOffset]);
+
+  // Watch `tick` — fires on every content change (add, remove, in-place delta).
+  const lastTickRef = useRef(tick);
+  const lastMaxOffsetRef = useRef(maxOffset);
+  const firstEffectRef = useRef(true);
+  useEffect(() => {
+    if (firstEffectRef.current) {
+      // Initial mount: if there's content, follow the tail (preserves the
+      // pre-refactor behavior where scrollOffset was 0 only on empty state).
+      firstEffectRef.current = false;
+      lastTickRef.current = tick;
+      lastMaxOffsetRef.current = maxOffset;
+      if (maxOffset > 0) {
+        setScrollOffset(maxOffset);
+      }
+      return;
+    }
+    if (tick === lastTickRef.current) return;
+    lastTickRef.current = tick;
+    const grew = maxOffset - lastMaxOffsetRef.current;
+    lastMaxOffsetRef.current = maxOffset;
+    if (pinnedRef.current) {
+      if (grew > 0) setPendingNew((p) => p + grew);
+    } else {
+      // FollowTail: snap to the new bottom.
+      setScrollOffset(maxOffset);
+    }
+  }, [tick, maxOffset]);
+
+  const commands = {
+    lineUp:    () => { const next = Math.max(0, scrollOffset - 1);           setScrollOffset(next); recomputePinned(next); },
+    lineDown:  () => { const next = Math.min(maxOffset, scrollOffset + 1);   setScrollOffset(next); recomputePinned(next); },
+    pageUp:    () => {
+      const prev = [...messageBoundaries].reverse().find((b) => b < scrollOffset);
+      const next = prev ?? Math.max(0, scrollOffset - viewportH);
+      setScrollOffset(next); recomputePinned(next);
+    },
+    pageDown:  () => {
+      const nxt = messageBoundaries.find((b) => b > scrollOffset);
+      const next = nxt ?? Math.min(maxOffset, scrollOffset + viewportH);
+      setScrollOffset(next); recomputePinned(next);
+    },
+    jumpTop:    () => { setScrollOffset(0);        recomputePinned(0); },
+    jumpBottom: () => { setScrollOffset(maxOffset); recomputePinned(maxOffset); },
+  };
+
+  return { scrollOffset, setScrollOffset, pinned, pendingNew, isAtBottom, maxOffset, commands };
+}
+
 export function App(props: AppProps): React.JSX.Element {
   const { stdout } = useStdout();
   const [transcript, setTranscript] = useState<TranscriptItem[]>(props.initialTranscript ?? []);
@@ -103,7 +181,6 @@ export function App(props: AppProps): React.JSX.Element {
   const [elapsed, setElapsed] = useState(0);
   const [queuedInputs, setQueuedInputs] = useState<string[]>([]);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const [scrollOffset, setScrollOffset] = useState(0);
   const streamingIdRef = useRef<string | null>(null);
 
   const width = stdout?.columns ?? 100;
@@ -112,8 +189,20 @@ export function App(props: AppProps): React.JSX.Element {
   const grouped = groupTools(transcript);
   const viewportH = Math.max(5, height - 10);
   const totalRows = grouped.length + (plan.length > 0 ? 1 : 0) + 2;
-  const maxOffset = Math.max(0, totalRows - viewportH);
-  const isAtBottom = scrollOffset >= maxOffset;
+  const messageBoundaries = useMemo(() => grouped.map((_, i) => i), [grouped]);
+
+  // Monotonic tick: increments on every render, so the scroll hook fires
+  // for every content mutation — including in-place text deltas.
+  const tickRef = useRef(0);
+  useEffect(() => { tickRef.current += 1; });
+
+  const scroll = useChatScroll({
+    totalRows,
+    viewportH,
+    messageBoundaries,
+    tick: tickRef.current,
+  });
+  const { scrollOffset, isAtBottom, maxOffset, pinned, pendingNew, commands } = scroll;
   const trackH = viewportH;
   const thumbPos = maxOffset === 0 ? 0 : Math.round((scrollOffset / maxOffset) * (trackH - 1));
   const visibleGrouped = isFullscreen ? grouped.slice(scrollOffset, scrollOffset + viewportH) : grouped;
@@ -130,7 +219,6 @@ export function App(props: AppProps): React.JSX.Element {
     }
   }, [queuedInputs, status.status, awaitingApproval]);
   useEffect(() => { if (status.status !== 'running') return; const start = Date.now() - elapsed; const t = setInterval(() => setElapsed(Date.now() - start), 1000); return () => clearInterval(t); }, [status.status, elapsed]);
-  useEffect(() => { if (isAtBottom) setScrollOffset(maxOffset); }, [transcript.length, plan.length, maxOffset, isAtBottom]);
 
   const append = useCallback((item: TranscriptItem) => { if (item.kind !== 'text' || item.role !== 'assistant') streamingIdRef.current = null; setTranscript((prev) => [...prev, item]); }, []);
   const appendDelta = useCallback((text: string) => {
@@ -146,15 +234,18 @@ export function App(props: AppProps): React.JSX.Element {
   useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
-  const scrollUp = (n = 3) => setScrollOffset((p) => Math.max(0, p - n));
-  const scrollDown = (n = 3) => setScrollOffset((p) => Math.min(maxOffset, p + n));
 
   useInput((inputStr, key) => {
     if (key.escape && queuedInputs.length > 0) { setQueuedInputs((prev) => prev.slice(1)); return; }
-    if (key.pageUp || (key.ctrl && inputStr === 'u')) { scrollUp(5); return; }
-    if (key.pageDown || (key.ctrl && inputStr === 'd')) { scrollDown(5); return; }
-    if (key.upArrow && (key.shift || key.ctrl)) { scrollUp(1); return; }
-    if (key.downArrow && (key.shift || key.ctrl)) { scrollDown(1); return; }
+    // Scroll keys (work in any mode, including while running).
+    if (isFullscreen && maxOffset > 0) {
+      if (key.home) { commands.jumpTop(); return; }
+      if (key.end)  { commands.jumpBottom(); return; }
+      if (key.pageUp || (key.ctrl && inputStr === 'u')) { commands.pageUp(); return; }
+      if (key.pageDown || (key.ctrl && inputStr === 'd')) { commands.pageDown(); return; }
+      if (key.upArrow && (key.shift || key.ctrl)) { commands.lineUp(); return; }
+      if (key.downArrow && (key.shift || key.ctrl)) { commands.lineDown(); return; }
+    }
     if (awaitingApproval) return;
     if (key.ctrl && inputStr === 'o') { const groups = grouped.filter((x): x is Group => typeof (x as Group).verb === 'string'); const last = groups[groups.length - 1]; if (last) toggleGroup(last.id); return; }
     if (status.status === 'running') {
@@ -274,6 +365,13 @@ export function App(props: AppProps): React.JSX.Element {
           </Box>
         ) : null}
       </Box>
+      {pinned && pendingNew > 0 ? (
+        <Box justifyContent="flex-end" paddingX={1} marginTop={-1}>
+          <Text backgroundColor={tokens.colors.accentSoft as string} color={tokens.colors.accent as string} bold>
+            {' ↓ '}{pendingNew}{' new '}{pendingNew === 1 ? 'message' : 'messages'}{' '}
+          </Text>
+        </Box>
+      ) : null}
       <Box flexDirection="column">
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
         <Box>
