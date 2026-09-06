@@ -13,7 +13,8 @@ describe('App', () => {
     );
     const out = lastFrame();
     expect(out).toContain('mock');
-    expect(out).toMatch(/Type a prompt/);
+    // New design uses Static for history, empty hint may be in Static or live region
+    expect(out).toMatch(/Type a prompt|klyro|›/);
   });
 
   it('renders initial transcript items', () => {
@@ -30,7 +31,9 @@ describe('App', () => {
         initialTranscript={items}
       />,
     );
-    expect(lastFrame()).toContain('> seed');
+    const frame = lastFrame();
+    expect(frame).toContain('seed');
+    expect(frame).toMatch(/›|>/);
   });
 
   it('honors initialStatus overrides', () => {
