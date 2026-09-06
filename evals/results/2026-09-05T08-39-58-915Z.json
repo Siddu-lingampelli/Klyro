@@ -1,0 +1,75 @@
+{
+  "suite": "smoke",
+  "results": [
+    {
+      "id": "add-fn-test",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 511
+    },
+    {
+      "id": "ambiguous-ask",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 366
+    },
+    {
+      "id": "cli-flag",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 407
+    },
+    {
+      "id": "dedupe",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 408
+    },
+    {
+      "id": "dep-update",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 544
+    },
+    {
+      "id": "fix-failing-test",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 705
+    },
+    {
+      "id": "read-answer",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 664
+    },
+    {
+      "id": "readme",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 755
+    },
+    {
+      "id": "rename",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 638
+    },
+    {
+      "id": "type-error",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 710
+    }
+  ]
+}

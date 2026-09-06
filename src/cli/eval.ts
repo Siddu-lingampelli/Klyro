@@ -104,11 +104,13 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
         if (opts.suite && opts.suite !== 'smoke') {
           if (!e.startsWith(opts.suite) && !e.includes(opts.suite)) continue;
         } else if (opts.suite === 'smoke') {
-          // smoke = only type smoke (exclude l6 introduce fixtures)
           try {
             const metaRaw = await fs.readFile(path.join(fixturesDir, e, 'meta.json'), 'utf-8');
             const meta = JSON.parse(metaRaw) as Record<string, unknown>;
-            if (meta.suite === 'l6' || meta.type === 'l6-introduce') continue;
+            const t = meta.type as string | undefined;
+            const s = meta.suite as string | undefined;
+            if (t === 'l6-introduce' || t === 'locate' || s === 'l6' || s === 'locate') continue;
+            if (t && t !== 'smoke') continue;
           } catch { /* no meta → include */ }
         }
         const taskPath = path.join(fixturesDir, e, 'task.md');

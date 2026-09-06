@@ -1,0 +1,110 @@
+{
+  "suite": "smoke",
+  "results": [
+    {
+      "id": "add-fn-test",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 536
+    },
+    {
+      "id": "ambiguous-ask",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 398
+    },
+    {
+      "id": "cli-flag",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 444
+    },
+    {
+      "id": "dedupe",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 468
+    },
+    {
+      "id": "dep-update",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 387
+    },
+    {
+      "id": "fix-failing-test",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 410
+    },
+    {
+      "id": "locate-auth",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 406
+    },
+    {
+      "id": "locate-config",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 571
+    },
+    {
+      "id": "locate-db",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 388
+    },
+    {
+      "id": "locate-errors",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 381
+    },
+    {
+      "id": "locate-routing",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 425
+    },
+    {
+      "id": "read-answer",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 404
+    },
+    {
+      "id": "readme",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 392
+    },
+    {
+      "id": "rename",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 435
+    },
+    {
+      "id": "type-error",
+      "status": "pass",
+      "details": "pass\n",
+      "observedStatus": "complete",
+      "durationMs": 394
+    }
+  ]
+}
