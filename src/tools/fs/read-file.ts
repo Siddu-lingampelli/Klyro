@@ -19,6 +19,7 @@ import { defineTool } from '../types.js';
 import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
 import { TOOL_ERROR_CODES, safe } from '../normalize.js';
 import { markRead } from './read-history.js';
+import { checkUnchanged, storeResult } from '../../context/lifecycle.js';
 
 const InputSchema = z.object({
   path: z.string().min(1).describe('Path relative to cwd, or absolute path inside cwd'),
@@ -105,6 +106,13 @@ export const readFileTool = defineTool<z.infer<typeof InputSchema>, ReadFileOutp
           (result as unknown as Record<string, unknown>).hint = 'Truncated to 8k tokens — use startLine/endLine to get more';
         }
         markRead(input.path);
+        // 8.2 lifecycle: store large results, duplicate detection <50 tokens
+        const asStr = outLines.join('\n');
+        if (asStr.length > 2000) storeResult(asStr);
+        const unchanged = checkUnchanged(input.path, asStr, 0);
+        if (unchanged.unchanged) {
+          (result as unknown as Record<string, unknown>).note = `unchanged since turn ${unchanged.sinceTurn}`;
+        }
         return result satisfies ReadFileOutput;
       } finally {
         await fh.close().catch(() => undefined);

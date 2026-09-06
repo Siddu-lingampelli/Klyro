@@ -35,10 +35,12 @@ export type SlashCommand =
   | { kind: 'jobs' }
   | { kind: 'verify' }
   | { kind: 'project' }
+  | { kind: 'context' }
+  | { kind: 'compact'; focus?: string }
   | { kind: 'prompt'; text: string }
   | { kind: 'unknown'; raw: string };
 
-const KNOWN = ['clear', 'compact', 'model', 'diff', 'undo', 'rewind', 'plan', 'status', 'quit', 'help', 'config', 'doctor', 'version', 'cost', 'thinking', 'memory', 'jobs', 'verify', 'project', 'exit', 'clear'] as const;
+const KNOWN = ['clear', 'compact', 'model', 'diff', 'undo', 'rewind', 'plan', 'status', 'quit', 'help', 'config', 'doctor', 'version', 'cost', 'thinking', 'memory', 'jobs', 'verify', 'project', 'context', 'compact', 'exit', 'clear'] as const;
 
 export function parse(input: string): SlashCommand {
   const trimmed = input.trim();
@@ -62,6 +64,8 @@ export function parse(input: string): SlashCommand {
     case 'jobs':    return { kind: 'jobs' };
     case 'verify':  return { kind: 'verify' };
     case 'project': return { kind: 'project' };
+    case 'context': return { kind: 'context' };
+    case 'compact': return { kind: 'compact', focus: rest || undefined };
     case 'quit':
     case 'exit':
     case 'q':       return { kind: 'quit' };

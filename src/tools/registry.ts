@@ -24,6 +24,8 @@ import { repoMapTool } from './repo-map.js';
 import { importsOfTool, importersOfTool } from './search/imports.js';
 import { findSymbolTool } from './symbols/find-symbol.js';
 import { lspDiagnosticsTool, lspGotoDefinitionTool } from './lsp/diagnostics.js';
+import { expandResultTool } from './expand-result.js';
+import { memoryWriteTool } from './memory-write.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { zodToJsonSchema } from './schema.js';
 
@@ -113,5 +115,7 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(findSymbolTool);
   r.register(lspDiagnosticsTool);
   r.register(lspGotoDefinitionTool);
+  r.register(expandResultTool);
+  r.register(memoryWriteTool);
   return r;
 };

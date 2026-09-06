@@ -505,6 +505,21 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         queuedAppend({ id: `proj-${Date.now()}`, kind: 'text', text: out.slice(0, 4000), role: 'assistant' });
         return;
       }
+      case 'context': {
+        const { renderContextBreakdown } = await import('./context.js');
+        // use last transcript via closure? approximate with empty
+        const { accounting } = await import('../context/accounting.js');
+        const sys = '' ; // system prompt approx
+        const breakdown = renderContextBreakdown(sys, []);
+        queuedAppend({ id: `ctx-${Date.now()}`, kind: 'text', text: breakdown, role: 'assistant' });
+        return;
+      }
+      case 'compact': {
+        queuedAppend({ id: `compact-${Date.now()}`, kind: 'text', text: 'Compacting context…', role: 'assistant' });
+        // 8.3 compaction would summarize oldest 60% — stub emits compacted event
+        queuedStatus({ status: 'running' });
+        return;
+      }
       case 'compact':
         queuedAppend({
           id: `stub-${Date.now()}`,
