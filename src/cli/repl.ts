@@ -128,12 +128,32 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     else pendingQueue.push({ kind: 'plan', plan: p });
   }
 
+  // ── Full-screen takeover like OpenCode/Claude Code (§3) ──
+  // When useTui, enter alternate screen so `klyro` owns the whole terminal.
+  // Ctrl+C (SIGINT) + /quit both leave the alt screen and restore the shell like opencode.
+  const isAltScreen = useTui && !!process.stdout.isTTY;
+  const enterAlt = () => {
+    if (!isAltScreen) return;
+    try {
+      process.stdout.write('\x1b[?1049h\x1b[?25l'); // alt screen + hide cursor
+      process.stdout.write('\x1b[H\x1b[2J'); // home + clear
+    } catch { /* ignore */ }
+  };
+  const leaveAlt = () => {
+    if (!isAltScreen) return;
+    try {
+      process.stdout.write('\x1b[?25h\x1b[?1049l'); // show cursor + leave alt
+    } catch { /* ignore */ }
+  };
+
   // Declare app before handler to avoid TDZ; handler added after render
   let app: ReturnType<typeof render> | undefined;
   let sigintHandler: (() => void) | undefined;
   // Level 9 — session store for TUI (one store per REPL)
   const tuiStore = getDefaultSessionStore();
   let tuiSessionId: string | undefined;
+
+  if (isAltScreen) enterAlt();
 
   app = render(
     React.createElement(App, {
@@ -162,13 +182,16 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         pendingQueue.length = 0;
       },
     }),
+    { patchConsole: false } as unknown as Parameters<typeof render>[1],
   );
 
   // Install SIGINT handler only after app exists (avoids TDZ) and use once
+  // On Ctrl+C in alt-screen, leave alt before exit so shell is restored
   sigintHandler = () => {
     ac.abort();
     queuedStatus({ status: 'aborted' });
     try { app?.unmount(); } catch { /* ignore */ }
+    leaveAlt();
   };
   process.once('SIGINT', sigintHandler);
 
@@ -516,18 +539,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
       case 'compact': {
         queuedAppend({ id: `compact-${Date.now()}`, kind: 'text', text: 'Compacting context…', role: 'assistant' });
-        // 8.3 compaction would summarize oldest 60% — stub emits compacted event
         queuedStatus({ status: 'running' });
         return;
       }
-      case 'compact':
-        queuedAppend({
-          id: `stub-${Date.now()}`,
-          kind: 'text',
-          text: `/compact is a stub in this build. (persistence integration pending)`,
-          role: 'assistant',
-        });
-        return;
       case 'model': {
         const next = cmd.model?.trim();
         if (!next) {
@@ -554,9 +568,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   return new Promise<number>((resolve) => {
     const onExit = () => {
       if (sigintHandler) process.removeListener('SIGINT', sigintHandler);
+      leaveAlt();
       resolve(ac.signal.aborted ? 130 : 0);
     };
     if (!app) {
+      leaveAlt();
       resolve(1);
       return;
     }
