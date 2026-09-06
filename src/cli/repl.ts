@@ -10,6 +10,7 @@ import React from 'react';
 import { render } from 'ink';
 import { App } from '../tui/app.js';
 import { httpChatAdapter } from '../agent/provider-adapter.js';
+import { anthropicAdapter } from '../agent/anthropic-adapter.js';
 import { run } from '../agent/runtime.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, DEFAULT_POLICY_CONFIG, PolicyEngine } from '../policy/engine.js';
@@ -18,11 +19,8 @@ import { DenyAllApprovalPrompt, StdinApprovalPrompt } from '../policy/approval.j
 import { TuiApprovalBridge } from '../tui/approval.js';
 import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
-
-function readEnv(name: string, fallback?: string): string | undefined {
-  const v = process.env[name];
-  return v && v.length > 0 ? v : fallback;
-}
+import { resolveProvider, providerHelp } from '../providers.js';
+import { inferProviderFromBaseURL } from '../agent/registry.js';
 
 export interface ReplOptions {
   systemPrompt?: string;
@@ -30,20 +28,41 @@ export interface ReplOptions {
   maxSteps?: number;
   model?: string;
   nonInteractive?: boolean;
+  /** Force TUI even when stdin is not a TTY (e.g. for testing or explicit flag). */
+  forceTty?: boolean;
 }
 
 export async function startRepl(opts: ReplOptions = {}): Promise<number> {
-  const baseUrl = readEnv('KLYRO_BASE_URL');
-  const apiKey = readEnv('KLYRO_API_KEY');
-  const model = opts.model ?? readEnv('KLYRO_MODEL');
-  if (!baseUrl || !apiKey || !model) {
-    process.stderr.write('klyro: KLYRO_BASE_URL, KLYRO_API_KEY, and KLYRO_MODEL must be set\n');
+  // Reuse the same provider resolution as legacy repl.ts — probes local
+  // Ollama / LM Studio / vLLM when env is not fully set, so bare `klyro`
+  // works with a local model just like `klyro chat` does.
+  const resolved = await resolveProvider();
+  if (!resolved) {
+    process.stderr.write('klyro: no provider available.\n');
+    process.stderr.write(`  ${providerHelp(null)}\n`);
+    process.stderr.write('  Set KLYRO_BASE_URL and KLYRO_API_KEY, or run a local server (Ollama, LM Studio, vLLM).\n');
+    process.stderr.write('  Examples:\n');
+    process.stderr.write('    set KLYRO_BASE_URL=https://api.openai.com/v1\n');
+    process.stderr.write('    set KLYRO_API_KEY=sk-...\n');
+    process.stderr.write('    ollama serve   # then KLYRO_BASE_URL=http://localhost:11434/v1 KLYRO_MODEL=llama3.2\n');
     return 2;
   }
+  const baseUrl = resolved.baseURL;
+  const apiKey = resolved.apiKey;
+  let model = opts.model ?? resolved.model;
   const cwd = opts.cwd ?? process.cwd();
   const registry = builtinRegistry();
   const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
-  const adapter = httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: 60_000 });
+  const providerKind = inferProviderFromBaseURL(baseUrl);
+  // Local Ollama exposes OpenAI-compat but hostname could contain "anthropic"
+  // via proxy — don't try anthropic adapter with empty key (would 401).
+  const effectiveProvider = providerKind === 'anthropic' && !apiKey ? 'openai' as const : providerKind;
+  if (providerKind === 'anthropic' && !apiKey) {
+    process.stderr.write('klyro: anthropic provider detected but KLYRO_API_KEY is empty — falling back to OpenAI-compatible adapter\n');
+  }
+  const adapter = effectiveProvider === 'anthropic'
+    ? anthropicAdapter({ baseURL: baseUrl, apiKey, timeoutMs: 60_000 })
+    : httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: 60_000 });
   const ctxBlock = await buildLevel6Context({ cwd });
   const ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
   const systemPromptFn = (_ctx: { cwd: string; telemetry?: string }): string => {
@@ -53,21 +72,53 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   };
 
   const ac = new AbortController();
-  process.on('SIGINT', () => ac.abort());
 
   // When the TUI is mounted, use the inline Ink prompt. Otherwise
   // fall back to stdin readline. The bridge is shared between the
   // App and the runtime so the modal can resolve the runtime's ask().
   const tuiBridge = new TuiApprovalBridge();
+  const useTui = opts.forceTty || process.stdin.isTTY;
   const approval = opts.nonInteractive
     ? new DenyAllApprovalPrompt()
-    : (process.stdin.isTTY ? tuiBridge : new StdinApprovalPrompt());
+    : (useTui ? tuiBridge : new StdinApprovalPrompt());
 
   let inflight: Promise<unknown> | null = null;
-  let transcriptRef: import('../tui/transcript.js').TranscriptItem[] = [];
   let lastStatus: import('../tui/status.js').StatusSnapshot | null = null;
 
-  const app = render(
+  // --- Ordered queued bridge with instance-local hooks (no global singleton) ---
+  type QueuedEvent =
+    | { kind: 'append'; item: import('../tui/transcript.js').TranscriptItem }
+    | { kind: 'status'; patch: Partial<import('../tui/status.js').StatusSnapshot> }
+    | { kind: 'plan'; plan: import('../agent/runtime.js').PlanStep[] };
+  const pendingQueue: QueuedEvent[] = [];
+  let isMounted = false;
+  let directHooks:
+    | {
+        append: (i: import('../tui/transcript.js').TranscriptItem) => void;
+        updateStatus: (s: Partial<import('../tui/status.js').StatusSnapshot>) => void;
+        updatePlan: (p: import('../agent/runtime.js').PlanStep[]) => void;
+      }
+    | undefined;
+
+  function queuedAppend(item: import('../tui/transcript.js').TranscriptItem): void {
+    if (isMounted && directHooks) directHooks.append(item);
+    else pendingQueue.push({ kind: 'append', item });
+  }
+  function queuedStatus(s: Partial<import('../tui/status.js').StatusSnapshot>): void {
+    lastStatus = { ...(lastStatus ?? { model: model ?? '', step: 0, maxSteps: opts.maxSteps ?? 30, usageInput: 0, usageOutput: 0, repairs: 0, status: 'idle' } as import('../tui/status.js').StatusSnapshot), ...s };
+    if (isMounted && directHooks) directHooks.updateStatus(s);
+    else pendingQueue.push({ kind: 'status', patch: s });
+  }
+  function queuedPlan(p: import('../agent/runtime.js').PlanStep[]): void {
+    if (isMounted && directHooks) directHooks.updatePlan(p);
+    else pendingQueue.push({ kind: 'plan', plan: p });
+  }
+
+  // Declare app before handler to avoid TDZ; handler added after render
+  let app: ReturnType<typeof render> | undefined;
+  let sigintHandler: (() => void) | undefined;
+
+  app = render(
     React.createElement(App, {
       initialModel: model,
       maxSteps: opts.maxSteps ?? 30,
@@ -82,21 +133,36 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       onSlash: async (cmd: SlashCommand) => {
         await handleSlash(cmd);
       },
+      onMounted: (hooks) => {
+        directHooks = hooks;
+        isMounted = true;
+        for (const ev of pendingQueue) {
+          if (ev.kind === 'status') hooks.updateStatus(ev.patch);
+          else if (ev.kind === 'plan') hooks.updatePlan(ev.plan);
+          else hooks.append(ev.item);
+        }
+        pendingQueue.length = 0;
+      },
     }),
   );
 
-  // Bridge: subscribes to global hooks installed by App.useEffect.
-  // Every time the runtime emits, we translate to a transcript item or
-  // a status update.
-  const appG = globalThis as unknown as {
-    __klyroAppAppend?: (i: import('../tui/transcript.js').TranscriptItem) => void;
-    __klyroAppStatus?: (s: Partial<import('../tui/status.js').StatusSnapshot>) => void;
-    __klyroAppPlan?: (p: import('../agent/runtime.js').PlanStep[]) => void;
+  // Install SIGINT handler only after app exists (avoids TDZ) and use once
+  sigintHandler = () => {
+    ac.abort();
+    queuedStatus({ status: 'aborted' });
+    try { app?.unmount(); } catch { /* ignore */ }
   };
+  process.once('SIGINT', sigintHandler);
 
   async function runWithBridge(text: string): Promise<void> {
-    appG.__klyroAppStatus?.({ status: 'running', step: 0 });
+    if (!model) {
+      queuedAppend({ id: `err-${Date.now()}`, kind: 'error', message: 'no model configured' });
+      queuedStatus({ status: 'error', errorMessage: 'no model configured' });
+      return;
+    }
+    queuedStatus({ status: 'running', step: 0, model });
     let textBuf = '';
+    let pendingTextId: string | null = null;
     let activeCallId: string | null = null;
     let activeCallName: string | null = null;
     let activeCallArgs = '';
@@ -105,16 +171,35 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         {
           task: text,
           cwd,
-          model: model!,
+          model,
           maxSteps: opts.maxSteps ?? 30,
           signal: ac.signal,
           nonInteractive: opts.nonInteractive ?? false,
           onEvent: (ev) => {
             if (ev.kind === 'step_start') {
-              appG.__klyroAppStatus?.({ step: ev.step });
+              // Flush coalesced text before new step
+              pendingTextId = null;
+              queuedStatus({ step: ev.step });
             } else if (ev.kind === 'text_delta') {
               textBuf += ev.text;
-              appG.__klyroAppAppend?.({ id: `text-${ev.kind}-${Date.now()}-${Math.random()}`, kind: 'text', text: ev.text, role: 'assistant' });
+              // Coalesce: reuse pending text item if still queued, otherwise create one.
+              // App.tsx also coalesces post-mount, so we only need to avoid queue bloat.
+              if (pendingTextId) {
+                const last = pendingQueue[pendingQueue.length - 1];
+                if (last?.kind === 'append' && last.item.kind === 'text' && last.item.id === pendingTextId) {
+                  last.item.text += ev.text;
+                  return;
+                }
+              }
+              // For mounted case, App will merge via its own coalescing (same id)
+              // so reuse pendingTextId to let App merge
+              if (pendingTextId && isMounted) {
+                queuedAppend({ id: pendingTextId, kind: 'text', text: ev.text, role: 'assistant' });
+                return;
+              }
+              const id = `text-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+              pendingTextId = id;
+              queuedAppend({ id, kind: 'text', text: ev.text, role: 'assistant' });
             } else if (ev.kind === 'tool_call_start') {
               activeCallId = ev.id;
               activeCallName = ev.name;
@@ -122,7 +207,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             } else if (ev.kind === 'tool_call_delta') {
               activeCallArgs += ev.argsJson;
             } else if (ev.kind === 'tool_call_end') {
-              appG.__klyroAppAppend?.({
+              queuedAppend({
                 id: `tool-${ev.id}-${Date.now()}`,
                 kind: 'tool',
                 name: ev.name,
@@ -134,7 +219,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
               activeCallName = null;
               activeCallArgs = '';
             } else if (ev.kind === 'policy_decision') {
-              appG.__klyroAppAppend?.({
+              queuedAppend({
                 id: `pol-${ev.id}-${Date.now()}`,
                 kind: 'policy',
                 name: ev.name,
@@ -142,7 +227,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 reason: ev.reason,
               });
             } else if (ev.kind === 'tool_result') {
-              appG.__klyroAppAppend?.({
+              queuedAppend({
                 id: `tres-${ev.id}-${Date.now()}`,
                 kind: 'tool',
                 name: ev.name,
@@ -154,69 +239,77 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 status: ev.isError ? 'error' : 'done',
               });
             } else if (ev.kind === 'usage') {
-              appG.__klyroAppStatus?.({ usageInput: ev.input, usageOutput: ev.output });
+              queuedStatus({ usageInput: ev.input, usageOutput: ev.output });
             } else if (ev.kind === 'plan_update') {
-              appG.__klyroAppPlan?.(ev.plan);
+              queuedPlan(ev.plan);
             } else if (ev.kind === 'file_changed') {
-              appG.__klyroAppAppend?.({
+              queuedAppend({
                 id: `fc-${ev.path}-${Date.now()}`,
                 kind: 'file_changed',
                 path: ev.path,
                 op: ev.op,
               });
             } else if (ev.kind === 'verification_failed') {
-              appG.__klyroAppAppend?.({
+              queuedAppend({
                 id: `vf-${ev.step}-${Date.now()}`,
                 kind: 'error',
                 message: `verification failed at ${ev.step}: ${ev.reason}`,
               });
             } else if (ev.kind === 'aborted') {
-              appG.__klyroAppStatus?.({ status: 'aborted' });
+              queuedStatus({ status: 'aborted' });
             }
           },
         },
         { adapter, registry, policy, approval, systemPrompt: systemPromptFn },
       );
-      appG.__klyroAppStatus?.({ status: 'complete' === result.status ? 'done' : 'error', repairs: result.repairs ?? 0 });
+      queuedStatus({ status: 'complete' === result.status ? 'done' : 'error', repairs: result.repairs ?? 0 });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      appG.__klyroAppAppend?.({ id: `err-${Date.now()}`, kind: 'error', message });
-      appG.__klyroAppStatus?.({ status: 'error', errorMessage: message });
+      queuedAppend({ id: `err-${Date.now()}`, kind: 'error', message });
+      queuedStatus({ status: 'error', errorMessage: message });
     }
   }
 
   async function handleSlash(cmd: SlashCommand): Promise<void> {
     switch (cmd.kind) {
       case 'quit':
-        app.unmount();
-        process.exit(0);
+        try { app?.unmount(); } catch { /* ignore */ }
+        // Listener cleanup is handled by the waitUntilExit resolver below
         return;
       case 'clear':
-        // Bypass via the app's setTranscript by re-rendering is awkward;
-        // for MVP, append a marker and rely on the user to scroll.
-        // A real implementation would expose a clear() method.
-        appG.__klyroAppAppend?.({ id: `sep-${Date.now()}`, kind: 'text', text: '--- cleared ---', role: 'assistant' });
+        queuedAppend({ id: `sep-${Date.now()}`, kind: 'text', text: '--- cleared ---', role: 'assistant' });
         return;
       case 'help': {
-        const helpText = 'commands: /clear /compact /model <id> /diff /status /quit';
-        appG.__klyroAppAppend?.({ id: `help-${Date.now()}`, kind: 'text', text: helpText, role: 'assistant' });
+        const helpText = [
+          'commands:',
+          '  /clear          — clear transcript marker',
+          '  /diff           — show git diff',
+          '  /status         — show session status',
+          '  /compact        — (stub) context compaction',
+          '  /model <id>     — switch model mid-session',
+          '  /quit           — exit',
+          `provider: ${effectiveProvider}  model: ${model}  cwd: ${cwd}`,
+        ].join('\n');
+        queuedAppend({ id: `help-${Date.now()}`, kind: 'text', text: helpText, role: 'assistant' });
         return;
       }
       case 'status': {
         if (lastStatus) {
-          appG.__klyroAppAppend?.({
+          queuedAppend({
             id: `stat-${Date.now()}`,
             kind: 'text',
             text: JSON.stringify(lastStatus, null, 2),
             role: 'assistant',
           });
+        } else {
+          queuedAppend({ id: `stat2-${Date.now()}`, kind: 'text', text: `model: ${model}  provider: ${effectiveProvider}  cwd: ${cwd}`, role: 'assistant' });
         }
         return;
       }
       case 'diff': {
         const r = await registry.execute('git_diff', {}, { cwd, env: process.env, nonInteractive: true });
         if (!r.ok) {
-          appG.__klyroAppAppend?.({
+          queuedAppend({
             id: `diff-err-${Date.now()}`,
             kind: 'error',
             message: `git_diff failed: ${r.error.message ?? r.error.code}`,
@@ -225,7 +318,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         }
         const out = r.value as { diff: string; stat: string; patchedFiles: string[] };
         const hunks = parseUnifiedDiff(out.diff);
-        appG.__klyroAppAppend?.({
+        queuedAppend({
           id: `diff-${Date.now()}`,
           kind: 'diff',
           hunks,
@@ -234,16 +327,26 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'compact':
-      case 'model':
-        appG.__klyroAppAppend?.({
+        queuedAppend({
           id: `stub-${Date.now()}`,
           kind: 'text',
-          text: `/${cmd.kind} is a stub in this build. (${cmd.kind === 'model' ? `requested: ${cmd.model}` : 'persistence integration pending'})`,
+          text: `/compact is a stub in this build. (persistence integration pending)`,
           role: 'assistant',
         });
         return;
+      case 'model': {
+        const next = cmd.model?.trim();
+        if (!next) {
+          queuedAppend({ id: `mdl-${Date.now()}`, kind: 'text', text: `current model: ${model}`, role: 'assistant' });
+        } else {
+          queuedStatus({ model: next });
+          queuedAppend({ id: `mdl2-${Date.now()}`, kind: 'text', text: `model switched to ${next} (takes effect on next prompt)`, role: 'assistant' });
+          model = next;
+        }
+        return;
+      }
       case 'unknown':
-        appG.__klyroAppAppend?.({
+        queuedAppend({
           id: `unk-${Date.now()}`,
           kind: 'error',
           message: `unknown command: ${cmd.raw} (try /help)`,
@@ -252,7 +355,17 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     }
   }
 
+  // Keep process alive until user quits; resolve on unmount or SIGINT.
+  // ac.aborted indicates SIGINT; return 130 (128+SIGINT) like shells do.
   return new Promise<number>((resolve) => {
-    process.on('exit', () => resolve(0));
+    const onExit = () => {
+      if (sigintHandler) process.removeListener('SIGINT', sigintHandler);
+      resolve(ac.signal.aborted ? 130 : 0);
+    };
+    if (!app) {
+      resolve(1);
+      return;
+    }
+    app.waitUntilExit().then(onExit, onExit);
   });
 }

@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { chat } from './chat.js';
 import { repl } from './repl.js';
+import { startRepl } from './cli/repl.js';
 import { runOnce } from './cli/run.js';
 import { runEval } from './cli/eval.js';
 
@@ -53,10 +54,44 @@ async function main(): Promise<void> {
     .helpOption('-h, --help', 'Print this help message')
     .showHelpAfterError();
 
-  // Default action: TUI REPL. For now this falls back to the legacy REPL
-  // until the Ink-based TUI lands. The wiring point is cli/repl.ts.
+  // Top-level TUI overrides — single definition; commander auto-creates --no-tui negation
+  // Note: -m/--model and --max-steps are defined only on the `tui` subcommand to avoid
+  // CommanderError "option already exists" (parent options are inherited by subcommands).
+  program
+    .option('--tui', 'Force Ink TUI even when stdin is not a TTY')
+    .option('--chat', 'Alias for --no-tui (force legacy chat REPL)');
+
+  // Explicit `klyro tui` command — always uses the Ink UI.
+  program
+    .command('tui')
+    .description('Start the Ink TUI REPL (same as bare `klyro` on a TTY)')
+    .option('-m, --model <id>', 'Model id (default: auto-detected)')
+    .option('--max-steps <n>', 'Max agent steps (default 30)', (v) => parsePositiveInt('--max-steps', v))
+    .action(async (opts: { model?: string; maxSteps?: number }) => {
+      const code = await startRepl({ model: opts.model, maxSteps: opts.maxSteps, forceTty: true });
+      process.exit(code);
+    });
+
   program
     .action(async () => {
+      const opts = program.opts<{ tui?: boolean; chat?: boolean }>();
+      const forceTui = opts.tui === true;
+      const forceLegacy = opts.chat === true || opts.tui === false;
+      if (forceTui) {
+        const code = await startRepl({ forceTty: true });
+        process.exit(code);
+      }
+      if (forceLegacy) {
+        await repl('You are a helpful assistant.');
+        return;
+      }
+      if (process.stdin.isTTY) {
+        const code = await startRepl();
+        process.exit(code);
+      }
+      // Non-TTY without explicit flag: explain UI requires TTY
+      process.stderr.write('klyro: no TTY detected — starting legacy REPL (pipe mode)\n');
+      process.stderr.write('  Tip: run `klyro tui` or `klyro --tui` to force the Ink UI, or `klyro --help` for options.\n');
       await repl('You are a helpful assistant.');
     });
 

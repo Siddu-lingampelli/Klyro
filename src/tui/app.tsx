@@ -11,7 +11,7 @@
  * translates them into transcript/status updates.
  */
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Box, Text, useInput } from 'ink';
 import { StatusLine, type StatusSnapshot } from './status.js';
 import { Transcript, type TranscriptItem } from './transcript.js';
@@ -35,6 +35,12 @@ export interface AppProps {
   initialStatus?: Partial<StatusSnapshot>;
   /** Optional approval bridge — when set, the modal prompts inline. */
   approvalBridge?: TuiApprovalBridge;
+  /** Called once after mount with direct hooks; also installs global compat hooks. */
+  onMounted?: (hooks: {
+    append: (i: TranscriptItem) => void;
+    updateStatus: (s: Partial<StatusSnapshot>) => void;
+    updatePlan: (p: PlanStep[]) => void;
+  }) => void;
 }
 
 let _itemCounter = 0;
@@ -67,22 +73,48 @@ export function App(props: AppProps): React.JSX.Element {
   }, [bridge]);
 
   const append = useCallback((item: TranscriptItem) => {
-    setTranscript((prev) => [...prev, item]);
+    setTranscript((prev) => {
+      const last = prev[prev.length - 1];
+      // Only coalesce when IDs match — separate turns have different IDs
+      if (
+        last?.kind === 'text' &&
+        item.kind === 'text' &&
+        last.role === 'assistant' &&
+        item.role === 'assistant' &&
+        last.id === item.id
+      ) {
+        return [...prev.slice(0, -1), { ...last, text: last.text + item.text } as TranscriptItem];
+      }
+      return [...prev, item];
+    });
   }, []);
 
+  const updateStatus = useCallback((s: Partial<StatusSnapshot>) => {
+    setStatus((prev) => ({ ...prev, ...s }));
+  }, []);
+
+  const updatePlan = useCallback((p: PlanStep[]) => {
+    setPlan(p);
+    setPlanExpanded(true);
+  }, []);
+
+  // Stabilize onMounted to avoid re-installing hooks on every parent re-render
+  const onMountedRef = useRef(props.onMounted);
+  useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
+
   useEffect(() => {
+    // Instance-local hooks via callback (preferred)
+    onMountedRef.current?.({ append, updateStatus, updatePlan });
+    // Global compat hooks for tests / legacy callers (single instance at a time)
     (globalThis as { __klyroAppAppend?: (i: TranscriptItem) => void }).__klyroAppAppend = append;
-    (globalThis as { __klyroAppStatus?: (s: Partial<StatusSnapshot>) => void }).__klyroAppStatus = (s) => setStatus((prev) => ({ ...prev, ...s }));
-    (globalThis as { __klyroAppPlan?: (p: PlanStep[]) => void }).__klyroAppPlan = (p) => {
-      setPlan(p);
-      setPlanExpanded(true);
-    };
+    (globalThis as { __klyroAppStatus?: (s: Partial<StatusSnapshot>) => void }).__klyroAppStatus = updateStatus;
+    (globalThis as { __klyroAppPlan?: (p: PlanStep[]) => void }).__klyroAppPlan = updatePlan;
     return () => {
       delete (globalThis as { __klyroAppAppend?: unknown }).__klyroAppAppend;
       delete (globalThis as { __klyroAppStatus?: unknown }).__klyroAppStatus;
       delete (globalThis as { __klyroAppPlan?: unknown }).__klyroAppPlan;
     };
-  }, [append]);
+  }, [append, updateStatus, updatePlan]);
 
   useInput((inputStr, key) => {
     if (status.status === 'running' || awaitingApproval) return;
