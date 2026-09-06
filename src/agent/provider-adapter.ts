@@ -17,6 +17,7 @@ import { redact } from '../policy/secret-redactor.js';
 
 export type StreamEvent =
   | { kind: 'text_delta'; text: string }
+  | { kind: 'thinking_delta'; text: string }
   | { kind: 'message_start'; id?: string; model?: string }
   | { kind: 'message_end'; finishReason?: string; usage?: { input: number; output: number } }
   | { kind: 'tool_call_start'; id: string; name: string }
@@ -306,6 +307,15 @@ async function* streamChatCompletions(
               (choice as unknown as { delta?: { text?: string } })?.delta?.text;
             if (typeof text === 'string' && text) {
               yield { kind: 'text_delta', text };
+            }
+            // Reasoning channel (DeepSeek-R1 / OpenRouter / vLLM et al. send
+            // `reasoning_content`; some proxies use `reasoning`). Shown dimmed
+            // while working, discarded when the answer completes.
+            const thinking =
+              (delta as { reasoning_content?: string })?.reasoning_content ??
+              (delta as { reasoning?: string })?.reasoning;
+            if (typeof thinking === 'string' && thinking) {
+              yield { kind: 'thinking_delta', text: thinking };
             }
             for (const tc of choice.delta.tool_calls ?? []) {
               if (tc.id && tc.function?.name) {

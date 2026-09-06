@@ -145,6 +145,33 @@ describe('App', () => {
     return out;
   }
 
+  // Polling assertions: hook-driven updates flush on React's schedule, so
+  // fixed sleeps flake under load. Poll the frame instead.
+  async function waitForMatch(getFrame: () => string | undefined, re: RegExp, timeout = 4000): Promise<string> {
+    const start = Date.now();
+    let frame = '';
+    for (;;) {
+      frame = getFrame() ?? '';
+      if (re.test(frame)) return frame;
+      if (Date.now() - start > timeout) {
+        throw new Error(`timed out waiting for ${re}\nlast frame:\n${frame.slice(0, 2000)}`);
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+  async function waitForAbsent(getFrame: () => string | undefined, re: RegExp, timeout = 4000): Promise<string> {
+    const start = Date.now();
+    let frame = '';
+    for (;;) {
+      frame = getFrame() ?? '';
+      if (!re.test(frame)) return frame;
+      if (Date.now() - start > timeout) {
+        throw new Error(`timed out waiting for absence of ${re}\nlast frame:\n${frame.slice(0, 2000)}`);
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
   // ANSI sequences Ink's parse-keypress recognizes.
   const KEY_HOME = '\x1b[H';
   const KEY_END = '\x1b[F';
@@ -408,14 +435,11 @@ describe('App', () => {
     expect(captured).not.toBeNull();
     // Wheel up ×12 (3 lines each = 36 > maxTop 32) → pinned at top.
     for (let i = 0; i < 12; i++) captured!.scrollLines(-3);
-    await new Promise((r) => setTimeout(r, 50));
-    const top = lastFrame() ?? '';
-    expect(top).toMatch(/MSG-00-tag/);
+    const top = await waitForMatch(lastFrame, /MSG-00-tag/);
     expect(top).not.toMatch(/MSG-24-tag/);
     // scrollToBottom → tail visible again.
     captured!.scrollToBottom();
-    await new Promise((r) => setTimeout(r, 50));
-    expect(lastFrame() ?? '').toMatch(/MSG-24-tag/);
+    await waitForMatch(lastFrame, /MSG-24-tag/);
   });
 
   it('idle Ctrl+C quits (design.md §18)', async () => {
@@ -537,19 +561,14 @@ describe('App', () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(handle).not.toBeNull();
     handle!.runTranscriptCommand('messages_half_page_up');
-    await new Promise((r) => setTimeout(r, 50));
-    let frame = lastFrame() ?? '';
     // Half page (10 lines) up from bottom (row 30 → 20): MSG-24 gone, MSG-14 in view.
-    expect(frame).not.toMatch(/MSG-24-tag/);
-    expect(frame).toMatch(/MSG-14-tag/);
+    await waitForAbsent(lastFrame, /MSG-24-tag/);
+    await waitForMatch(lastFrame, /MSG-14-tag/);
     handle!.runTranscriptCommand('messages_first');
-    await new Promise((r) => setTimeout(r, 50));
-    frame = lastFrame() ?? '';
-    expect(frame).toMatch(/MSG-00-tag/);
+    let frame = await waitForMatch(lastFrame, /MSG-00-tag/);
     expect(frame).not.toMatch(/MSG-24-tag/);
     handle!.runTranscriptCommand('messages_last');
-    await new Promise((r) => setTimeout(r, 50));
-    expect(lastFrame() ?? '').toMatch(/MSG-24-tag/);
+    await waitForMatch(lastFrame, /MSG-24-tag/);
   });
 
   it('tool result patches the running item in place (no stale spinner)', async () => {
@@ -573,13 +592,10 @@ describe('App', () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(hooks).not.toBeNull();
     hooks!.append({ id: 't1', kind: 'tool', name: 'read_file', id_call: 'c1', args: '{"path":"a.ts"}', status: 'running' });
-    await new Promise((r) => setTimeout(r, 50));
-    expect(lastFrame() ?? '').toMatch(/Read/);
+    await waitForMatch(lastFrame, /Read/);
     hooks!.updateTool('c1', { result: 'ok', isError: false, latencyMs: 42, status: 'done' });
-    await new Promise((r) => setTimeout(r, 50));
-    const frame = lastFrame() ?? '';
     // Resolved with real latency — exactly one group (start item patched, no duplicate).
-    expect(frame).toMatch(/42ms/);
+    const frame = await waitForMatch(lastFrame, /42ms/);
     expect(frame.match(/Read/g)?.length ?? 0).toBeLessThanOrEqual(2);
   });
 
@@ -635,10 +651,9 @@ describe('App', () => {
       .then((c) => {
         choice = c;
       });
-    await new Promise((r) => setTimeout(r, 80));
     // The modal must actually render — previously it never mounted, so every
     // policy 'ask' hung the runtime forever.
-    expect(lastFrame() ?? '').toMatch(/approval needed/i);
+    await waitForMatch(lastFrame, /approval needed/i);
     expect(bridge.resolve('deny')).toBe(true);
     await pending;
     expect(choice).toBe('deny');
@@ -684,12 +699,35 @@ describe('App', () => {
     );
     await new Promise((r) => setTimeout(r, 50));
     hooks!.append({ id: 't1', kind: 'tool', name: 'read_file', id_call: 'c1', args: '{"path":"a.ts"}', status: 'running' });
-    await new Promise((r) => setTimeout(r, 120));
     // Running group: spinner next to the verb (braille frame or fallback text).
-    expect(lastFrame() ?? '').toMatch(/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Read/);
+    await waitForMatch(lastFrame, /⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Read/);
     hooks!.updateTool('c1', { result: 'ok', isError: false, latencyMs: 42, status: 'done' });
+    await waitForMatch(lastFrame, /42ms/);
+  });
+
+  it('thinking shows dim while working, clears on response', async () => {
+    let hooks: {
+      appendThinkingDelta: (t: string) => void;
+      clearThinking: () => void;
+    } | null = null;
+    const { lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={true}
+        onMounted={(h) => {
+          hooks = { appendThinkingDelta: h.appendThinkingDelta, clearThinking: h.clearThinking };
+        }}
+      />,
+    );
     await new Promise((r) => setTimeout(r, 50));
-    expect(lastFrame() ?? '').toMatch(/42ms/);
+    expect(hooks).not.toBeNull();
+    hooks!.appendThinkingDelta('weighing two approaches... ');
+    hooks!.appendThinkingDelta('leaning to the second.');
+    await waitForMatch(lastFrame, /weighing two approaches\.\.\. leaning to the second\./);
+    // Answered: thinking goes away, only the response stays.
+    hooks!.clearThinking();
+    await waitForAbsent(lastFrame, /weighing two approaches/);
   });
 
   it('Shift+Up / Shift+Down scroll by one line', async () => {

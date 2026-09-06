@@ -118,6 +118,7 @@ export type RuntimeEvent =
   | { kind: 'step_start'; step: number }
   | { kind: 'step_end'; step: number }
   | { kind: 'text_delta'; text: string }
+  | { kind: 'thinking_delta'; text: string }
   | { kind: 'tool_call_start'; id: string; name: string }
   | { kind: 'tool_call_delta'; id: string; argsJson: string }
   | { kind: 'tool_call_end'; id: string; name: string; input: Record<string, unknown> }
@@ -355,6 +356,9 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
 
     const events = deps.adapter.stream(req);
     let textBuf = '';
+    // Thinking is ephemeral: streamed to the UI live, never stored in the
+    // transcript, and cleared when the turn's answer completes.
+    let thinkingBuf = '';
     const pendingToolCalls = new Map<string, { id: string; name: string; argsJson: string }>();
     let lastFinishReason: string | undefined;
 
@@ -363,6 +367,9 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       if (ev.kind === 'text_delta') {
         textBuf += ev.text;
         emit?.({ kind: 'text_delta', text: ev.text });
+      } else if (ev.kind === 'thinking_delta') {
+        thinkingBuf += ev.text;
+        emit?.({ kind: 'thinking_delta', text: ev.text });
       } else if (ev.kind === 'tool_call_start') {
         pendingToolCalls.set(ev.id, { id: ev.id, name: ev.name, argsJson: '' });
         emit?.({ kind: 'tool_call_start', id: ev.id, name: ev.name });

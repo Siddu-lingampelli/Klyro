@@ -39,7 +39,7 @@ export interface AppProps {
   initialTranscript?: TranscriptItem[];
   initialStatus?: Partial<StatusSnapshot>;
   approvalBridge?: TuiApprovalBridge;
-  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void; scrollHalfPage: (dir: -1 | 1) => void; scrollToTop: () => void; transcript: TranscriptScrollHandle; updateTool: (idCall: string, patch: ToolResultPatch) => void }) => void;
+  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void; scrollHalfPage: (dir: -1 | 1) => void; scrollToTop: () => void; transcript: TranscriptScrollHandle; updateTool: (idCall: string, patch: ToolResultPatch) => void; appendThinkingDelta: (text: string) => void; clearThinking: () => void }) => void;
   version?: string;
   isFullscreen?: boolean;
 }
@@ -323,6 +323,8 @@ export function App(props: AppProps): React.JSX.Element {
         out.push({ key: it.id, desc: { kind: 'user', text: it.text }, groupIndex: gi, tail: null });
       } else if (it.kind === 'text') {
         out.push({ key: it.id, desc: { kind: 'assistant', text: it.text }, groupIndex: gi, tail: null });
+      } else if (it.kind === 'thinking') {
+        out.push({ key: it.id, desc: { kind: 'reasoning', text: it.text }, groupIndex: gi, tail: null });
       } else if (it.kind === 'error') {
         out.push({ key: it.id, desc: { kind: 'error', message: it.message }, groupIndex: gi, tail: null });
       } else if (it.kind === 'policy') {
@@ -436,7 +438,19 @@ export function App(props: AppProps): React.JSX.Element {
     if (sid) setTranscript((prev) => { const idx = prev.findIndex((x) => x.id === sid); if (idx === -1) return [...prev, { id: sid, kind: 'text', text, role: 'assistant' } as TranscriptItem]; const cur = prev[idx] as Extract<TranscriptItem, { kind: 'text' }>; const copy = [...prev]; copy[idx] = { ...cur, text: cur.text + text } as TranscriptItem; return copy; });
     else { const id = nextId('stream'); streamingIdRef.current = id; setTranscript((prev) => [...prev, { id, kind: 'text', text, role: 'assistant' } as TranscriptItem]); }
   }, []);
-  useEffect(() => { if (status.status !== 'running') streamingIdRef.current = null; }, [status.status]);
+  // Ephemeral reasoning display: merges into one transient item (never in
+  // context/persistence); removed when the turn's answer completes.
+  const thinkingIdRef = useRef<string | null>(null);
+  const appendThinkingDelta = useCallback((text: string) => {
+    if (!text) return; const tid = thinkingIdRef.current;
+    if (tid) setTranscript((prev) => { const idx = prev.findIndex((x) => x.id === tid); if (idx === -1) return [...prev, { id: tid, kind: 'thinking', text } as TranscriptItem]; const cur = prev[idx] as Extract<TranscriptItem, { kind: 'thinking' }>; const copy = [...prev]; copy[idx] = { ...cur, text: cur.text + text } as TranscriptItem; return copy; });
+    else { const id = nextId('thinking'); thinkingIdRef.current = id; setTranscript((prev) => [...prev, { id, kind: 'thinking', text } as TranscriptItem]); }
+  }, []);
+  const clearThinking = useCallback(() => {
+    thinkingIdRef.current = null;
+    setTranscript((prev) => (prev.some((x) => x.kind === 'thinking') ? prev.filter((x) => x.kind !== 'thinking') : prev));
+  }, []);
+  useEffect(() => { if (status.status !== 'running') { streamingIdRef.current = null; thinkingIdRef.current = null; } }, [status.status]);
   const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
   const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
   // Tool results patch the running start-item IN PLACE (no second item, so a
@@ -486,7 +500,7 @@ export function App(props: AppProps): React.JSX.Element {
   );
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
-  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle, updateTool }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle, updateTool]);
+  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle, updateTool, appendThinkingDelta, clearThinking }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; (globalThis as unknown as Record<string, unknown>).__klyroAppendThinking = appendThinkingDelta; (globalThis as unknown as Record<string, unknown>).__klyroClearThinking = clearThinking; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendThinking; delete (globalThis as unknown as Record<string, unknown>).__klyroClearThinking; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle, updateTool, appendThinkingDelta, clearThinking]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
@@ -662,6 +676,8 @@ export function App(props: AppProps): React.JSX.Element {
                 </Box>
               );
             }
+            // Ephemeral reasoning: light-white while working, removed on response.
+            if (it.kind === 'thinking') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text wrap="wrap" color={tokens.colors.dim as string}>{it.text}</Text></Box>;
             if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.err as string}>  {g('guide')}   {g('failure')} {it.message}</Text></Box>;
             if (it.kind === 'policy') return null;
             if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;

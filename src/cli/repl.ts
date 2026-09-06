@@ -130,7 +130,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     | { kind: 'delta'; text: string }
     | { kind: 'status'; patch: Partial<import('../tui/status.js').StatusSnapshot> }
     | { kind: 'plan'; plan: import('../agent/runtime.js').PlanStep[] }
-    | { kind: 'toolupdate'; idCall: string; patch: import('../tui/transcript.js').ToolResultPatch };
+    | { kind: 'toolupdate'; idCall: string; patch: import('../tui/transcript.js').ToolResultPatch }
+    | { kind: 'thinking'; text: string };
   const pendingQueue: QueuedEvent[] = [];
   let isMounted = false;
   let directHooks:
@@ -146,6 +147,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         scrollToTop: () => void;
         transcript: import('../tui/transcript-commands.js').TranscriptScrollHandle;
         updateTool: (idCall: string, patch: import('../tui/transcript.js').ToolResultPatch) => void;
+        appendThinkingDelta: (text: string) => void;
+        clearThinking: () => void;
       }
     | undefined;
 
@@ -170,6 +173,18 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     if (!text) return;
     if (isMounted && directHooks) directHooks.appendDelta(text);
     else pendingQueue.push({ kind: 'delta', text });
+  }
+  // Ephemeral reasoning display (light-white while working, gone on response).
+  function queuedThinking(text: string): void {
+    if (!text) return;
+    if (isMounted && directHooks) directHooks.appendThinkingDelta(text);
+    else pendingQueue.push({ kind: 'thinking', text });
+  }
+  function clearThinking(): void {
+    for (let i = pendingQueue.length - 1; i >= 0; i--) {
+      if (pendingQueue[i]?.kind === 'thinking') pendingQueue.splice(i, 1);
+    }
+    if (isMounted && directHooks) directHooks.clearThinking();
   }
   // Tool results patch the running start-item in place (App.updateTool) so a
   // group resolves to done/error with its real latency instead of ticking
@@ -402,9 +417,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     try {
       for await (const ev of adapter.stream(req)) {
         if (ev.kind === 'text_delta') { text += ev.text; queuedDelta(ev.text); }
+        else if (ev.kind === 'thinking_delta') queuedThinking(ev.text);
         else if (ev.kind === 'error') throw new Error(ev.message);
       }
       lastAssistantText = text;
+      clearThinking();
       queuedStatus({ status: 'done' });
       return text;
     } catch (err) {
@@ -445,6 +462,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           else if (ev.kind === 'plan') hooks.updatePlan(ev.plan);
           else if (ev.kind === 'delta') hooks.appendDelta(ev.text);
           else if (ev.kind === 'toolupdate') hooks.updateTool(ev.idCall, ev.patch);
+          else if (ev.kind === 'thinking') hooks.appendThinkingDelta(ev.text);
           else hooks.append(ev.item);
         }
         pendingQueue.length = 0;
@@ -509,9 +527,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         let simpleText = '';
         for await (const ev of adapter.stream(simpleReq)) {
           if (ev.kind === 'text_delta') { simpleText += ev.text; queuedDelta(ev.text); }
+          else if (ev.kind === 'thinking_delta') queuedThinking(ev.text);
           else if (ev.kind === 'error') throw new Error(ev.message);
         }
         lastAssistantText = simpleText;
+        clearThinking();
         queuedStatus({ status: 'done' });
         return;
       } catch (err) {
@@ -538,9 +558,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           onEvent: (ev) => {
             if (ev.kind === 'step_start') {
               queuedStatus({ step: ev.step });
+              clearThinking(); // fresh reasoning display per step
             } else if (ev.kind === 'text_delta') {
               // single appendDelta path — App merges into one assistant item (Q→A order, no duplication)
               queuedDelta(ev.text);
+            } else if (ev.kind === 'thinking_delta') {
+              queuedThinking(ev.text);
             } else if (ev.kind === 'verification_started') {
               queuedAppend({ id: `vrfy-${Date.now()}`, kind: 'text', text: `[verify] running \`${ev.command}\``, role: 'assistant' });
               queuedStatus({ status: 'running' });
@@ -603,6 +626,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 });
               }
             } else if (ev.kind === 'final_text') {
+              // Response arrived: thinking display goes away, only the answer stays.
+              clearThinking();
               // streamingId is closed by status change; no extra handling needed
             } else if (ev.kind === 'usage') {
               queuedStatus({ usageInput: ev.input, usageOutput: ev.output });

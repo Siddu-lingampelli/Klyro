@@ -75,6 +75,7 @@ export function contentWidth(termWidth: number): number {
 export type BlockDesc =
   | { kind: 'user'; text: string }
   | { kind: 'assistant'; text: string }
+  | { kind: 'reasoning'; text: string }
   | { kind: 'group'; count: number; expanded: boolean; status: string; resultLen: number }
   | { kind: 'error'; message: string }
   | { kind: 'policy' }
@@ -93,6 +94,8 @@ export function blockHeight(b: BlockDesc, termWidth: number): number {
       return wrapCount(b.text, termWidth) + 1;
     case 'assistant':
       return 1 + wrapCount(b.text, cw) + 1;
+    case 'reasoning':
+      return wrapCount(b.text, cw) + 1;
     case 'group':
       if (!b.expanded) return 1 + 1;
       return 1 + Math.min(b.count, EXPANDED_DETAIL_CAP) + (b.count > EXPANDED_DETAIL_CAP ? 1 : 0) + 1;
@@ -123,6 +126,8 @@ export function blockSig(b: BlockDesc): string {
       return `u:${b.text.length}:${b.text.slice(0, 16)}:${b.text.slice(-16)}`;
     case 'assistant':
       return `a:${b.text.length}:${b.text.slice(0, 16)}:${b.text.slice(-16)}`;
+    case 'reasoning':
+      return `th:${b.text.length}:${b.text.slice(0, 16)}:${b.text.slice(-16)}`;
     case 'group':
       return `g:${b.count}:${b.expanded ? 1 : 0}:${b.status}:${b.resultLen}`;
     case 'error':

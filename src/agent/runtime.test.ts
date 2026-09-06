@@ -50,6 +50,31 @@ describe('runtime', () => {
     expect(r.finalText).toBe('Task done.');
   });
 
+  it('emits thinking deltas but keeps them out of the final text', async () => {
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'thinking_delta', text: 'considering options…' },
+        { kind: 'text_delta', text: 'Final answer.' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const seen: string[] = [];
+    const r = await run(
+      {
+        task: 'say hi', cwd, model: 'mock', maxSteps: 3, nonInteractive: true,
+        onEvent: (ev) => { if (ev.kind === 'thinking_delta') seen.push(ev.text); },
+      },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('complete');
+    expect(seen).toEqual(['considering options…']);
+    expect(r.finalText).toBe('Final answer.');
+    expect(r.transcript.some((m) => JSON.stringify(m.content).includes('considering'))).toBe(false);
+  });
+
   it('executes a tool call then completes', async () => {
     const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
     const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);

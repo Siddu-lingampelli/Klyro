@@ -11,6 +11,9 @@ import type { DiffHunk } from './diff.js';
 
 export type TranscriptItem =
   | { id: string; kind: 'text'; text: string; role: 'user' | 'assistant' }
+  // Ephemeral reasoning display: streamed dim while working, removed when
+  // the turn's answer completes (never persisted, never in context).
+  | { id: string; kind: 'thinking'; text: string }
   | {
       id: string;
       kind: 'tool';

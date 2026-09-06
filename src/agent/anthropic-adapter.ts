@@ -174,6 +174,8 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
   const toolBuffers = new Map<string, { name: string; argsJson: string }>();
   // Map content_block index → tool_use id (persists after tool completes to handle late deltas)
   const indexToToolId = new Map<number, string>();
+  // Active thinking-block index (Anthropic reasoning channel).
+  const thinkingState: { idx: number | null } = { idx: null };
   // message_stop already yields message_end — don't emit a second one at EOF.
   let sawMessageEnd = false;
 
@@ -206,7 +208,7 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
       for (const e of events) {
         let parsed: AnthropicSseEvent;
         try { parsed = JSON.parse(e.data) as AnthropicSseEvent; } catch { continue; }
-        const out = translateSse(e.event, parsed, toolBuffers, indexToToolId);
+        const out = translateSse(e.event, parsed, toolBuffers, indexToToolId, thinkingState);
         for (const ev of out) {
           if (ev.kind === 'message_end') sawMessageEnd = true;
           yield ev;
@@ -229,6 +231,7 @@ function translateSse(
   parsed: AnthropicSseEvent,
   toolBuffers: Map<string, { name: string; argsJson: string }>,
   indexToToolId: Map<number, string>,
+  thinking?: { idx: number | null },
 ): StreamEvent[] {
   const out: StreamEvent[] = [];
   switch (event) {
@@ -239,14 +242,18 @@ function translateSse(
         toolBuffers.set(block.id, { name: block.name, argsJson: '' });
         if (idx !== undefined) indexToToolId.set(idx, block.id);
         out.push({ kind: 'tool_call_start', id: block.id, name: block.name });
+      } else if ((block?.type === 'thinking' || block?.type === 'redacted_thinking') && thinking && idx !== undefined) {
+        thinking.idx = idx;
       }
       return out;
     }
     case 'content_block_delta': {
-      const delta = parsed.delta as { type?: string; text?: string; partial_json?: string } | undefined;
+      const delta = parsed.delta as { type?: string; text?: string; partial_json?: string; thinking?: string } | undefined;
       const index = parsed.index as number | undefined;
       if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
         out.push({ kind: 'text_delta', text: delta.text });
+      } else if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking) {
+        out.push({ kind: 'thinking_delta', text: delta.thinking });
       } else if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
         const id = findToolIdByIndex(index, toolBuffers, indexToToolId);
         if (id) {
@@ -261,6 +268,7 @@ function translateSse(
     }
     case 'content_block_stop': {
       const index = parsed.index as number | undefined;
+      if (thinking && index !== undefined && index === thinking.idx) thinking.idx = null;
       const id = findToolIdByIndex(index, toolBuffers, indexToToolId);
       if (id) {
         toolBuffers.delete(id);

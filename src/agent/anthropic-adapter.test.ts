@@ -219,6 +219,32 @@ describe('toAnthropicMessages', () => {
     expect(kinds).toContain('text_delta');
   });
 
+  it('emits thinking_delta for thinking blocks', async () => {
+    const fetchImpl = makeFetch(
+      sse([
+        ['message_start', { type: 'message_start' }],
+        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'hmm, ' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'let me see' } }],
+        ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+        ['content_block_start', { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'done' } }],
+        ['content_block_stop', { type: 'content_block_stop', index: 1 }],
+        ['message_stop', { type: 'message_stop' }],
+      ]),
+    );
+    const adapter = anthropicAdapter({ apiKey: 'k', baseURL: 'https://api.example.com', fetchImpl });
+    const req: CallRequest = { model: 'm', messages: [{ role: 'user', content: [{ kind: 'text', text: 'hi' }] }], tools: [] };
+    const thinking: string[] = [];
+    const texts: string[] = [];
+    for await (const ev of adapter.stream(req)) {
+      if (ev.kind === 'thinking_delta') thinking.push(ev.text);
+      if (ev.kind === 'text_delta') texts.push(ev.text);
+    }
+    expect(thinking.join('')).toBe('hmm, let me see');
+    expect(texts.join('')).toBe('done');
+  });
+
   it('hoists role=system into top-level system (not in messages)', () => {
     const msgs: Message[] = [
       { role: 'system', content: [{ kind: 'text', text: 'sysprompt' }] },

@@ -56,6 +56,12 @@ describe('blockHeight mirrors app.tsx render', () => {
   it('policy renders null → 0', () => {
     expect(blockHeight({ kind: 'policy' }, 100)).toBe(0);
   });
+  it('reasoning block = wrapped + margin, sig tracks text', () => {
+    expect(blockHeight({ kind: 'reasoning', text: 'hi' }, 100)).toBe(2);
+    expect(blockSig({ kind: 'reasoning', text: 'a' })).not.toBe(
+      blockSig({ kind: 'reasoning', text: 'a much longer thinking trace here' }),
+    );
+  });
 });
 
 describe('blockSig changes when content changes (I6)', () => {
