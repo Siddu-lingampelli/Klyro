@@ -93,9 +93,9 @@ describe('App', () => {
     expect(call?.kind).toBe('help');
   });
 
-  it('ignores Enter while status is running', async () => {
+  it('queues Enter while status is running (2.4)', async () => {
     const onPrompt = vi.fn(async () => {});
-    const { stdin } = render(
+    const { stdin, lastFrame } = render(
       <App
         initialModel="m"
         maxSteps={10}
@@ -109,7 +109,9 @@ describe('App', () => {
     await new Promise((r) => setTimeout(r, 20));
     stdin.write('\x0d');
     await new Promise((r) => setTimeout(r, 50));
-    expect(onPrompt).not.toHaveBeenCalled();
+    // Per TUI_DESIGN.md §5.2 queued message while running, not immediate
+    expect(lastFrame()).toMatch(/queued|hello/);
+    expect(onPrompt).not.toHaveBeenCalled(); // not yet, queued
   });
 
   it('routes /quit to onSlash as a quit command', async () => {

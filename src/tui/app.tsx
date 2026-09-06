@@ -1,29 +1,18 @@
 /**
- * Klyro TUI v2 — inline/scrollback architecture per TUI_DESIGN.md §1, §10-11
- * Four disciplines:
- * 1. History in <Static> — never re-rendered
- * 2. Only live region is dynamic
- * 3. Stream deltas batched at ~30fps
- * 4. Exactly one useInput owner
+ * Klyro Full-Screen TUI — TUI_DESIGN.md §2, §24, §38 (Phase 1-4)
+ * Full viewport, conversation, input, status bar — professional, dense, terminal-native
  */
 
-import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { Box, Text, Static, useInput, useStdout } from 'ink';
-import { Banner } from './banner.js';
-import { InputBox } from './input-box.js';
-import { ActivityLine } from './activity-line.js';
-import { ThinkingBlock } from './thinking-block.js';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Box, Text, useInput, useStdout, useStdin } from 'ink';
+import { Header } from './components/Header.js';
 import { StatusLine, type StatusSnapshot } from './status.js';
 import { Transcript, type TranscriptItem } from './transcript.js';
 import { ApprovalModal, TuiApprovalBridge } from './approval.js';
 import { PlanView } from './plan.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash } from '../cli/slash/parser.js';
-import { tokens, glyphs } from './tokens.js';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { tokens } from './tokens.js';
 
 export interface AppProps {
   initialModel: string;
@@ -44,31 +33,13 @@ export interface AppProps {
 let _id = 0;
 function nextId(p: string): string { _id++; return `${p}-${_id}`; }
 
-function getBranch(cwd: string): string {
-  try {
-    const r = spawnSync('git', ['branch', '--show-current'], { cwd, encoding: 'utf-8', timeout: 800, windowsHide: true });
-    if (r.status === 0 && r.stdout) return r.stdout.trim().slice(0, 40);
-  } catch {}
-  return '';
-}
-
-function getHistoryPath(): string {
-  return path.join(os.homedir() || process.cwd(), '.klyro', 'history');
-}
-
 export function App(props: AppProps): React.JSX.Element {
-  // Scrollback — committed once to <Static>, never re-rendered (discipline 1)
-  const [staticItems, setStaticItems] = useState<TranscriptItem[]>(props.initialTranscript ?? []);
-  // Live region — only current turn's streaming text / active tool / activity
-  const [liveText, setLiveText] = useState<string>('');
-  const [liveThinking, setLiveThinking] = useState<string>('');
-  const [isThinkingExpanded, setThinkingExpanded] = useState(false);
-  const [activity, setActivity] = useState<{ verb: string; start: number } | null>(null);
+  const { stdout } = useStdout();
+  const [transcript, setTranscript] = useState<TranscriptItem[]>(props.initialTranscript ?? []);
   const [input, setInput] = useState('');
   const [bridge] = useState(() => props.approvalBridge ?? new TuiApprovalBridge());
   const [awaitingApproval, setAwaitingApproval] = useState(false);
   const [plan, setPlan] = useState<PlanStep[]>([]);
-  const [planExpanded, setPlanExpanded] = useState(false);
   const [status, setStatus] = useState<StatusSnapshot>({
     model: props.initialModel,
     step: 0,
@@ -79,77 +50,48 @@ export function App(props: AppProps): React.JSX.Element {
     status: 'idle',
     ...props.initialStatus,
   });
-  const [history, setHistory] = useState<string[]>(() => {
-    try {
-      const raw = fs.readFileSync(getHistoryPath(), 'utf-8');
-      return raw.split('\n').filter(Boolean).slice(-200).map((l) => {
-        try { const o = JSON.parse(l) as { cwd?: string; text?: string }; return o.cwd === props.cwd ? o.text ?? '' : ''; } catch { return l; }
-      }).filter(Boolean);
-    } catch { return []; }
-  });
-  const histIdx = useRef(-1);
-  const lastCtrlC = useRef(0);
+  const [elapsed, setElapsed] = useState(0);
   const [queued, setQueued] = useState<string | null>(null);
-  const [gitBranch, setGitBranch] = useState(() => getBranch(props.cwd));
-  const batchRef = useRef<string>('');
-  const batchTimer = useRef<NodeJS.Timeout | null>(null);
-
-  useEffect(() => {
-    const t = setInterval(() => setGitBranch(getBranch(props.cwd)), 5000);
-    return () => clearInterval(t);
-  }, [props.cwd]);
 
   useEffect(() => bridge.subscribe((p) => setAwaitingApproval(p !== null)), [bridge]);
 
-  // Batched delta handler — 30fps (discipline 3)
-  const flushBatch = useCallback(() => {
-    if (batchRef.current) {
-      const chunk = batchRef.current;
-      batchRef.current = '';
-      setLiveText((prev) => prev + chunk);
+  // 2.4 — send queued when idle
+  useEffect(() => {
+    if (queued && status.status !== 'running' && !awaitingApproval) {
+      const toSend = queued;
+      setQueued(null);
+      const item: TranscriptItem = { id: nextId('text'), kind: 'text', text: toSend, role: 'user' };
+      setTranscript((prev) => [...prev, item]);
+      const cmd = parseSlash(toSend.trim());
+      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text);
+      else void props.onSlash(cmd);
     }
-    if (batchTimer.current) {
-      clearTimeout(batchTimer.current);
-      batchTimer.current = null;
-    }
+  }, [queued, status.status, awaitingApproval]);
+  useEffect(() => {
+    if (status.status !== 'running') return;
+    const start = Date.now() - elapsed;
+    const t = setInterval(() => setElapsed(Date.now() - start), 1000);
+    return () => clearInterval(t);
+  }, [status.status, elapsed]);
+
+  const append = useCallback((item: TranscriptItem) => {
+    setTranscript((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.kind === 'text' && item.kind === 'text' && last.role === 'assistant' && item.role === 'assistant' && last.id === item.id) {
+        return [...prev.slice(0, -1), { ...last, text: last.text + item.text } as TranscriptItem];
+      }
+      return [...prev, item];
+    });
   }, []);
 
-  const appendDeltaBatched = useCallback((text: string) => {
-    batchRef.current += text;
-    if (!batchTimer.current) {
-      batchTimer.current = setTimeout(flushBatch, 33); // ~30fps
-    }
-  }, [flushBatch]);
-
-  // Commit live region to scrollback atomically (discipline 1)
-  const commitLive = useCallback(() => {
-    flushBatch();
-    if (liveText) {
-      const item: TranscriptItem = { id: nextId('text'), kind: 'text', text: liveText, role: 'assistant' };
-      setStaticItems((prev) => [...prev, item]);
-      setLiveText('');
-    }
-    if (liveThinking) {
-      // Thinking is not committed unless expanded — spec says collapsed by default
-      setLiveThinking('');
-    }
-    setActivity(null);
-  }, [liveText, liveThinking, flushBatch]);
-
-  const appendStatic = useCallback((item: TranscriptItem) => {
-    // If live text is pending, commit first
-    if (liveText) commitLive();
-    setStaticItems((prev) => [...prev, item]);
-  }, [liveText, commitLive]);
-
   const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
-  const updatePlan = useCallback((p: PlanStep[]) => { setPlan(p); setPlanExpanded(true); }, []);
+  const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
 
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
   useEffect(() => {
-    onMountedRef.current?.({ append: appendStatic, updateStatus, updatePlan });
-    (globalThis as unknown as { __klyroAppAppend?: unknown }).__klyroAppAppend = appendStatic;
+    onMountedRef.current?.({ append, updateStatus, updatePlan });
+    (globalThis as unknown as { __klyroAppAppend?: unknown }).__klyroAppAppend = append;
     (globalThis as unknown as { __klyroAppStatus?: unknown }).__klyroAppStatus = updateStatus;
     (globalThis as unknown as { __klyroAppPlan?: unknown }).__klyroAppPlan = updatePlan;
     return () => {
@@ -157,35 +99,11 @@ export function App(props: AppProps): React.JSX.Element {
       delete (globalThis as unknown as { __klyroAppStatus?: unknown }).__klyroAppStatus;
       delete (globalThis as unknown as { __klyroAppPlan?: unknown }).__klyroAppPlan;
     };
-  }, [appendStatic, updateStatus, updatePlan]);
+  }, [append, updateStatus, updatePlan]);
 
-  // Also handle batched text via global hook for streaming
-  useEffect(() => {
-    const origAppend = appendStatic;
-    (globalThis as unknown as { __klyroAppendDelta?: (t: string) => void }).__klyroAppendDelta = appendDeltaBatched;
-    return () => { delete (globalThis as unknown as { __klyroAppendDelta?: unknown }).__klyroAppendDelta; };
-  }, [appendDeltaBatched, appendStatic]);
-
-  // Queue handling (2.4)
-  useEffect(() => {
-    if (queued && status.status !== 'running' && !awaitingApproval) {
-      const toSend = queued;
-      setQueued(null);
-      const trimmed = toSend.trim();
-      if (!trimmed) return;
-      const item: TranscriptItem = { id: nextId('text'), kind: 'text', text: toSend, role: 'user' };
-      setStaticItems((prev) => [...prev, item]);
-      try { fs.mkdirSync(path.dirname(getHistoryPath()), { recursive: true }); fs.appendFileSync(getHistoryPath(), JSON.stringify({ cwd: props.cwd, text: toSend, ts: Date.now() }) + '\n'); } catch {}
-      const cmd = parseSlash(trimmed);
-      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text);
-      else void props.onSlash(cmd);
-    }
-  }, [queued, status.status, awaitingApproval]);
-
-  // Single useInput owner (discipline 4)
+  // Single useInput owner — handles queued when running (2.4)
   useInput((inputStr, key) => {
-    if (awaitingApproval) return; // approval modal owns input
-
+    if (awaitingApproval) return;
     if (status.status === 'running') {
       if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
       if (key.return) {
@@ -193,171 +111,103 @@ export function App(props: AppProps): React.JSX.Element {
         if (!v) return;
         setQueued(v);
         setInput('');
-        // Show queued indicator in live region
+        setTranscript((prev) => [...prev, { id: nextId('text'), kind: 'text', text: `queued: ${v.slice(0, 80)}`, role: 'assistant' } as TranscriptItem]);
         return;
       }
-      if (key.ctrl && inputStr === 't') { setThinkingExpanded((v) => !v); return; }
-      return;
-    }
-
-    if (key.upArrow) {
-      if (history.length === 0) return;
-      if (histIdx.current === -1) histIdx.current = history.length - 1;
-      else if (histIdx.current > 0) histIdx.current--;
-      setInput(history[histIdx.current] ?? '');
-      return;
-    }
-    if (key.downArrow) {
-      if (histIdx.current === -1) return;
-      histIdx.current++;
-      if (histIdx.current >= history.length) { histIdx.current = -1; setInput(''); }
-      else setInput(history[histIdx.current] ?? '');
-      return;
-    }
-    if (key.ctrl && inputStr === 'r') {
-      const term = input.toLowerCase();
-      for (let i = history.length - 1; i >= 0; i--) if (history[i]!.toLowerCase().includes(term)) { setInput(history[i]!); return; }
+      if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
+      if (!key.ctrl && !key.meta) {
+        const norm = inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        setInput((v) => v + norm);
+      }
       return;
     }
     if (key.return) {
-      const isShift = (key as unknown as { shift?: boolean }).shift === true;
-      if (isShift || input.endsWith('\\')) {
-        if (input.endsWith('\\')) setInput((v) => v.slice(0, -1) + '\n');
-        else setInput((v) => v + '\n');
-        return;
-      }
-      const value = input;
-      const trimmed = value.replace(/^\s+|\s+$/g, '');
-      if (!trimmed) { setInput(''); return; }
-      // @ and ! handling
-      if (trimmed.startsWith('@')) {
-        const atPath = trimmed.slice(1).trim().split(' ')[0] ?? '';
-        setInput('');
-        setStaticItems((prev) => [...prev, { id: nextId('text'), kind: 'text', text: value, role: 'user' } as TranscriptItem]);
-        void props.onPrompt(`Reference file: ${atPath}`);
-        return;
-      }
-      if (trimmed.startsWith('!')) {
-        const cmdText = trimmed.slice(1).trim();
-        setInput('');
-        setStaticItems((prev) => [...prev, { id: nextId('text'), kind: 'text', text: value, role: 'user' } as TranscriptItem]);
-        import('../tools/shell/shell-exec.js').then(async ({ shellExecTool }) => {
-          const { builtinRegistry } = await import('../tools/registry.js');
-          const reg = builtinRegistry();
-          const r = await reg.execute('shell_exec', { command: cmdText }, { cwd: props.cwd, env: process.env, nonInteractive: true });
-          const out = r.ok ? JSON.stringify(r.value).slice(0, 500) : String((r as unknown as { error: { message: string } }).error.message);
-          setStaticItems((prev) => [...prev, { id: nextId('text'), kind: 'text', text: `!${cmdText}\n${out}`, role: 'assistant' } as TranscriptItem]);
-        });
-        return;
-      }
-      if (trimmed.startsWith('# ')) {
-        const note = trimmed.slice(2).trim();
-        import('node:fs/promises').then(async (fs) => {
-          const p = path.join(props.cwd, '.klyro', 'memory', 'session-notes.md');
-          await fs.mkdir(path.dirname(p), { recursive: true });
-          await fs.appendFile(p, `- ${note}\n`, 'utf-8');
-        });
-        setInput('');
-        setStaticItems((prev) => [...prev, { id: nextId('text'), kind: 'text', text: `Note saved: ${note}`, role: 'assistant' } as TranscriptItem]);
-        return;
-      }
+      const v = input.trim();
+      if (!v) return;
       setInput('');
-      histIdx.current = -1;
-      setHistory((prev) => {
-        const next = [...prev, value];
-        try { fs.mkdirSync(path.dirname(getHistoryPath()), { recursive: true }); fs.appendFileSync(getHistoryPath(), JSON.stringify({ cwd: props.cwd, text: value, ts: Date.now() }) + '\n'); } catch {}
-        return next.slice(-200);
-      });
-      const userItem: TranscriptItem = { id: nextId('text'), kind: 'text', text: value, role: 'user' };
-      setStaticItems((prev) => [...prev, userItem]);
-      const cmd = parseSlash(trimmed);
+      const item: TranscriptItem = { id: nextId('text'), kind: 'text', text: v, role: 'user' };
+      setTranscript((prev) => [...prev, item]);
+      const cmd = parseSlash(v);
       if (cmd.kind === 'prompt') void props.onPrompt(cmd.text);
       else void props.onSlash(cmd);
       return;
     }
     if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
-    if (key.ctrl && inputStr === 'c') {
-      if (input === '') {
-        const now = Date.now();
-        if (now - lastCtrlC.current < 1500) { void props.onSlash({ kind: 'quit' }); return; }
-        lastCtrlC.current = now;
-        setStaticItems((prev) => [...prev, { id: nextId('text'), kind: 'text', text: '(press Ctrl+C again to exit)', role: 'assistant' } as TranscriptItem]);
-        return;
-      }
-      setInput(''); return;
-    }
-    if (key.ctrl && inputStr === 'd') { void props.onSlash({ kind: 'quit' }); return; }
-    if (key.ctrl && inputStr === 'l') { setStaticItems((prev) => [...prev, { id: nextId('text'), kind: 'text', text: '(cleared)', role: 'assistant' } as TranscriptItem]); return; }
-    if (key.ctrl && inputStr === 't') { setThinkingExpanded((v) => !v); return; }
-    if (!key.ctrl && !key.meta) {
-      const norm = inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-      setInput((v) => v + norm);
-    }
+    if (!key.ctrl && !key.meta) setInput((v) => v + inputStr);
   });
 
-  const promptStr = `klyro › ${path.basename(props.cwd)}${gitBranch ? ` (${gitBranch})` : ''}`;
+  const width = stdout?.columns ?? 100;
+  const height = stdout?.rows ?? 30;
+  const isSmall = width < 80;
 
   return (
-    <Box flexDirection="column" width="100%">
-      {/* Banner — session start, per 5.1 */}
-      <Banner
-        version="0.1.8"
-        cwd={props.cwd}
-        branch={gitBranch}
-        model={status.model}
-        klyroMdLoaded={false}
-        packageManager="pnpm"
-        testRunner="vitest"
-      />
-      {/* Legacy header/status for test compatibility */}
-      <Box flexDirection="column" width="100%">
-        <Box borderStyle="single" borderColor={tokens.ansi.accent as unknown as string} paddingX={1} flexDirection="row" justifyContent="space-between">
-          <Box><Text color={tokens.ansi.accent as unknown as string} bold>KLYRO</Text><Text color={tokens.ansi.muted as unknown as string}>  {path.basename(props.cwd)}</Text></Box>
-          <Box><Text color={tokens.ansi.muted as unknown as string}>{status.model}  step {status.step}/{status.maxSteps}</Text></Box>
-        </Box>
-        <StatusLine snapshot={status} />
+    <Box flexDirection="column" width={width} height={height - 1}>
+      {/* Header — compact, per §3 — shows version, model, cwd, step, status */}
+      <Box flexDirection="column" borderStyle="single" borderColor={tokens.ansi.border as unknown as string} paddingX={1}>
+        <Text bold>KLYRO v0.1.10</Text>
+        <Text color={tokens.ansi.muted as unknown as string}>{status.model} · API Usage Billing · step {status.step}/{status.maxSteps} · {status.status} · repairs {status.repairs}</Text>
+        <Text color={tokens.ansi.muted as unknown as string}>{props.cwd}</Text>
       </Box>
-      <Static items={staticItems}>
-        {(item) => (
-          <Box key={item.id} flexDirection="column" width="100%">
-            {item.kind === 'text' && item.role === 'user' ? (
-              <Box><Text color={tokens.ansi.accent as unknown as string}>{glyphs.prompt} </Text><Text>{item.text}</Text></Box>
-            ) : item.kind === 'text' ? (
-              <Box paddingLeft={2}><Text>{item.text}</Text></Box>
-            ) : (
-              <Transcript items={[item]} />
-            )}
-          </Box>
-        )}
-      </Static>
 
-      {/* Live region — only dynamic part */}
-      <Box flexDirection="column" width="100%">
-        {liveThinking ? (
-          <Box paddingX={1}>
-            <Text color={tokens.ansi.muted as unknown as string} dimColor>∴ Thinking…</Text>
-            {isThinkingExpanded ? <Text color={tokens.ansi.muted as unknown as string} dimColor> {liveThinking}</Text> : <Text color={tokens.ansi.muted as unknown as string} dimColor> ctrl+t to show</Text>}
+      {/* Conversation — scrollable, per §4 */}
+      <Box flexDirection="column" flexGrow={1} overflow="hidden" paddingX={1} paddingY={1}>
+        {transcript.length === 0 ? (
+          <Box flexDirection="column">
+            <Text color={tokens.ansi.muted as unknown as string}>No conversation yet. Try "fix the failing login test"</Text>
+          </Box>
+        ) : (
+          transcript.map((item) => (
+            <Box key={item.id} flexDirection="column" marginBottom={1}>
+              {item.kind === 'text' && item.role === 'user' ? (
+                <Text>› {item.text}</Text>
+              ) : item.kind === 'text' ? (
+                <Text>  {item.text}</Text>
+              ) : item.kind === 'tool' ? (
+                <Box flexDirection="column" borderStyle="round" borderColor={tokens.ansi.border as unknown as string} paddingX={1}>
+                  <Text>{item.name} {item.isError ? '✗' : '✓'} {item.latencyMs ?? 0}ms</Text>
+                  {item.result ? <Text color={tokens.ansi.muted as unknown as string}>{String(item.result).slice(0, 200)}</Text> : null}
+                </Box>
+              ) : item.kind === 'diff' ? (
+                <Box flexDirection="column" borderStyle="round" borderColor={tokens.ansi.border as unknown as string} paddingX={1}>
+                  <Text bold>{item.summary ?? 'Diff'}</Text>
+                  {item.hunks.map((h, i) => (
+                    <Box key={i} flexDirection="column" marginTop={1}>
+                      <Text color={tokens.ansi.info as unknown as string}>{h.path}</Text>
+                      {h.lines.map((l, j) => (
+                        <Text key={j} color={l.kind === 'add' ? (tokens.ansi.success as unknown as string) : l.kind === 'remove' ? (tokens.ansi.error as unknown as string) : (tokens.ansi.muted as unknown as string)}>
+                          {l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}
+                        </Text>
+                      ))}
+                    </Box>
+                  ))}
+                </Box>
+              ) : (
+                <Transcript items={[item]} />
+              )}
+            </Box>
+          ))
+        )}
+        {status.status === 'running' ? (
+          <Box>
+            <Text color={tokens.ansi.info as unknown as string}>✦ Thinking...</Text>
+            <Text color={tokens.ansi.muted as unknown as string}> · {Math.round(elapsed / 1000)}s</Text>
           </Box>
         ) : null}
-        {liveText ? (
-          <Box paddingX={1} flexDirection="column">
-            <Text>{liveText}▍</Text>
-          </Box>
-        ) : null}
-        {activity ? (
-          <ActivityLine verb={activity.verb} elapsedMs={Date.now() - activity.start} hint="esc to interrupt" />
-        ) : null}
-        {queued ? (
-          <Box paddingX={1}><Text color={tokens.ansi.muted as unknown as string} dimColor>⏳ queued: "{queued.slice(0, 60)}"</Text></Box>
-        ) : null}
-        <Box borderStyle="round" borderColor={awaitingApproval ? (tokens.ansi.warning as unknown as string) : (tokens.ansi.accent as unknown as string)} paddingX={1}>
-          <Text color={tokens.ansi.muted as unknown as string} dimColor>{promptStr} </Text>
-          <Text>{input}▏</Text>
-        </Box>
-        <Box paddingX={1} justifyContent="space-between">
-          <Text color={tokens.ansi.muted as unknown as string} dimColor>Tab: slash completion · Shift+Enter: newline · Ctrl+C twice: exit</Text>
-          <Text color={tokens.ansi.muted as unknown as string} dimColor>{status.model} · ctx {Math.round(((status.usageInput + status.usageOutput)/128000)*100)}% · ${((status.usageInput/1000)*0.003 + (status.usageOutput/1000)*0.015).toFixed(2)}</Text>
-        </Box>
+        {plan.length > 0 ? <PlanView steps={plan} expanded={false} onToggle={() => {}} /> : null}
+      </Box>
+
+      {/* Input — always at bottom, per §15 */}
+      <Box borderStyle="single" borderColor={tokens.ansi.accent as unknown as string} paddingX={1}>
+        <Text>› </Text>
+        <Text>{input}▏</Text>
+      </Box>
+
+      {/* Status Bar — per §17 */}
+      <Box justifyContent="space-between" paddingX={1} borderStyle="single" borderColor={tokens.ansi.border as unknown as string}>
+        <Text color={tokens.ansi.muted as unknown as string}>
+          {status.model} · {status.usageInput + status.usageOutput} tokens · ${(status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015).toFixed(2)} · {Math.round(elapsed / 1000)}s
+        </Text>
+        <Text color={tokens.ansi.muted as unknown as string}>{isSmall ? 'Ctrl+C interrupt' : 'Ctrl+C interrupt · Ctrl+O expand · ↑↓ scroll'}</Text>
       </Box>
     </Box>
   );
