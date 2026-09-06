@@ -95,6 +95,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // --- Ordered queued bridge with instance-local hooks (no global singleton) ---
   type QueuedEvent =
     | { kind: 'append'; item: import('../tui/transcript.js').TranscriptItem }
+    | { kind: 'delta'; text: string }
     | { kind: 'status'; patch: Partial<import('../tui/status.js').StatusSnapshot> }
     | { kind: 'plan'; plan: import('../agent/runtime.js').PlanStep[] };
   const pendingQueue: QueuedEvent[] = [];
@@ -102,6 +103,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   let directHooks:
     | {
         append: (i: import('../tui/transcript.js').TranscriptItem) => void;
+        appendDelta: (text: string) => void;
         updateStatus: (s: Partial<import('../tui/status.js').StatusSnapshot>) => void;
         updatePlan: (p: import('../agent/runtime.js').PlanStep[]) => void;
       }
@@ -110,6 +112,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   function queuedAppend(item: import('../tui/transcript.js').TranscriptItem): void {
     if (isMounted && directHooks) directHooks.append(item);
     else pendingQueue.push({ kind: 'append', item });
+  }
+  function queuedDelta(text: string): void {
+    if (!text) return;
+    if (isMounted && directHooks) directHooks.appendDelta(text);
+    else pendingQueue.push({ kind: 'delta', text });
   }
   function queuedStatus(s: Partial<import('../tui/status.js').StatusSnapshot>): void {
     lastStatus = { ...(lastStatus ?? { model: model ?? '', step: 0, maxSteps: opts.maxSteps ?? 30, usageInput: 0, usageOutput: 0, repairs: 0, status: 'idle' } as import('../tui/status.js').StatusSnapshot), ...s };
@@ -149,6 +156,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         for (const ev of pendingQueue) {
           if (ev.kind === 'status') hooks.updateStatus(ev.patch);
           else if (ev.kind === 'plan') hooks.updatePlan(ev.plan);
+          else if (ev.kind === 'delta') hooks.appendDelta(ev.text);
           else hooks.append(ev.item);
         }
         pendingQueue.length = 0;
@@ -188,8 +196,6 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
     }
     queuedStatus({ status: 'running', step: 0, model });
-    let textBuf = '';
-    let pendingTextId: string | null = null;
     let activeCallId: string | null = null;
     let activeCallName: string | null = null;
     let activeCallArgs = '';
@@ -206,34 +212,10 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           persist: sessionId ? { store: tuiStore, sessionId } : undefined,
           onEvent: (ev) => {
             if (ev.kind === 'step_start') {
-              // Flush coalesced text before new step
-              pendingTextId = null;
               queuedStatus({ step: ev.step });
             } else if (ev.kind === 'text_delta') {
-              textBuf += ev.text;
-              // Try full-screen live region first (batched 30fps)
-              const g = globalThis as unknown as { __klyroAppendDelta?: (t: string) => void };
-              if (isMounted && g.__klyroAppendDelta) {
-                g.__klyroAppendDelta(ev.text);
-                // Also keep coalescing for fallback inline mode
-                if (!pendingTextId) pendingTextId = `text-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-                return;
-              }
-              // Fallback inline mode: coalesce via queuedAppend
-              if (pendingTextId) {
-                const last = pendingQueue[pendingQueue.length - 1];
-                if (last?.kind === 'append' && last.item.kind === 'text' && last.item.id === pendingTextId) {
-                  last.item.text += ev.text;
-                  return;
-                }
-              }
-              if (pendingTextId && isMounted) {
-                queuedAppend({ id: pendingTextId, kind: 'text', text: ev.text, role: 'assistant' });
-                return;
-              }
-              const id = `text-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-              pendingTextId = id;
-              queuedAppend({ id, kind: 'text', text: ev.text, role: 'assistant' });
+              // single appendDelta path — App merges into one assistant item (Q→A order, no duplication)
+              queuedDelta(ev.text);
             } else if (ev.kind === 'verification_started') {
               queuedAppend({ id: `vrfy-${Date.now()}`, kind: 'text', text: `[verify] running \`${ev.command}\``, role: 'assistant' });
               queuedStatus({ status: 'running' });
@@ -283,16 +265,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 status: ev.isError ? 'error' : 'done',
               });
             } else if (ev.kind === 'final_text') {
-              // Commit live region for both inline and full-screen TUI
-              const g2 = globalThis as unknown as { __klyroCommitLive?: () => void };
-              g2.__klyroCommitLive?.();
-              pendingTextId = null;
-              // For full-screen, also ensure liveText is committed if any remaining
-              if (ev.text) {
-                const g3 = globalThis as unknown as { __klyroAppendDelta?: (t: string) => void };
-                // If liveText was batched, ensure it's flushed and committed
-                g2.__klyroCommitLive?.();
-              }
+              // streamingId is closed by status change; no extra handling needed
             } else if (ev.kind === 'usage') {
               queuedStatus({ usageInput: ev.input, usageOutput: ev.output });
             } else if (ev.kind === 'plan_update') {
