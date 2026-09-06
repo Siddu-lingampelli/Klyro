@@ -768,7 +768,7 @@ export function App(props: AppProps): React.JSX.Element {
       </Box>
       <Box justifyContent="space-between" flexShrink={0}>
         <Text color={tokens.colors.dim as string}>{status.status === 'running' ? (<Text color={tokens.colors.accent as string}><Spinner type="dots" /> working  ·  </Text>) : null}{baseHints}{maxTop > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
-        <Text color={tokens.colors.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct}% ctx · {status.model}{status.status === 'running' ? ' ●' : ''}</Text>
+        <Text color={tokens.colors.dim as string}>{maxTop > 0 && isFullscreen ? `⇅ ${topRow}/${maxTop} · ` : ''}{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct}% ctx · {status.model}{status.status === 'running' ? ' ●' : ''}</Text>
       </Box>
     </Box>
   );

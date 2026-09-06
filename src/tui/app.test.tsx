@@ -862,6 +862,24 @@ describe('App', () => {
     expect(badge).toMatch(/↓ 3 new/);
   });
 
+  it('status bar shows scroll position when content overflows', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    // At bottom: topRow == maxTop, indicator shows position.
+    expect(lastFrame() ?? '').toMatch(/⇅ \d+\/\d+/);
+    // Pinned to top: position shows 0/N.
+    stdin.write(KEY_HOME);
+    const top = await waitForMatch(lastFrame, /⇅ 0\/\d+/);
+    expect(top).toMatch(/MSG-00-tag/);
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App
