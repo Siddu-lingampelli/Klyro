@@ -109,6 +109,27 @@ describe('App visual snapshot', () => {
     expect(frame).toMatch(/modified|\~/);
   });
 
+  it('renders markdown without leaking markers (design.md §23)', () => {
+    const { lastFrame } = render(
+      <App {...DEFAULT_PROPS}
+        initialModel="gpt-4o-mini"
+        maxSteps={30}
+        initialStatus={{ status: 'idle', model: 'gpt-4o-mini', step: 0, maxSteps: 30, usageInput: 0, usageOutput: 0, repairs: 0 }}
+        initialTranscript={[
+          { id: 'm1', kind: 'text', text: '## Done\n\nDid **the thing** with `npm test`.\n\nSee [docs](https://x.example).', role: 'assistant' },
+        ]}
+      />
+    );
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('Done');
+    expect(frame).toContain('the thing');
+    expect(frame).toContain('npm test');
+    expect(frame).toContain('docs');
+    expect(frame).not.toContain('**');
+    expect(frame).not.toContain('## Done');
+    expect(frame).not.toContain('`npm test`');
+  });
+
   it('diff transcript item renders the diff box', () => {
     const { lastFrame } = render(
       <App {...DEFAULT_PROPS}

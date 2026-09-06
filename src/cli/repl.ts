@@ -139,6 +139,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         clearTranscript: () => void;
         scrollLines: (delta: number) => void;
         scrollToBottom: () => void;
+        scrollHalfPage: (dir: -1 | 1) => void;
+        scrollToTop: () => void;
       }
     | undefined;
 

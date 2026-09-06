@@ -200,7 +200,7 @@ describe('App', () => {
     expect(bottom).not.toMatch(/MSG-00-tag/);
   });
 
-  it('PageUp/PageDown snap to message boundaries', async () => {
+  it('PageUp/PageDown move a half page (design.md §11)', async () => {
     const { stdin, lastFrame } = render(
       <App
         initialModel="m"
@@ -213,8 +213,8 @@ describe('App', () => {
       />,
     );
     await new Promise((r) => setTimeout(r, 50));
-    // Go to top, then PageDown 3 times. Each PageDown should land on a message
-    // boundary, so visible window starts at one of the seeded indices.
+    // Go to top, then PageDown 3 times. Half page = 10 lines = 5 items, so
+    // 3 × PageDown lands on MSG-15 (design.md §11 half-page behavior).
     stdin.write(KEY_HOME);
     await new Promise((r) => setTimeout(r, 30));
     stdin.write(KEY_PGDN);
@@ -224,11 +224,15 @@ describe('App', () => {
     stdin.write(KEY_PGDN);
     await new Promise((r) => setTimeout(r, 30));
     const frame = lastFrame() ?? '';
-    // After 3 PageDowns from top, the earliest visible item should be MSG-03
-    // (snap-to-message keeps the boundary on the first visible row). We assert
-    // that MSG-03 is visible and MSG-00 is not.
-    expect(frame).toMatch(/MSG-03-tag/);
+    expect(frame).toMatch(/MSG-15-tag/);
     expect(frame).not.toMatch(/MSG-00-tag/);
+    // And PageUp twice comes back up by the same step.
+    stdin.write(KEY_PGUP);
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write(KEY_PGUP);
+    await new Promise((r) => setTimeout(r, 30));
+    const back = lastFrame() ?? '';
+    expect(back).toMatch(/MSG-05-tag/);
   });
 
   it('pins to top: new content does NOT auto-scroll when user has scrolled up', async () => {
@@ -412,6 +416,79 @@ describe('App', () => {
     captured!.scrollToBottom();
     await new Promise((r) => setTimeout(r, 50));
     expect(lastFrame() ?? '').toMatch(/MSG-24-tag/);
+  });
+
+  it('idle Ctrl+C quits (design.md §18)', async () => {
+    const onSlash = vi.fn<(cmd: SlashCommand) => Promise<void>>(async () => {});
+    const { stdin } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={onSlash} />,
+    );
+    stdin.write('\x03');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onSlash).toHaveBeenCalled();
+    expect((onSlash.mock.calls[0] as unknown as [SlashCommand])[0]?.kind).toBe('quit');
+  });
+
+  it('running Ctrl+C cancels first, quits second (design.md §18)', async () => {
+    const onSlash = vi.fn<(cmd: SlashCommand) => Promise<void>>(async () => {});
+    const { stdin } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={onSlash}
+        initialStatus={{ status: 'running' }}
+      />,
+    );
+    stdin.write('\x03');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('\x03');
+    await new Promise((r) => setTimeout(r, 30));
+    const kinds = onSlash.mock.calls.map((c) => (c[0] as SlashCommand).kind);
+    expect(kinds).toEqual(['cancel', 'quit']);
+  });
+
+  it('running Esc with empty queue cancels streaming (design.md §18)', async () => {
+    const onSlash = vi.fn<(cmd: SlashCommand) => Promise<void>>(async () => {});
+    const { stdin } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={onSlash}
+        initialStatus={{ status: 'running' }}
+      />,
+    );
+    stdin.write('\x1b');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onSlash).toHaveBeenCalled();
+    expect((onSlash.mock.calls[0] as unknown as [SlashCommand])[0]?.kind).toBe('cancel');
+  });
+
+  it('Shift+Enter inserts a newline instead of submitting (design.md §18)', async () => {
+    const onPrompt = vi.fn(async () => {});
+    const onSlash = vi.fn<(cmd: SlashCommand) => Promise<void>>(async () => {});
+    const { stdin, lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={onPrompt} onSlash={onSlash} />,
+    );
+    stdin.write('line one');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x1b[13;2u'); // CSI-u Shift+Enter
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('line two');
+    await new Promise((r) => setTimeout(r, 20));
+    // Nothing submitted, both lines in the input buffer.
+    expect(onPrompt).not.toHaveBeenCalled();
+    expect(onSlash).not.toHaveBeenCalled();
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('line one');
+    expect(frame).toContain('line two');
+    // Enter submits the whole multiline buffer with the newline intact.
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onPrompt).toHaveBeenCalledWith('line one\nline two');
   });
 
   it('Shift+Up / Shift+Down scroll by one line', async () => {
