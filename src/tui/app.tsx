@@ -1,7 +1,6 @@
 /**
- * Klyro TUI — TUI_DESIGN.md §3-7,10-12 — Professional monochrome + one accent orange #E8843C
- * No boxes, no borders (§24). Guide │ at col2, accent ● at col4 for agent.
- * Regions: scrollback (header+turns) / live window (streaming tail+groups) / pinned (input+status)
+ * Klyro TUI — opencode-perfect — TUI_DESIGN.md §2-7 + user request: no clumsy words, smooth scroll like opencode
+ * Full-screen alt takeover when supported, inline degrade otherwise. Clean wrap at word boundaries, slider │●.
  */
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
@@ -25,82 +24,55 @@ export interface AppProps {
   version?: string;
   isFullscreen?: boolean;
 }
-
 let _id = 0;
 function nextId(p: string): string { _id++; return `${p}-${_id}`; }
 
-// ── Header §4 ───────────────────────────────────────────────────────────────
 function Header({ cwd, model, version, width }: { cwd: string; model: string; version: string; width: number }) {
   const branch = (() => { try { const { execSync } = require('node:child_process') as typeof import('node:child_process'); return execSync('git rev-parse --abbrev-ref HEAD', { cwd, stdio: ['ignore','pipe','ignore'] }).toString().trim(); } catch { return ''; } })();
   const showLinks = width >= 120;
-  const links = '│  /help   /config   /clear   /exit';
-  const ctxShort = '200k'; // TODO wire real context window
-  const row1Left = `KLYRO  v${version}`;
   return (
     <Box flexDirection="column" marginBottom={1}>
       <Box justifyContent="space-between">
-        <Text bold color={tokens.ansi.accent as string}>{row1Left}</Text>
-        {showLinks ? <Text color={tokens.ansi.dim as string}>{links}</Text> : null}
+        <Text bold color={tokens.ansi.accent as string}>KLYRO  v{version}</Text>
+        {showLinks ? <Text color={tokens.ansi.dim as string}>│  /help   /config   /clear   /exit</Text> : null}
       </Box>
-      <Text color={tokens.ansi.dim as string}>{model}[{ctxShort}]  ·  API Usage Billing</Text>
+      <Text color={tokens.ansi.dim as string}>{model}[200k]  ·  API Usage Billing</Text>
       <Text color={tokens.ansi.dim as string}>{cwd}{branch ? `  ·  ${branch}` : ''}</Text>
     </Box>
   );
 }
 
-// ── Verb table §5.3.1 ──────────────────────────────────────────────────────
 type Verb = 'Read' | 'Listed' | 'Searched' | 'Ran' | 'Started' | 'Edited' | 'Created' | 'Checked git' | 'Fetched' | 'Searched web' | 'Mapped' | 'Called';
-function verbForTool(name: string): { verb: Verb; plural: string } {
-  if (name === 'read_file') return { verb: 'Read', plural: 'Read' };
-  if (name === 'list_directory') return { verb: 'Listed', plural: 'Listed' };
-  if (name === 'grep' || name === 'glob' || name === 'find_files' || name === 'search_files' || name === 'recent_files') return { verb: 'Searched', plural: 'Searched' };
-  if (name === 'shell_exec') return { verb: 'Ran', plural: 'Ran' };
-  if (name.startsWith('git_')) return { verb: 'Checked git', plural: 'Checked git' };
-  if (name === 'web_fetch') return { verb: 'Fetched', plural: 'Fetched' };
-  if (name === 'web_search') return { verb: 'Searched web', plural: 'Searched web' };
-  if (name === 'edit_file' || name === 'multi_edit' || name === 'apply_patch' || name === 'write_file') return { verb: 'Edited', plural: 'Edited' };
-  return { verb: 'Called', plural: 'Called' };
+function verbForTool(name: string): Verb {
+  if (name === 'read_file') return 'Read' as Verb;
+  if (name === 'list_directory') return 'Listed' as Verb;
+  if (name === 'grep' || name === 'glob' || name === 'find_files' || name === 'search_files' || name === 'recent_files') return 'Searched' as Verb;
+  if (name === 'shell_exec') return 'Ran' as Verb;
+  if (name.startsWith('git_')) return 'Checked git' as Verb;
+  if (name === 'web_fetch') return 'Fetched' as Verb;
+  if (name === 'web_search') return 'Searched web' as Verb;
+  if (name === 'edit_file' || name === 'multi_edit' || name === 'apply_patch' || name === 'write_file') return 'Edited' as Verb;
+  return 'Called' as Verb;
 }
-
-interface Group {
-  id: string;
-  verb: Verb;
-  items: Extract<TranscriptItem, { kind: 'tool' }>[];
-  totalMs: number;
-  status: 'running' | 'done' | 'error';
-}
-
+interface Group { id: string; verb: Verb; items: Extract<TranscriptItem, { kind: 'tool' }>[]; totalMs: number; status: 'running' | 'done' | 'error'; }
 function groupTools(items: TranscriptItem[]): Array<TranscriptItem | Group> {
   const out: Array<TranscriptItem | Group> = [];
   let cur: Extract<TranscriptItem, { kind: 'tool' }>[] = [];
   const flush = () => {
     if (cur.length === 0) return;
-    // bucket by verb
     const byVerb = new Map<Verb, typeof cur>();
-    for (const it of cur) {
-      const v = verbForTool(it.name).verb;
-      if (!byVerb.has(v)) byVerb.set(v, []);
-      byVerb.get(v)!.push(it);
-    }
+    for (const it of cur) { const v = verbForTool(it.name); if (!byVerb.has(v)) byVerb.set(v, []); byVerb.get(v)!.push(it); }
     for (const [verb, list] of byVerb) {
       const totalMs = list.reduce((s, x) => s + (x.latencyMs ?? 0), 0);
-      const status = list.some((x) => x.isError || x.status === 'error') ? 'error' : list.some((x) => x.status === 'running') ? 'running' : 'done';
+      const status = list.some((x) => x.isError || x.status === 'error') ? 'error' as const : list.some((x) => x.status === 'running') ? 'running' as const : 'done' as const;
       out.push({ id: nextId('g'), verb, items: list, totalMs, status });
     }
     cur = [];
   };
-  for (const it of items) {
-    if (it.kind === 'tool') cur.push(it as Extract<TranscriptItem, { kind: 'tool' }>);
-    else {
-      flush();
-      out.push(it);
-    }
-  }
-  flush();
-  return out;
+  for (const it of items) { if (it.kind === 'tool') cur.push(it as Extract<TranscriptItem, { kind: 'tool' }>); else { flush(); out.push(it); } }
+  flush(); return out;
 }
 
-// ── Main App §3 ────────────────────────────────────────────────────────────
 export function App(props: AppProps): React.JSX.Element {
   const { stdout } = useStdout();
   const [transcript, setTranscript] = useState<TranscriptItem[]>(props.initialTranscript ?? []);
@@ -114,216 +86,150 @@ export function App(props: AppProps): React.JSX.Element {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [scrollOffset, setScrollOffset] = useState(0);
   const streamingIdRef = useRef<string | null>(null);
-  const placeholders = ['Message Klyro…', 'Message @file to attach…', 'Type / for commands…', '! runs a shell command…'];
-  const placeholder = placeholders[0] ?? 'Message Klyro…';
+  const placeholder = 'Message Klyro…';
+
+  const width = stdout?.columns ?? 100;
+  const height = stdout?.rows ?? 30;
+  const isFullscreen = props.isFullscreen ?? false;
+  const viewportH = Math.max(5, height - 10);
+  const grouped = groupTools(transcript);
+  const totalRows = grouped.length + (plan.length > 0 ? 1 : 0) + 2;
+  const maxOffset = Math.max(0, totalRows - viewportH);
+  const isAtBottom = scrollOffset >= maxOffset;
+  const trackH = viewportH;
+  const thumbPos = maxOffset === 0 ? 0 : Math.round((scrollOffset / maxOffset) * (trackH - 1));
+  const visibleGrouped = isFullscreen ? grouped.slice(scrollOffset, scrollOffset + viewportH) : grouped;
 
   useEffect(() => bridge.subscribe((p) => setAwaitingApproval(p !== null)), [bridge]);
-  useEffect(() => {
-    if (queued && status.status !== 'running' && !awaitingApproval) {
-      const toSend = queued; setQueued(null);
-      setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: toSend, role: 'user' } as TranscriptItem]);
-      streamingIdRef.current = null;
-      const cmd = parseSlash(toSend.trim());
-      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd);
-    }
-  }, [queued, status.status, awaitingApproval]);
-  useEffect(() => {
-    if (status.status !== 'running') return;
-    const start = Date.now() - elapsed;
-    const t = setInterval(() => setElapsed(Date.now() - start), 1000);
-    return () => clearInterval(t);
-  }, [status.status, elapsed]);
+  useEffect(() => { if (queued && status.status !== 'running' && !awaitingApproval) { const toSend = queued; setQueued(null); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: toSend, role: 'user' } as TranscriptItem]); streamingIdRef.current = null; const cmd = parseSlash(toSend.trim()); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); } }, [queued, status.status, awaitingApproval]);
+  useEffect(() => { if (status.status !== 'running') return; const start = Date.now() - elapsed; const t = setInterval(() => setElapsed(Date.now() - start), 1000); return () => clearInterval(t); }, [status.status, elapsed]);
+  useEffect(() => { if (isAtBottom) setScrollOffset(maxOffset); }, [transcript.length, plan.length, maxOffset, isAtBottom]);
 
-  const append = useCallback((item: TranscriptItem) => {
-    if (item.kind !== 'text' || item.role !== 'assistant') streamingIdRef.current = null;
-    setTranscript((prev) => [...prev, item]);
-  }, []);
+  const append = useCallback((item: TranscriptItem) => { if (item.kind !== 'text' || item.role !== 'assistant') streamingIdRef.current = null; setTranscript((prev) => [...prev, item]); }, []);
   const appendDelta = useCallback((text: string) => {
-    if (!text) return;
-    const sid = streamingIdRef.current;
-    if (sid) {
-      setTranscript((prev) => {
-        const idx = prev.findIndex((x) => x.id === sid);
-        if (idx === -1) return [...prev, { id: sid, kind: 'text', text, role: 'assistant' } as TranscriptItem];
-        const cur = prev[idx] as Extract<TranscriptItem, { kind: 'text' }>;
-        const next = { ...cur, text: cur.text + text } as TranscriptItem;
-        const copy = [...prev]; copy[idx] = next; return copy;
-      });
-    } else {
-      const id = nextId('stream'); streamingIdRef.current = id;
-      setTranscript((prev) => [...prev, { id, kind: 'text', text, role: 'assistant' } as TranscriptItem]);
-    }
+    if (!text) return; const sid = streamingIdRef.current;
+    if (sid) setTranscript((prev) => { const idx = prev.findIndex((x) => x.id === sid); if (idx === -1) return [...prev, { id: sid, kind: 'text', text, role: 'assistant' } as TranscriptItem]; const cur = prev[idx] as Extract<TranscriptItem, { kind: 'text' }>; const copy = [...prev]; copy[idx] = { ...cur, text: cur.text + text } as TranscriptItem; return copy; });
+    else { const id = nextId('stream'); streamingIdRef.current = id; setTranscript((prev) => [...prev, { id, kind: 'text', text, role: 'assistant' } as TranscriptItem]); }
   }, []);
   useEffect(() => { if (status.status !== 'running') streamingIdRef.current = null; }, [status.status]);
   const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
   const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
-  useEffect(() => {
-    onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan });
-    (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append;
-    (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta;
-    (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus;
-    (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan;
-    return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; };
-  }, [append, appendDelta, updateStatus, updatePlan]);
+  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; }; }, [append, appendDelta, updateStatus, updatePlan]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
-  const width = stdout?.columns ?? 100;
-  const height = stdout?.rows ?? 30;
-  const isFullscreen = props.isFullscreen ?? false;
-  const grouped = groupTools(transcript);
-  const viewportH = Math.max(5, height - 10);
-  const totalRows = grouped.length + (plan.length > 0 ? 1 : 0) + 2;
-  const maxOffset = Math.max(0, totalRows - viewportH);
-  const isAtBottom = scrollOffset >= maxOffset;
-  useEffect(() => { if (isAtBottom) setScrollOffset(maxOffset); }, [transcript.length, plan.length, maxOffset, isAtBottom]);
   const scrollUp = (n = 3) => setScrollOffset((p) => Math.max(0, p - n));
   const scrollDown = (n = 3) => setScrollOffset((p) => Math.min(maxOffset, p + n));
 
   useInput((inputStr, key) => {
-    // slider scroll: PageUp/PageDown, Ctrl+U/D, Shift+↑/↓, j/k in vim-like
     if (key.pageUp || (key.ctrl && inputStr === 'u')) { scrollUp(5); return; }
     if (key.pageDown || (key.ctrl && inputStr === 'd')) { scrollDown(5); return; }
     if (key.upArrow && (key.shift || key.ctrl)) { scrollUp(1); return; }
     if (key.downArrow && (key.shift || key.ctrl)) { scrollDown(1); return; }
     if (awaitingApproval) return;
-    if (key.ctrl && inputStr === 'o') {
-      const groups = groupTools(transcript).filter((x): x is Group => typeof (x as Group).verb === 'string');
-      const last = groups[groups.length - 1];
-      if (last) toggleGroup(last.id);
-      return;
-    }
+    if (key.ctrl && inputStr === 'o') { const groups = grouped.filter((x): x is Group => typeof (x as Group).verb === 'string'); const last = groups[groups.length - 1]; if (last) toggleGroup(last.id); return; }
     if (status.status === 'running') {
       if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
-      if (key.return) {
-        const v = input.trim(); if (!v) return; setQueued(v); setInput('');
-        setTranscript((prev) => [...prev, { id: nextId('queued'), kind: 'text', text: `queued: ${v.slice(0, 80)}`, role: 'assistant' } as TranscriptItem]);
-        return;
-      }
+      if (key.return) { const v = input.trim(); if (!v) return; setQueued(v); setInput(''); setTranscript((prev) => [...prev, { id: nextId('queued'), kind: 'text', text: `queued: ${v.slice(0, 80)}`, role: 'assistant' } as TranscriptItem]); return; }
       if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
       if (!key.ctrl && !key.meta) setInput((v) => v + inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
       return;
     }
-    if (key.return) {
-      const v = input.trim(); if (!v) return; setInput('');
-      setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]);
-      streamingIdRef.current = null;
-      const cmd = parseSlash(v);
-      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd);
-      return;
-    }
+    if (key.return) { const v = input.trim(); if (!v) return; setInput(''); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); streamingIdRef.current = null; const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
     if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
     if (!key.ctrl && !key.meta) setInput((v) => v + inputStr);
   });
 
-  const isSmall = width < 80;
-  const ver = props.version ?? '0.1.24';
+  const ver = props.version ?? '0.1.27';
   const rule = g('rule').repeat(Math.max(10, width - 2));
-
-  // Derived status right
   const cost = (status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015);
   const totalTokens = status.usageInput + status.usageOutput;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
-  const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : status.status === 'idle' && transcript.length === 0 ? 'shift+tab to cycle  ·  ↑↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
+  const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
   const hints = maxOffset > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
-  const visibleGrouped = isFullscreen ? grouped.slice(scrollOffset, scrollOffset + viewportH) : grouped;
-  const trackH = viewportH;
-  const thumbPos = maxOffset === 0 ? 0 : Math.round((scrollOffset / maxOffset) * (trackH - 1));
+  // wrap width: leave 6 cells for guide+indent+scrollbar so words never clump
+  const wrapW = Math.max(20, width - 6);
 
   return (
     <Box flexDirection="column" width={width} height={isFullscreen ? height - 1 : undefined}>
       <Header cwd={props.cwd} model={status.model} version={ver} width={width} />
-
-      {/* Transcript §5 + slider — fullscreen: fixed viewport + slider, inline: natural grow */}
       <Box flexDirection="row" flexGrow={isFullscreen ? 1 : 0} overflow={isFullscreen ? 'hidden' : undefined}>
         <Box flexDirection="column" flexGrow={1} overflow={isFullscreen ? 'hidden' : undefined} paddingX={0}>
-        {grouped.length === 0 ? (
-          <Text color={tokens.ansi.dim as string}>{placeholder}</Text>
-        ) : visibleGrouped.map((item) => {
-          if ((item as Group).verb) {
-            const gr = item as Group;
-            const isExpanded = expandedGroups.has(gr.id);
-            const marker = isExpanded ? g('expanded') : g('collapsed');
-            const verbLine = (() => {
-              if (gr.items.length === 1) {
-                const it = gr.items[0]!;
-                const primary = (() => {
-                  try { const a = JSON.parse(it.args) as Record<string, unknown>; return (a.path as string) ?? (a.pattern as string) ?? (a.command as string)?.slice(0, 48) ?? ''; } catch { return ''; }
-                })();
-                const name = gr.verb === 'Read' && primary ? `Read ${primary.split('/').pop()}` : gr.verb === 'Searched' && primary ? `Searched "${primary}"` : gr.verb === 'Ran' && primary ? `Ran ${primary.split(' ')[0]}` : `${gr.verb} ${primary}`;
-                return name;
-              }
-              if (gr.verb === 'Read') return `Read ${gr.items.length} files`;
-              if (gr.verb === 'Searched') return `Searched ${gr.items.length} patterns`;
-              if (gr.verb === 'Ran') return `Ran ${gr.items.length} commands`;
-              if (gr.verb === 'Edited' || gr.verb === 'Created') return `${gr.verb} ${gr.items.length} files`;
-              return `${gr.verb} ${gr.items.length} items`;
-            })();
-            const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? '✗' : `${gr.totalMs}ms`;
-            return (
-              <Box key={gr.id} flexDirection="column" marginBottom={1}>
-                <Box>
-                  <Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text>
-                  <Text color={gr.status === 'running' ? tokens.ansi.warn as string : undefined}>{isExpanded ? g('expanded') : g('collapsed')} {verbLine}</Text>
-                  <Text color={tokens.ansi.dim as string}>  {right}</Text>
-                </Box>
-                {isExpanded ? gr.items.map((it) => (
-                  <Box key={it.id} paddingLeft={4} marginTop={0}>
-                    <Text color={tokens.ansi.guide as string}>{g('end')} </Text>
-                    <Text color={it.isError ? tokens.ansi.err as string : undefined}>{it.name}</Text>
-                    <Text color={tokens.ansi.dim as string}> {it.args.slice(0, 60)}</Text>
+          {grouped.length === 0 ? (
+            <Text color={tokens.ansi.dim as string}>{placeholder}</Text>
+          ) : visibleGrouped.map((item) => {
+            if ((item as Group).verb) {
+              const gr = item as Group;
+              const isExpanded = expandedGroups.has(gr.id);
+              const verbLine = (() => {
+                if (gr.items.length === 1) { const it = gr.items[0]!; let p = ''; try { const a = JSON.parse(it.args) as Record<string, unknown>; p = (a.path as string) ?? (a.pattern as string) ?? (a.command as string)?.slice(0, 48) ?? ''; } catch { p = ''; } if (gr.verb === 'Read' && p) return `Read ${p.split('/').pop()}`; if (gr.verb === 'Searched' && p) return `Searched "${p}"`; if (gr.verb === 'Ran' && p) return `Ran ${p.split(' ')[0]}`; return `${gr.verb} ${p}`; }
+                if (gr.verb === 'Read') return `Read ${gr.items.length} files`;
+                if (gr.verb === 'Searched') return `Searched ${gr.items.length} patterns`;
+                if (gr.verb === 'Ran') return `Ran ${gr.items.length} commands`;
+                if (gr.verb === 'Edited') return `Edited ${gr.items.length} files`;
+                return `${gr.verb} ${gr.items.length} items`;
+              })();
+              const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? '✗' : `${gr.totalMs}ms`;
+              return (
+                <Box key={gr.id} flexDirection="column" marginBottom={1}>
+                  <Box>
+                    <Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text>
+                    <Text>{isExpanded ? g('expanded') : g('collapsed')} {verbLine}</Text>
+                    <Text color={tokens.ansi.dim as string}>  {right}</Text>
                   </Box>
-                )) : null}
-              </Box>
-            );
-          }
-          const it = item as TranscriptItem;
-          if (it.kind === 'text' && it.role === 'user') {
-            return <Box key={it.id} marginBottom={1}><Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text><Text>{it.text}</Text></Box>;
-          }
-          if (it.kind === 'text') {
-            if (it.text.startsWith('queued:')) return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {it.text}  esc to drop</Text></Box>;
-            return (
-              <Box key={it.id} flexDirection="column" marginBottom={1}>
-                <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.accent as string}>{g('agentBullet')} Klyro</Text></Box>
-                <Box paddingLeft={2} marginTop={0}><Text color={tokens.ansi.dim as string}>  {g('guide')}   </Text><Text wrap="wrap">{it.text}</Text></Box>
-              </Box>
-            );
-          }
-          if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.err as string}>  {g('guide')}   ✗ {it.message}</Text></Box>;
-          if (it.kind === 'policy') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   [policy] {it.action} {it.name}</Text></Box>;
-          if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
-          if (it.kind === 'diff') return (
-            <Box key={it.id} flexDirection="column" paddingLeft={2} marginBottom={1}>
-              <Text bold color={tokens.ansi.soft as string}>{it.summary ?? 'Diff'}</Text>
-              {it.hunks.map((h, i) => (
-                <Box key={i} flexDirection="column" marginTop={0}>
-                  <Text color={tokens.ansi.soft as string}>{h.path}</Text>
-                  {h.lines.map((l, j) => (
-                    <Text key={j} wrap="wrap" color={l.kind === 'add' ? tokens.ansi.ok as string : l.kind === 'remove' ? tokens.ansi.err as string : tokens.ansi.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}</Text>
-                  ))}
+                  {isExpanded ? gr.items.map((it) => (
+                    <Box key={it.id} paddingLeft={4}>
+                      <Text color={tokens.ansi.guide as string}>{g('end')} </Text>
+                      <Text>{it.name}</Text>
+                      <Text color={tokens.ansi.dim as string}> {it.args.slice(0, 50)}</Text>
+                    </Box>
+                  )) : null}
                 </Box>
+              );
+            }
+            const it = item as TranscriptItem;
+            if (it.kind === 'text' && it.role === 'user') {
+              return <Box key={it.id} marginBottom={1}><Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text><Text wrap="wrap">{it.text}</Text></Box>;
+            }
+            if (it.kind === 'text') {
+              if (it.text.startsWith('queued:')) return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {it.text}  esc to drop</Text></Box>;
+              return (
+                <Box key={it.id} flexDirection="column" marginBottom={1}>
+                  <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.accent as string}>{g('agentBullet')} Klyro</Text></Box>
+                  <Box paddingLeft={2}><Text color={tokens.ansi.dim as string}>  {g('guide')}   </Text><Text wrap="wrap">{it.text}</Text></Box>
+                </Box>
+              );
+            }
+            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.err as string}>  {g('guide')}   ✗ {it.message}</Text></Box>;
+            if (it.kind === 'policy') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   [policy] {it.action} {it.name}</Text></Box>;
+            if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
+            if (it.kind === 'diff') return (
+              <Box key={it.id} flexDirection="column" paddingLeft={2} marginBottom={1}>
+                <Text bold color={tokens.ansi.soft as string}>{it.summary ?? 'Diff'}</Text>
+                {it.hunks.map((h, i) => (
+                  <Box key={i} flexDirection="column" marginTop={0}>
+                    <Text color={tokens.ansi.soft as string}>{h.path}</Text>
+                    {h.lines.map((l, j) => (
+                      <Text key={j} wrap="wrap" color={l.kind === 'add' ? tokens.ansi.ok as string : l.kind === 'remove' ? tokens.ansi.err as string : tokens.ansi.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}</Text>
+                    ))}
+                  </Box>
+                ))}
+              </Box>
+            );
+            return null;
+          })}
+          {status.status === 'running' && !streamingIdRef.current ? (
+            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.dim as string}>Thinking...</Text><Text color={tokens.ansi.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
+          ) : null}
+          {plan.length > 0 ? (
+            <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
+              <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
+              {plan.slice(0, 8).map((p) => (
+                <Box key={p.id}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.ansi.ok as string : p.status === 'in_progress' ? tokens.ansi.accent as string : tokens.ansi.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {p.title}</Text></Box>
               ))}
             </Box>
-          );
-          return null;
-        })}
-        {status.status === 'running' && !streamingIdRef.current ? (
-          <Box paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={tokens.ansi.dim as string}>Thinking...</Text><Text color={tokens.ansi.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
-        ) : null}
-        {plan.length > 0 ? (
-          <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
-            <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
-            {plan.slice(0, 8).map((p) => (
-              <Box key={p.id}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.ansi.ok as string : p.status === 'in_progress' ? tokens.ansi.accent as string : tokens.ansi.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {p.title}</Text></Box>
-            ))}
-            {plan.length > 8 ? <Text color={tokens.ansi.dim as string}>  {g('guide')}   … +{plan.length - 8} more (/todos)</Text> : null}
-          </Box>
-        ) : null}
-        {status.status === 'done' && transcript.some((x) => x.kind === 'file_changed') ? (
-          <Box paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {transcript.filter((x) => x.kind === 'file_changed').length} files · /diff</Text></Box>
-        ) : null}
+          ) : null}
         </Box>
         {isFullscreen ? (
           <Box flexDirection="column" width={1} marginLeft={1}>
@@ -333,18 +239,14 @@ export function App(props: AppProps): React.JSX.Element {
           </Box>
         ) : null}
       </Box>
-
-      {/* Input §6 — rules + prompt */}
       <Box flexDirection="column">
         <Text color={tokens.ansi.guide as string}>{rule}</Text>
         <Box>
           <Text color={tokens.ansi.accent as string} bold>{g('prompt')} </Text>
-          <Text>{input || <Text color={tokens.ansi.dim as string}>{placeholder}</Text> as unknown as string}▏</Text>
+          <Text wrap="wrap">{input || <Text color={tokens.ansi.dim as string}>{placeholder}</Text> as unknown as string}▏</Text>
         </Box>
         <Text color={tokens.ansi.guide as string}>{rule}</Text>
       </Box>
-
-      {/* Status §7 */}
       <Box justifyContent="space-between">
         <Text color={tokens.ansi.dim as string}>{hints}</Text>
         <Text color={tokens.ansi.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct > 0 ? `${ctxPct}% ctx · ` : ''}{status.status === 'running' ? 'auto mode on ●' : ''}</Text>
