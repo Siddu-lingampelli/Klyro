@@ -1,0 +1,1 @@
+Fix failing test in src/foo.test.ts — expect 1 to equal 2. Patch the source, not the test.

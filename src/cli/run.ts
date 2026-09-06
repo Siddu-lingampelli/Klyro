@@ -70,6 +70,7 @@ export interface RunCliOptions {
   verifyCommand?: string;
   maxRepairAttempts?: number;
   verifyTimeoutMs?: number;
+  requireVerify?: boolean;
   /** Level 9 — persistence */
   persist?: boolean;
   sessionId?: string;
@@ -170,6 +171,7 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
         command: opts.verifyCommand,
         maxRepairAttempts: opts.maxRepairAttempts ?? 3,
         timeoutMs: opts.verifyTimeoutMs,
+        requireVerify: opts.requireVerify,
       };
 
   const result = await run(
@@ -258,6 +260,18 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'verify_failed', failureType: result.verification?.failureType }) + '\n');
     else stderr.write(`klyro: verification failed after ${result.verification?.attempts ?? 3} repairs — see output above\n`);
     return 5;
+  }
+  // 6.5 — --require-verify: if edits were made but verification never passed, exit 8
+  if (opts.requireVerify && result.verification && !result.verification.ok) {
+    if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'require_verify_failed' }) + '\n');
+    else stderr.write('klyro: --require-verify: verification required but not passed\n');
+    return 8;
+  }
+  if (opts.requireVerify && !result.verification) {
+    // hasEdits but no verification command found
+    if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'require_verify_missing' }) + '\n');
+    else stderr.write('klyro: --require-verify: no verification command found and edits were made\n');
+    return 8;
   }
   if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'ok', text: result.finalText }) + '\n');
   return 0;

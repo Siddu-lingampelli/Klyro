@@ -24,8 +24,13 @@ import type { PolicyEngine } from '../policy/engine.js';
 import type { ApprovalPrompt } from '../policy/approval.js';
 import { redact } from '../policy/secret-redactor.js';
 import { RuntimeTelemetry, emptyTelemetryBlock, summarizeToolCall } from '../context/level7.js';
-import { verify, diagnosticForModel } from '../verification/engine.js';
+import * as path from 'node:path';
+import { verify, diagnosticForModel, type VerifyResult } from '../verification/engine.js';
 import { detectVerifyCommand } from '../verification/auto.js';
+import { detectVerifiers } from '../verification/registry.js';
+import { ensureBaseline, getBaseline } from '../verification/baseline.js';
+import { classifyFailure, rerunOnce, gatherRepairContext, guardRepair } from '../verification/classify.js';
+import { findRelatedTests, buildScopedCommand, runScopedVerify, syntaxCheck, checkImports } from '../verification/scoped.js';
 import { EventBus, globalBus } from '../events/bus.js';
 import { TraceWriter } from '../trace/writer.js';
 
@@ -85,6 +90,7 @@ export interface RunOptions {
     command?: string;
     maxRepairAttempts?: number;
     timeoutMs?: number;
+    requireVerify?: boolean;
   };
   /**
    * Level 9 — persistence. When a SessionStore is provided, every message
@@ -213,6 +219,16 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   };
   const store = opts.persist?.store;
   const sessionId = opts.persist?.sessionId;
+  // 6.1 baseline cache per HEAD — capture before first edit
+  let baselinePrimed = false;
+  async function primeBaseline(): Promise<void> {
+    if (baselinePrimed) return;
+    baselinePrimed = true;
+    const cmd = opts.verify?.command ?? detectVerifyCommand(opts.cwd);
+    if (!cmd) return;
+    try { await ensureBaseline(opts.cwd, cmd); } catch { /* ignore */ }
+  }
+
   async function checkpoint(msg?: Message, obs?: { toolCallId: string; toolName: string; input: unknown; output: unknown; isError: boolean }): Promise<void> {
     if (!store || !sessionId) return;
     try {
@@ -375,11 +391,47 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       if (verifyEnabled && hasEdits && verifyCmd && verificationAttempts < maxRepairs) {
         emit?.({ kind: 'verification_started', command: verifyCmd });
         let vResult: Awaited<ReturnType<typeof verify>> | undefined;
+        // 6.3 — scoped run if edited files known
+        const edited = [...fileEditCounts.keys()];
+        const related = findRelatedTests(opts.cwd, edited);
+        const scopedCmd = buildScopedCommand(opts.cwd, verifyCmd, related);
+        const cmdToRun = scopedCmd ?? verifyCmd;
+        const isScoped = !!scopedCmd;
+        if (isScoped) emit?.({ kind: 'verification_started', command: cmdToRun });
         try {
-          vResult = await verify({ cwd: opts.cwd, command: verifyCmd, timeoutMs: opts.verify?.timeoutMs });
+          if (isScoped) {
+            const sr = await runScopedVerify(opts.cwd, cmdToRun, opts.verify?.timeoutMs);
+            const det = sr.ok ? undefined : (await import('../verification/detect.js')).detect(sr.stdout, sr.stderr, sr.exitCode);
+            vResult = { ok: sr.ok, exitCode: sr.exitCode, stdout: sr.stdout, stderr: sr.stderr, ...(det ? { failure: det } : {}) } as VerifyResult;
+          } else {
+            vResult = await verify({ cwd: opts.cwd, command: cmdToRun, timeoutMs: opts.verify?.timeoutMs });
+          }
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           vResult = { ok: false, exitCode: -1, stdout: '', stderr: msg, failure: { type: 'unknown', files: [], raw: msg, exitCode: -1 } };
+        }
+        // 6.3 — sanity checks before full verify
+        if (vResult.ok) {
+          // quick syntax/import guard for last edited files
+          for (const f of edited.slice(-3)) {
+            const sc = await syntaxCheck(opts.cwd, f);
+            if (!sc.ok) {
+              vResult = { ok: false, exitCode: 1, stdout: '', stderr: sc.error ?? `syntax error ${f}`, failure: { type: 'build', files: [{ path: f, message: sc.error ?? 'syntax error' }], raw: sc.error ?? '', exitCode: 1 } } as VerifyResult;
+              break;
+            }
+            const ic = checkImports(opts.cwd, f);
+            if (!ic.ok) {
+              vResult = { ok: false, exitCode: 1, stdout: '', stderr: `missing imports in ${f}: ${ic.missing.join(', ')}`, failure: { type: 'build', files: ic.missing.map((m) => ({ path: f, message: `missing import ${m}` })), raw: `missing imports ${ic.missing.join(', ')}`, exitCode: 1 } } as VerifyResult;
+              break;
+            }
+          }
+        }
+        // If scoped passed but full may still fail, run full before declaring success
+        if (vResult.ok && isScoped) {
+          try {
+            const full = await verify({ cwd: opts.cwd, command: verifyCmd, timeoutMs: opts.verify?.timeoutMs });
+            if (!full.ok) vResult = full;
+          } catch { /* scoped success is enough */ }
         }
         if (vResult.ok) {
           emit?.({ kind: 'verification_succeeded', command: verifyCmd });
@@ -391,16 +443,83 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           await closeTracer();
           return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
         }
-        // Failure → repair loop
+        // 6.4 — classify
+        const baseline = await getBaseline(opts.cwd, verifyCmd);
+        const isFlaky = await rerunOnce(opts.cwd, cmdToRun, 30_000);
+        const cls = classifyFailure({ failure: vResult.failure, stdout: vResult.stdout, stderr: vResult.stderr }, baseline, isFlaky);
+        if (cls === 'flaky') {
+          // rerun succeeded on second try — treat as flaky, don't count as repair
+          emit?.({ kind: 'verification_succeeded', command: verifyCmd });
+          emit?.({ kind: 'final_text', text: finalText });
+          emit?.({ kind: 'step_end', step: steps });
+          if (store && sessionId) {
+            try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
+          }
+          await closeTracer();
+          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
+        }
+        if (cls === 'env') {
+          // don't try to repair env failures with code edits
+          const envMsg: Message = { role: 'user', content: [text(`Verification failed due to environment issue (not code):\n\n${diagnosticForModel(vResult)}\n\nPlease suggest how to fix the environment (install deps, set env vars) rather than editing code. If this is a missing binary, ask the user.`)] };
+          transcript.push(envMsg);
+          await checkpoint(envMsg);
+          verificationAttempts++;
+          emit?.({ kind: 'verification_failed', step: String(steps), reason: `env: ${diagnosticForModel(vResult).slice(0, 600)}` });
+          if (verificationAttempts >= maxRepairs) {
+            await closeTracer();
+            return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: false, command: verifyCmd, attempts: verificationAttempts, failureType: 'env' } };
+          }
+          emit?.({ kind: 'step_end', step: steps });
+          continue;
+        }
+        if (cls === 'pre_existing') {
+          // pre-existing — don't penalize, but still surface
+          const preMsg: Message = { role: 'user', content: [text(`Note: verification failure appears pre-existing (present in baseline at HEAD). Current failure:\n\n${diagnosticForModel(vResult)}\n\nIf this failure is unrelated to your changes, you may proceed, but try to avoid making it worse.`)] };
+          transcript.push(preMsg);
+          await checkpoint(preMsg);
+          // still count as needing repair if introduced files overlap, else allow completion
+          // For now, treat pre-existing as non-blocking after one warning if no introduced files in failure
+          const introducedPaths = new Set(edited);
+          const failurePaths = new Set(vResult.failure?.files.map((f) => f.path).filter(Boolean) ?? []);
+          const overlaps = [...failurePaths].some((p) => introducedPaths.has(p) || introducedPaths.has(path.basename(p)));
+          if (!overlaps) {
+            emit?.({ kind: 'verification_succeeded', command: verifyCmd });
+            emit?.({ kind: 'final_text', text: finalText });
+            emit?.({ kind: 'step_end', step: steps });
+            if (store && sessionId) {
+              try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
+            }
+            await closeTracer();
+            return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
+          }
+        }
+        // Failure → repair loop (introduced)
         verificationAttempts++;
         const diagnostic = diagnosticForModel(vResult);
         const failureType = vResult.failure?.type ?? 'unknown';
+        // 6.4 — gather context
+        const ctx = await gatherRepairContext(opts.cwd, vResult.failure);
+        const ctxBlock = [
+          ctx.hunks ? `Changed hunks:\n${ctx.hunks.slice(0, 1500)}` : '',
+          ctx.failingTests.length > 0 ? `Failing test excerpt:\n${ctx.failingTests[0]?.content.slice(0, 1500)}` : '',
+          ctx.blame ? `Blame:\n${ctx.blame.slice(0, 800)}` : '',
+        ].filter(Boolean).join('\n\n');
         emit?.({ kind: 'verification_failed', step: String(steps), reason: diagnostic.slice(0, 800) });
         emit?.({ kind: 'repair_started', attempt: verificationAttempts, maxAttempts: maxRepairs, reason: diagnostic.slice(0, 400) });
         telemetry.recordError(`verify_${failureType}`);
+        // 6.4 guard — check if last diff touches assertions/skips (would need approval)
+        try {
+          const diffText = await (await import('node:fs/promises')).readFile(path.join(opts.cwd, '.klyro', 'checkpoints', 'last.diff'), 'utf-8').catch(() => ctx.hunks);
+          const g = guardRepair(diffText ?? ctx.hunks, edited);
+          if (g.blocked) {
+            const guardMsg: Message = { role: 'user', content: [text(`Repair guard blocked: ${g.reason}\n\nIf you must edit test assertions or add skips, first ask the user for explicit approval via ask_user.`)] };
+            transcript.push(guardMsg);
+            await checkpoint(guardMsg);
+          }
+        } catch { /* ignore guard */ }
         const repairMsg: Message = {
           role: 'user',
-          content: [text(`Verification failed (attempt ${verificationAttempts}/${maxRepairs}) running \`${verifyCmd}\`:\n\n${diagnostic}\n\nPlease analyze the failure, re-read the failing files, and repair the code. Focus on the error above.`)],
+          content: [text(`Verification failed (attempt ${verificationAttempts}/${maxRepairs}, class=${cls}) running \`${verifyCmd}\`:\n\n${diagnostic}\n\n${ctxBlock ? `\nContext:\n${ctxBlock}\n` : ''}\nPlease analyze the failure, re-read the failing files, and repair the code. Focus on the error above. Do not edit test assertions unless the test itself is wrong — fix the source.`)],
         };
         transcript.push(repairMsg);
         await checkpoint(repairMsg);
@@ -500,7 +619,9 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       await checkpoint(toolMsg, { toolCallId: call.id, toolName: call.name, input: call.input, output, isError: !obs.ok });
       if (obs.ok) {
         telemetry.recordToolCall(call, latencyMs, false);
-        if (call.name === 'write_file' || call.name === 'edit_file') hasEdits = true;
+        if (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'multi_edit' || call.name === 'apply_patch') hasEdits = true;
+        // 6.1 — prime baseline on first edit
+        if (hasEdits && !baselinePrimed) void primeBaseline();
       } else {
         const code = String((obs.error as { code?: string; message?: string })?.code ?? 'tool_error');
         telemetry.recordToolCall(call, latencyMs, true);

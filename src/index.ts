@@ -299,11 +299,12 @@ async function main(): Promise<void> {
     .option('--verify-command <cmd>', 'Custom verification command (default: auto-detected)')
     .option('--max-repairs <n>', 'Max autonomous repair attempts (default 3)', (v) => parsePositiveInt('--max-repairs', v))
     .option('--persist', 'Enable session persistence (Level 9, default: enabled)')
+    .option('--require-verify', 'Fail with exit 8 if no verification passed after edits (6.5)')
     .action(async (prompt: string, opts: {
       model?: string; maxSteps?: number; maxTokens?: number; temperature?: number;
       timeout?: number; baseUrl?: string; apiKey?: string;
       output?: string; dryRun?: boolean; provider?: string; resume?: string;
-      resumeSession?: string; verify?: boolean; verifyCommand?: string; maxRepairs?: number; persist?: boolean;
+      resumeSession?: string; verify?: boolean; verifyCommand?: string; maxRepairs?: number; persist?: boolean; requireVerify?: boolean;
     }) => {
       const model = opts.model ?? process.env.KLYRO_MODEL;
       if (!model) {
@@ -336,6 +337,7 @@ async function main(): Promise<void> {
           verifyCommand: opts.verifyCommand,
           maxRepairAttempts: opts.maxRepairs,
           persist: opts.persist,
+          requireVerify: !!opts.requireVerify,
         });
         process.exit(code);
       } catch (err) {

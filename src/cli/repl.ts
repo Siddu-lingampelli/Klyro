@@ -474,6 +474,27 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         }
         return;
       }
+      case 'verify': {
+        const { detectVerifiers, primaryVerifyCommand } = await import('../verification/registry.js');
+        const { verify } = await import('../verification/engine.js');
+        const verifiers = detectVerifiers(cwd);
+        if (verifiers.length === 0) {
+          queuedAppend({ id: `vrfy-${Date.now()}`, kind: 'text', text: 'No verifiers detected (no test/typecheck/lint/build). Try `npm test` manually.', role: 'assistant' });
+          return;
+        }
+        const list = verifiers.map((v) => `  ${v.id}: ${v.command}`).join('\n');
+        queuedAppend({ id: `vrfy-list-${Date.now()}`, kind: 'text', text: `Verifiers:\n${list}`, role: 'assistant' });
+        const cmd = primaryVerifyCommand(cwd);
+        if (!cmd) return;
+        queuedAppend({ id: `vrfy-run-${Date.now()}`, kind: 'text', text: `[verify] running \`${cmd}\`...`, role: 'assistant' });
+        try {
+          const res = await verify({ cwd, command: cmd });
+          queuedAppend({ id: `vrfy-res-${Date.now()}`, kind: 'text', text: res.ok ? `[verify] passed (${cmd})` : `[verify] failed (${cmd}): ${res.stderr.slice(0, 500)}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `vrfy-err-${Date.now()}`, kind: 'error', message: `verify failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
       case 'compact':
         queuedAppend({
           id: `stub-${Date.now()}`,

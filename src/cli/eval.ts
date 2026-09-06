@@ -100,6 +100,17 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
       const entries = await fs.readdir(fixturesDir);
       for (const e of entries) {
         if (opts.filter && !e.includes(opts.filter)) continue;
+        // 6.5 — suite filter: smoke = type smoke, l6 = prefix l6-introduce
+        if (opts.suite && opts.suite !== 'smoke') {
+          if (!e.startsWith(opts.suite) && !e.includes(opts.suite)) continue;
+        } else if (opts.suite === 'smoke') {
+          // smoke = only type smoke (exclude l6 introduce fixtures)
+          try {
+            const metaRaw = await fs.readFile(path.join(fixturesDir, e, 'meta.json'), 'utf-8');
+            const meta = JSON.parse(metaRaw) as Record<string, unknown>;
+            if (meta.suite === 'l6' || meta.type === 'l6-introduce') continue;
+          } catch { /* no meta → include */ }
+        }
         const taskPath = path.join(fixturesDir, e, 'task.md');
         try {
           const task = await fs.readFile(taskPath, 'utf-8');

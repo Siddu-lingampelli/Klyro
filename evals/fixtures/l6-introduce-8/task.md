@@ -1,0 +1,1 @@
+Fix runtime error — ReferenceError: foo is not defined in src/run.js.

@@ -1,0 +1,1 @@
+Fix the type error in src/app.ts — Cannot find name 'x'. The file has an undefined variable that breaks tsc.

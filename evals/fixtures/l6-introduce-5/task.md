@@ -1,0 +1,1 @@
+Fix pytest failure — AssertionError in test_app.py::test_add.
