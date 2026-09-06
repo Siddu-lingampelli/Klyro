@@ -144,7 +144,7 @@ export function App(props: AppProps): React.JSX.Element {
     <Box flexDirection="column" width={width} height={height - 1}>
       {/* Header — compact, per §3 — shows version, model, cwd, step, status */}
       <Box flexDirection="column" borderStyle="single" borderColor={tokens.ansi.border as unknown as string} paddingX={1}>
-        <Text bold>KLYRO v0.1.10</Text>
+        <Text bold>KLYRO v0.1.11</Text>
         <Text color={tokens.ansi.muted as unknown as string}>{status.model} · API Usage Billing · step {status.step}/{status.maxSteps} · {status.status} · repairs {status.repairs}</Text>
         <Text color={tokens.ansi.muted as unknown as string}>{props.cwd}</Text>
       </Box>

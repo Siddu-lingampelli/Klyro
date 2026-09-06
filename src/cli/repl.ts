@@ -173,15 +173,19 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     // 2.3 image handling: extract @img refs
     const { text: cleanText, images } = parseImageInput(text);
     const taskText = images.length > 0 ? `${cleanText}\n\n[images: ${images.join(', ')}]` : cleanText;
-    // Level 9 — create session for this prompt if not already (one session per prompt)
+    // Only create session for non-trivial tasks (with tools/verify) — plain chat like "hello" is not a persisted session
+    const isSimpleChat = taskText.trim().split(/\s+/).length <= 5 && !taskText.toLowerCase().includes('fix') && !taskText.toLowerCase().includes('add') && !taskText.toLowerCase().includes('create');
     let sessionId: string | undefined;
-    try {
-      const rec = await tuiStore.create({ cwd, task: taskText, config: { model, maxSteps: opts.maxSteps ?? 30 } });
-      sessionId = rec.id;
-      tuiSessionId = rec.id;
-      queuedAppend({ id: `sess-${Date.now()}`, kind: 'text', text: `session ${rec.id.slice(0, 8)} started`, role: 'assistant' });
-    } catch {
-      // best-effort
+    if (!isSimpleChat) {
+      try {
+        const rec = await tuiStore.create({ cwd, task: taskText, config: { model, maxSteps: opts.maxSteps ?? 30 } });
+        sessionId = rec.id;
+        tuiSessionId = rec.id;
+        // Session info goes to status bar, not transcript (clean like Claude Code)
+        queuedStatus({ status: 'running', step: 0, model });
+      } catch {
+        // best-effort
+      }
     }
     queuedStatus({ status: 'running', step: 0, model });
     let textBuf = '';
@@ -312,11 +316,16 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       if (result.status === 'verify_failed') {
         queuedAppend({ id: `verr-${Date.now()}`, kind: 'error', message: `Verification failed after ${result.verification?.attempts ?? 3} attempts. Check output above.` });
         queuedStatus({ status: 'error', errorMessage: 'verification failed' });
+      } else if (result.status === 'no_final' && result.finalText) {
+        // Simple chat with text but no tool calls — treat as done (provider finished)
+        queuedStatus({ status: 'done', repairs: result.repairs ?? 0 });
       } else {
         queuedStatus({ status: 'complete' === result.status ? 'done' : 'error', repairs: result.repairs ?? 0 });
       }
       if (sessionId) {
         queuedAppend({ id: `sess-end-${Date.now()}`, kind: 'text', text: `session ${sessionId.slice(0, 8)} ${result.status} — ${result.steps} steps, ${result.toolCalls} tool calls`, role: 'assistant' });
+      } else if (result.status === 'no_final' && !result.finalText) {
+        queuedAppend({ id: `no_final-${Date.now()}`, kind: 'error', message: 'Provider returned no final text — check model/provider' });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
