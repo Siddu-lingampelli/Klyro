@@ -53,7 +53,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   const baseUrl = resolved.baseURL;
   const apiKey = resolved.apiKey;
   let model = opts.model ?? resolved.model;
-  const cwd = opts.cwd ?? process.cwd();
+  let cwd = opts.cwd ?? process.cwd();
   const registry = builtinRegistry();
   const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
   const providerKind = inferProviderFromBaseURL(baseUrl);
@@ -74,10 +74,10 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       : httpChatAdapter({ baseURL: url, apiKey: key, timeoutMs: 60_000 });
   let adapter = buildAdapter(currentProvider, currentBaseUrl, currentApiKey);
   const ctxBlock = await buildLevel6Context({ cwd });
-  const ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
-  // 4.4 KLYRO.md hierarchy
+  let ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
+  // 4.4 KLYRO.md hierarchy (mutable — /reload refreshes)
   const klyroMd = await import('../context/klyro-md.js').then((m) => m.loadKlyroMd(cwd)).catch(() => '');
-  const klyroBlock = klyroMd ? `\n\n<KLYRO.md>\n${klyroMd.slice(0, 4000)}\n</KLYRO.md>` : '';
+  let klyroBlock = klyroMd ? `\n\n<KLYRO.md>\n${klyroMd.slice(0, 4000)}\n</KLYRO.md>` : '';
   // 2.3 layered system prompt
   const systemPromptFn = (_ctx: { cwd: string; telemetry?: string }): string => {
     const base = buildSystemPrompt({ cwd, model, extraSystem: opts.systemPrompt, appendSystem: ctxPrefix + klyroBlock });
@@ -169,6 +169,75 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   let fastMode = false;
   let displayMode = 'default';
   let lastAssistantText = '';
+  // P2 state (commands.md Priority 2)
+  let activeAgent = 'default';
+  let verboseMode = false;
+  let detailsMode = false;
+  let rawMode = false;
+  let lastPromptText = '';
+  const attachedFiles = new Map<string, number>();
+  const bgAgentTasks: Array<{ id: string; task: string; status: string }> = [];
+  const aliases = new Map<string, string>();
+  const savedPrompts = new Map<string, string>();
+  const AGENT_ROLES = ['default', 'explorer', 'implementer', 'tester', 'reviewer'];
+  const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? cwd;
+  const aliasFile = `${homeDir}/.klyro/aliases.json`.replace(/\\/g, '/');
+  const promptFile = `${homeDir}/.klyro/prompts.json`.replace(/\\/g, '/');
+  try {
+    const { readFileSync, existsSync } = await import('node:fs');
+    if (existsSync(aliasFile)) {
+      const raw = JSON.parse(readFileSync(aliasFile, 'utf-8')) as Record<string, string>;
+      for (const [k, v] of Object.entries(raw)) aliases.set(k, v);
+    }
+    if (existsSync(promptFile)) {
+      const raw = JSON.parse(readFileSync(promptFile, 'utf-8')) as Record<string, string>;
+      for (const [k, v] of Object.entries(raw)) savedPrompts.set(k, v);
+    }
+  } catch { /* best-effort */ }
+  function persistMap(file: string, m: Map<string, string>): void {
+    try {
+      const fs = require('node:fs') as typeof import('node:fs');
+      const path = require('node:path') as typeof import('node:path');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(Object.fromEntries(m), null, 2), 'utf-8');
+    } catch { /* best-effort */ }
+  }
+  /** Truncation budget honoring /verbose and /raw. */
+  function outCap(s: string): string {
+    const cap = rawMode ? 12000 : verboseMode ? 8000 : 4000;
+    return s.length > cap ? s.slice(0, cap) + `\n... [truncated ${s.length - cap} chars]` : s;
+  }
+  async function execShell(command: string, timeoutMs = 120_000): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+    const r = await registry.execute('shell_exec', { command, timeoutMs }, { cwd, env: process.env, nonInteractive: true });
+    if (!r.ok) throw new Error((r.error as { message?: string }).message ?? 'shell failed');
+    return r.value as { exitCode: number | null; stdout: string; stderr: string };
+  }
+  /** Read-only LLM answer (no tools) — powers /ask and /explain. */
+  async function answerReadOnly(question: string, context?: string): Promise<void> {
+    const sys = systemPromptFn({ cwd, telemetry: '' }) + '\n\nAnswer read-only: do not call tools, do not edit files.';
+    const userText = context ? `${question}\n\n<context>\n${context.slice(0, 6000)}\n</context>` : question;
+    const req = {
+      model,
+      system: sys,
+      messages: [{ role: 'user' as const, content: [{ kind: 'text' as const, text: userText }] } as unknown as import('../agent/message.js').Message],
+      tools: [] as import('../agent/provider-adapter.js').ToolDefinition[],
+      signal: ac.signal,
+    };
+    queuedStatus({ status: 'running', step: 0, model });
+    let text = '';
+    try {
+      for await (const ev of adapter.stream(req)) {
+        if (ev.kind === 'text_delta') { text += ev.text; queuedDelta(ev.text); }
+        else if (ev.kind === 'error') throw new Error(ev.message);
+      }
+      lastAssistantText = text;
+      queuedStatus({ status: 'done' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      queuedAppend({ id: `ro-err-${Date.now()}`, kind: 'error', message: msg });
+      queuedStatus({ status: 'error', errorMessage: msg });
+    }
+  }
   function queuedClear(): void {
     if (isMounted && directHooks) directHooks.clearTranscript();
     else pendingQueue.length = 0;
@@ -184,6 +253,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       approvalBridge: tuiBridge,
       isFullscreen: isAltScreen,
       onPrompt: async (text: string) => {
+        lastPromptText = text;
         inflight = runWithBridge(text);
         await inflight;
         inflight = null;
@@ -415,7 +485,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           '  project: /init /status /context /diff /plan [task] /todos /memory',
           '  perms:   /permissions /mode [m] /sandbox [dir] /approve /deny',
           '  app:     /login /logout /auth /version /update /cancel /shell (!cmd) /mention (@path) /tools /config /doctor',
-          '  (!cmd runs shell, @path attaches a file)',
+          '  P2: /review /code-review /security-review /simplify /test /lint /build /run /fix /explain /format /ask',
+          '      /undo /redo /rewind /checkpoint /accept /reject /details /verbose /raw /activity /tasks /queue /retry',
+          '      /mcp /agents /subtask /background /attach /files /ls /tree /search /web /read /map /tokens',
+          '      /commit /push /pull /pr /issue /theme /debug /whoami /reload /reset /prompt /alias /commands /env /deps /install',
+          '  (!cmd runs shell, @path attaches a file; /commands lists everything)',
           `provider: ${currentProvider}  model: ${model}  effort: ${effortLevel}${fastMode ? ' fast' : ''} (${currentMaxSteps} steps)  mode: ${displayMode}  cwd: ${cwd}${sessionLabel ? `  session: ${sessionLabel}` : ''}${currentBranch ? `  branch: ${currentBranch}` : ''}`,
         ].join('\n');
         queuedAppend({ id: `help-${Date.now()}`, kind: 'text', text: helpText, role: 'assistant' });
@@ -487,7 +561,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             role: 'assistant',
           });
         } else {
-          queuedAppend({ id: `stat2-${Date.now()}`, kind: 'text', text: `model: ${model}  provider: ${currentProvider}  effort: ${effortLevel} (${currentMaxSteps} steps)  cwd: ${cwd}`, role: 'assistant' });
+          queuedAppend({ id: `stat2-${Date.now()}`, kind: 'text', text: `model: ${model}  provider: ${currentProvider}  effort: ${effortLevel}${fastMode ? '+fast' : ''} (${currentMaxSteps} steps)  mode: ${displayMode}  agent: ${activeAgent}  cwd: ${cwd}${sessionLabel ? `  session: ${sessionLabel}` : ''}${currentBranch ? `  branch: ${currentBranch}` : ''}`, role: 'assistant' });
         }
         return;
       }
@@ -972,17 +1046,864 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         queuedAppend({ id: `set-${Date.now()}`, kind: 'text', text: `config: ${getConfigPath()} (alias of /config)`, role: 'assistant' });
         return;
       }
+      case 'review': {
+        try {
+          const r = await registry.execute('git_diff', {}, { cwd, env: process.env, nonInteractive: true });
+          if (!r.ok) {
+            queuedAppend({ id: `rev-err-${Date.now()}`, kind: 'error', message: `review failed: ${(r.error as { message?: string }).message ?? 'git_diff error'}` });
+          } else {
+            const v = r.value as { diff: string; stat: string; patchedFiles: string[] };
+            const head = v.patchedFiles.length === 0 ? 'Working tree clean — nothing to review.' : `Reviewing ${v.patchedFiles.length} file(s): ${v.patchedFiles.join(', ')}`;
+            let extra = '';
+            if (cmd.target) {
+              try {
+                const fr = await registry.execute('read_file', { path: cmd.target }, { cwd, env: process.env, nonInteractive: true });
+                if (fr.ok) extra = `\n\n--- ${cmd.target} ---\n${String((fr.value as { content?: string }).content ?? '').slice(0, 2000)}`;
+              } catch { /* ignore */ }
+            }
+            queuedAppend({ id: `rev-${Date.now()}`, kind: 'text', text: `${head}\n${v.stat.slice(0, 1500)}${extra}\n\n${outCap(v.diff).slice(0, 3000)}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `rev-err2-${Date.now()}`, kind: 'error', message: `review failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'code-review': {
+        try {
+          const { checkImports } = await import('../verification/scoped.js');
+          const r = await registry.execute('git_diff', {}, { cwd, env: process.env, nonInteractive: true });
+          if (!r.ok) {
+            queuedAppend({ id: `cr-err-${Date.now()}`, kind: 'error', message: 'code-review failed: no diff available' });
+          } else {
+            const v = r.value as { diff: string; stat: string; patchedFiles: string[] };
+            const findings: string[] = [];
+            for (const f of v.patchedFiles.slice(0, 10)) {
+              const ic = checkImports(cwd, f);
+              for (const m of ic.missing) findings.push(`missing import '${m}' in ${f}`);
+              if (f.length > 200) findings.push(`suspicious path length: ${f}`);
+            }
+            if (/(^|\/)\.env(\.|$)/.test(v.diff)) findings.push('.env content in diff — never commit secrets');
+            if (/console\.log|debugger/.test(v.diff)) findings.push('debug leftovers (console.log/debugger) in diff');
+            if (/\.skip\(|\.todo\(|xit\(|xtest\(/.test(v.diff)) findings.push('skipped tests in diff');
+            const verdict = findings.length === 0 ? 'No issues found.' : `Findings (${findings.length}):\n- ${findings.join('\n- ')}`;
+            queuedAppend({ id: `cr-${Date.now()}`, kind: 'text', text: `Code review — ${v.patchedFiles.length} file(s)${cmd.options ? ` (${cmd.options})` : ''}:\n${v.stat.slice(0, 1000)}\n\n${verdict}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `cr-err2-${Date.now()}`, kind: 'error', message: `code-review failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'security-review': {
+        try {
+          const r = await registry.execute('git_diff', {}, { cwd, env: process.env, nonInteractive: true });
+          const diff = r.ok ? (r.value as { diff: string }).diff : '';
+          const checks: Array<[RegExp, string]> = [
+            [/sk-[A-Za-z0-9]{8,}|sk-ant-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{10,}/, 'possible hardcoded secret in diff'],
+            [/(^|\/)\.env(\.|$)/, '.env content in diff'],
+            [/\beval\s*\(/, 'eval() usage in diff'],
+            [/rm\s+-rf\s+(\/|~|\*)/, 'dangerous rm -rf in diff'],
+            [/chmod\s+-R\s+777/, 'chmod 777 in diff'],
+            [/curl.*\|\s*(sh|bash)/i, 'curl|sh pipe in diff'],
+            [/password\s*=\s*["'][^"']+["']/i, 'hardcoded password in diff'],
+          ];
+          const hits = checks.filter(([re]) => re.test(diff)).map(([, msg]) => msg);
+          queuedAppend({ id: `sr-${Date.now()}`, kind: 'text', text: hits.length === 0 ? 'Security review: no issues found in working-tree diff.' : `Security review findings:\n- ${hits.join('\n- ')}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `sr-err-${Date.now()}`, kind: 'error', message: `security-review failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'simplify': {
+        await runWithBridge(`Simplify ${cmd.target ?? 'recent changes'}: refactor for clarity without changing behavior. Keep the diff minimal.`);
+        return;
+      }
+      case 'test': {
+        try {
+          const { primaryVerifyCommand } = await import('../verification/registry.js');
+          const { buildScopedCommand } = await import('../verification/scoped.js');
+          const { verify } = await import('../verification/engine.js');
+          const base = primaryVerifyCommand(cwd);
+          if (!base) {
+            queuedAppend({ id: `tst-${Date.now()}`, kind: 'text', text: 'No test command detected. Try /verify or run tests manually.', role: 'assistant' });
+          } else {
+            const scoped = cmd.target ? buildScopedCommand(cwd, base, [cmd.target]) ?? base : base;
+            queuedAppend({ id: `tst-run-${Date.now()}`, kind: 'text', text: `[test] running \`${scoped}\`...`, role: 'assistant' });
+            const res = await verify({ cwd, command: scoped, timeoutMs: 120_000 });
+            queuedAppend({ id: `tst-res-${Date.now()}`, kind: 'text', text: res.ok ? `[test] passed (${scoped})` : `[test] failed:\n${outCap(res.stderr || res.stdout)}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `tst-err-${Date.now()}`, kind: 'error', message: `test failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'lint': {
+        try {
+          const { readFileSync, existsSync } = await import('node:fs');
+          const { join } = await import('node:path');
+          const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf-8')) as { scripts?: Record<string, string> };
+          let lintCmd: string | null = null;
+          if (pkg.scripts?.lint) lintCmd = 'npm run lint --silent';
+          else if (existsSync(join(cwd, 'eslint.config.js')) || existsSync(join(cwd, '.eslintrc.json'))) lintCmd = 'npx eslint .';
+          else lintCmd = 'npx tsc --noEmit';
+          queuedAppend({ id: `lint-run-${Date.now()}`, kind: 'text', text: `[lint] running \`${lintCmd}\`...`, role: 'assistant' });
+          const v = await execShell(lintCmd);
+          queuedAppend({ id: `lint-res-${Date.now()}`, kind: 'text', text: v.exitCode === 0 ? `[lint] clean (${lintCmd})` : `[lint] issues (exit ${v.exitCode}):\n${outCap(v.stdout + v.stderr)}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `lint-err-${Date.now()}`, kind: 'error', message: `lint failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'build': {
+        try {
+          const { readFileSync } = await import('node:fs');
+          const { join } = await import('node:path');
+          const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf-8')) as { scripts?: Record<string, string> };
+          if (!pkg.scripts?.build) {
+            queuedAppend({ id: `bld-${Date.now()}`, kind: 'text', text: 'No build script in package.json.', role: 'assistant' });
+          } else {
+            queuedAppend({ id: `bld-run-${Date.now()}`, kind: 'text', text: '[build] running `npm run build`...', role: 'assistant' });
+            const v = await execShell('npm run build', 300_000);
+            queuedAppend({ id: `bld-res-${Date.now()}`, kind: 'text', text: v.exitCode === 0 ? '[build] succeeded' : `[build] failed (exit ${v.exitCode}):\n${outCap(v.stdout + v.stderr)}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `bld-err-${Date.now()}`, kind: 'error', message: `build failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'run': {
+        if (!cmd.command) {
+          queuedAppend({ id: `run-${Date.now()}`, kind: 'text', text: 'usage: /run <command>', role: 'assistant' });
+        } else {
+          try {
+            const v = await execShell(cmd.command, 300_000);
+            queuedAppend({ id: `run2-${Date.now()}`, kind: 'text', text: `$ ${cmd.command}\nexit ${v.exitCode}\n${outCap(v.stdout + (v.stderr ? `\n[stderr]\n${v.stderr}` : '') || '(no output)')}`, role: 'assistant' });
+          } catch (err) {
+            queuedAppend({ id: `run-err-${Date.now()}`, kind: 'error', message: `run failed: ${err instanceof Error ? err.message : String(err)}` });
+          }
+        }
+        return;
+      }
+      case 'fix': {
+        await runWithBridge(`Fix ${cmd.target ?? 'failing tests and lint errors'}: reproduce the failure, fix the source (do not edit test assertions unless the test itself is wrong), then verify.`);
+        return;
+      }
+      case 'explain': {
+        if (!cmd.target) {
+          queuedAppend({ id: `exp-${Date.now()}`, kind: 'text', text: 'usage: /explain <file|symbol>', role: 'assistant' });
+        } else {
+          let ctx = '';
+          try {
+            const fr = await registry.execute('read_file', { path: cmd.target }, { cwd, env: process.env, nonInteractive: true });
+            if (fr.ok) ctx = `File ${cmd.target}:\n${String((fr.value as { content?: string }).content ?? '').slice(0, 6000)}`;
+          } catch { /* symbol — answer without file context */ }
+          await answerReadOnly(`Explain ${cmd.target}: what it does, key logic, and gotchas.`, ctx || undefined);
+        }
+        return;
+      }
+      case 'format': {
+        try {
+          const v = await execShell('git status --porcelain');
+          const files = v.stdout.split('\n').map((l) => l.slice(3).trim()).filter((f) => /\.(ts|tsx|js|jsx|json|md)$/.test(f)).slice(0, 20);
+          if (files.length === 0) {
+            queuedAppend({ id: `fmt-${Date.now()}`, kind: 'text', text: 'Nothing to format (no changed source files).', role: 'assistant' });
+          } else {
+            const check = await execShell('npx --no-install prettier --version').catch(() => null);
+            if (!check || check.exitCode !== 0) {
+              queuedAppend({ id: `fmt2-${Date.now()}`, kind: 'text', text: 'prettier not installed — run `npm i -D prettier` first.', role: 'assistant' });
+            } else {
+              const fv = await execShell(`npx prettier --write ${files.map((f) => `"${f}"`).join(' ')}`);
+              queuedAppend({ id: `fmt3-${Date.now()}`, kind: 'text', text: fv.exitCode === 0 ? `[format] formatted ${files.length} file(s)` : `[format] failed:\n${outCap(fv.stderr || fv.stdout)}`, role: 'assistant' });
+            }
+          }
+        } catch (err) {
+          queuedAppend({ id: `fmt-err-${Date.now()}`, kind: 'error', message: `format failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'ask': {
+        if (!cmd.question) {
+          queuedAppend({ id: `ask-${Date.now()}`, kind: 'text', text: 'usage: /ask <question>  (read-only, no edits)', role: 'assistant' });
+        } else {
+          await answerReadOnly(cmd.question);
+        }
+        return;
+      }
+      case 'redo': {
+        queuedAppend({ id: `redo-${Date.now()}`, kind: 'text', text: 'No redo stack — checkpoints support /undo and /rewind only.', role: 'assistant' });
+        return;
+      }
+      case 'checkpoint': {
+        try {
+          const { snapshot } = await import('../checkpoints/store.js');
+          const v = await execShell('git status --porcelain');
+          const files = v.stdout.split('\n').map((l) => l.slice(3).trim()).filter(Boolean);
+          if (files.length === 0) {
+            queuedAppend({ id: `ckpt-${Date.now()}`, kind: 'text', text: 'Working tree clean — nothing to checkpoint.', role: 'assistant' });
+          } else {
+            const id = await snapshot(cwd, files.slice(0, 50));
+            queuedAppend({ id: `ckpt2-${Date.now()}`, kind: 'text', text: `checkpoint ${String(id).slice(0, 8)} — ${files.length} file(s)`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `ckpt-err-${Date.now()}`, kind: 'error', message: `checkpoint failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'accept': {
+        const ok = tuiBridge.resolve('allow');
+        queuedAppend({ id: `acc-${Date.now()}`, kind: 'text', text: ok ? 'accepted pending edits' : 'no pending edits to accept', role: 'assistant' });
+        return;
+      }
+      case 'reject': {
+        const ok = tuiBridge.resolve('deny');
+        queuedAppend({ id: `rej-${Date.now()}`, kind: 'text', text: ok ? 'rejected pending edits' : 'no pending edits to reject', role: 'assistant' });
+        return;
+      }
+      case 'details': {
+        detailsMode = !detailsMode;
+        queuedAppend({ id: `det-${Date.now()}`, kind: 'text', text: `detailed activity: ${detailsMode ? 'on (tool groups expanded by default — use ctrl+o)' : 'off'}`, role: 'assistant' });
+        return;
+      }
+      case 'verbose': {
+        verboseMode = !verboseMode;
+        queuedAppend({ id: `verb-${Date.now()}`, kind: 'text', text: `verbose output: ${verboseMode ? 'on (8k output cap)' : 'off (4k output cap)'}`, role: 'assistant' });
+        return;
+      }
+      case 'raw': {
+        rawMode = !rawMode;
+        queuedAppend({ id: `raw-${Date.now()}`, kind: 'text', text: `raw output: ${rawMode ? 'on (12k cap, no truncation notes)' : 'off'}`, role: 'assistant' });
+        return;
+      }
+      case 'activity': {
+        const s = lastStatus;
+        const line = s ? `status=${s.status} step=${s.step}/${s.maxSteps} model=${s.model} tokens=${s.usageInput + s.usageOutput}` : `status=idle model=${model}`;
+        queuedAppend({ id: `act-${Date.now()}`, kind: 'text', text: `Activity: ${line}${inflight ? ' (task running)' : ''}${tuiSessionId ? ` session=${tuiSessionId.slice(0, 8)}` : ''}`, role: 'assistant' });
+        return;
+      }
+      case 'tasks':
+      case 'ps': {
+        const { listJobs } = await import('../tools/shell/background.js');
+        const jobs = listJobs();
+        if (jobs.length === 0) queuedAppend({ id: `tasks-${Date.now()}`, kind: 'text', text: 'No background jobs', role: 'assistant' });
+        else queuedAppend({ id: `tasks2-${Date.now()}`, kind: 'text', text: `Background jobs:\n${jobs.map((j) => `  ${j.id.slice(0, 12)} [${j.running ? 'running' : 'done'}] ${j.command}`).join('\n')}\nstop via /stop <id>`, role: 'assistant' });
+        if (bgAgentTasks.length > 0) {
+          queuedAppend({ id: `tasks3-${Date.now()}`, kind: 'text', text: `Agent tasks:\n${bgAgentTasks.map((t) => `  ${t.id} [${t.status}] ${t.task.slice(0, 80)}`).join('\n')}`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'stop':
+      case 'kill': {
+        const id = cmd.id?.trim();
+        const { listJobs, killJob } = await import('../tools/shell/background.js');
+        if (!id) {
+          const jobs = listJobs();
+          queuedAppend({ id: `stop-${Date.now()}`, kind: 'text', text: jobs.length === 0 ? 'No background jobs.\nusage: /stop <id>' : `usage: /stop <id>\njobs:\n${jobs.map((j) => `  ${j.id.slice(0, 12)} ${j.command}`).join('\n')}`, role: 'assistant' });
+        } else {
+          const match = listJobs().find((j) => j.id.startsWith(id)) ?? listJobs().find((j) => j.id.includes(id));
+          const ag = bgAgentTasks.find((t) => t.id.startsWith(id));
+          if (match) {
+            try { killJob(match.id); queuedAppend({ id: `stop2-${Date.now()}`, kind: 'text', text: `stopped ${match.id.slice(0, 12)}`, role: 'assistant' }); }
+            catch (err) { queuedAppend({ id: `stop-err-${Date.now()}`, kind: 'error', message: String(err) }); }
+          } else if (ag) {
+            ag.status = 'stopped';
+            queuedAppend({ id: `stop3-${Date.now()}`, kind: 'text', text: `marked agent task ${ag.id} stopped (in-flight loop finishes current step)`, role: 'assistant' });
+          } else {
+            queuedAppend({ id: `stop-err2-${Date.now()}`, kind: 'error', message: `no job: ${id}` });
+          }
+        }
+        return;
+      }
+      case 'queue': {
+        const pending = bgAgentTasks.filter((t) => t.status === 'running');
+        queuedAppend({ id: `queue-${Date.now()}`, kind: 'text', text: pending.length === 0 ? 'Queue empty (input queue lives in the TUI — enter to queue while running, esc to drop).' : `Queued/running agent tasks:\n${pending.map((t) => `  ${t.id}: ${t.task.slice(0, 80)}`).join('\n')}`, role: 'assistant' });
+        return;
+      }
+      case 'retry': {
+        if (!lastPromptText) {
+          queuedAppend({ id: `retry-err-${Date.now()}`, kind: 'error', message: 'nothing to retry yet' });
+        } else {
+          queuedAppend({ id: `retry-${Date.now()}`, kind: 'text', text: `retrying: ${lastPromptText.slice(0, 120)}`, role: 'assistant' });
+          await runWithBridge(lastPromptText);
+        }
+        return;
+      }
+      case 'mcp': {
+        try {
+          const { readFileSync, existsSync } = await import('node:fs');
+          const { join } = await import('node:path');
+          const sub = cmd.sub?.trim().split(/\s+/)[0] ?? 'list';
+          const arg = cmd.sub?.trim().split(/\s+/).slice(1).join(' ');
+          const cfgPath = join(cwd, '.mcp.json');
+          if (!existsSync(cfgPath)) {
+            queuedAppend({ id: `mcp-${Date.now()}`, kind: 'text', text: 'No MCP servers configured (no .mcp.json). Add servers to .mcp.json.', role: 'assistant' });
+            return;
+          }
+          const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8')) as { servers?: Record<string, { disabled?: boolean; url?: string; command?: string }> };
+          const servers = cfg.servers ?? {};
+          const names = Object.keys(servers);
+          if (sub === 'list' || sub === 'status' || !sub) {
+            queuedAppend({ id: `mcp2-${Date.now()}`, kind: 'text', text: names.length === 0 ? 'MCP: .mcp.json has no servers.' : `MCP servers (${names.length}, lazy-connect):\n${names.map((n) => `  ${servers[n]?.disabled ? '[disabled]' : '[enabled] '} ${n}${servers[n]?.url ? ` ${servers[n].url}` : ''}`).join('\n')}`, role: 'assistant' });
+          } else if ((sub === 'enable' || sub === 'disable') && arg) {
+            if (!servers[arg]) {
+              queuedAppend({ id: `mcp-err-${Date.now()}`, kind: 'error', message: `no MCP server: ${arg}` });
+            } else {
+              servers[arg]!.disabled = sub === 'disable';
+              const { writeFileSync } = await import('node:fs');
+              writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf-8');
+              queuedAppend({ id: `mcp3-${Date.now()}`, kind: 'text', text: `MCP server ${arg} ${sub}d`, role: 'assistant' });
+            }
+          } else if (sub === 'reconnect' && arg) {
+            queuedAppend({ id: `mcp4-${Date.now()}`, kind: 'text', text: servers[arg] ? `MCP ${arg}: reconnect queued (connections are lazy — next tool use reconnects)` : `no MCP server: ${arg}`, role: 'assistant' });
+          } else {
+            queuedAppend({ id: `mcp5-${Date.now()}`, kind: 'text', text: 'usage: /mcp [list|status|enable <n>|disable <n>|reconnect <n>]', role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `mcp-err2-${Date.now()}`, kind: 'error', message: `mcp failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
+      case 'agents': {
+        queuedAppend({ id: `agents-${Date.now()}`, kind: 'text', text: `Agents (active: ${activeAgent}):\n${AGENT_ROLES.map((a) => `  ${a === activeAgent ? '*' : ' '} ${a}`).join('\n')}\nswitch via /agent <name>, spawn via /subtask <task>`, role: 'assistant' });
+        return;
+      }
+      case 'agent': {
+        const n = cmd.name?.trim().toLowerCase();
+        if (!n) {
+          queuedAppend({ id: `agent-${Date.now()}`, kind: 'text', text: `active agent: ${activeAgent}\nusage: /agent <${AGENT_ROLES.join('|')}>`, role: 'assistant' });
+        } else if (!AGENT_ROLES.includes(n)) {
+          queuedAppend({ id: `agent-err-${Date.now()}`, kind: 'error', message: `unknown agent: ${n} (expected ${AGENT_ROLES.join('|')})` });
+        } else {
+          activeAgent = n;
+          queuedAppend({ id: `agent2-${Date.now()}`, kind: 'text', text: `active agent: ${n} (role label for future tasks)`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'subagents': {
+        queuedAppend({ id: `subagents-${Date.now()}`, kind: 'text', text: `Subagents: ${AGENT_ROLES.filter((a) => a !== 'default').join(', ')}\nspawn via /subtask <task> — runs a full agent loop and reports back.`, role: 'assistant' });
+        return;
+      }
+      case 'subtask': {
+        if (!cmd.task) {
+          queuedAppend({ id: `subtask-${Date.now()}`, kind: 'text', text: 'usage: /subtask <task>', role: 'assistant' });
+        } else {
+          queuedAppend({ id: `subtask-run-${Date.now()}`, kind: 'text', text: `[subagent:${activeAgent}] starting: ${cmd.task.slice(0, 120)}`, role: 'assistant' });
+          await runWithBridge(`[subagent task] ${cmd.task}`);
+        }
+        return;
+      }
+      case 'background': {
+        if (!cmd.task) {
+          queuedAppend({ id: `bg-${Date.now()}`, kind: 'text', text: bgAgentTasks.length === 0 ? 'No agent background tasks.\nusage: /background <task>' : `Agent background tasks:\n${bgAgentTasks.map((t) => `  ${t.id} [${t.status}] ${t.task.slice(0, 80)}`).join('\n')}`, role: 'assistant' });
+        } else {
+          const id = `bg-${Date.now().toString(36)}`;
+          bgAgentTasks.push({ id, task: cmd.task, status: 'running' });
+          queuedAppend({ id: `bg-run-${Date.now()}`, kind: 'text', text: `[background] ${id} started: ${cmd.task.slice(0, 120)}`, role: 'assistant' });
+          void runWithBridge(cmd.task).then(() => {
+            const t = bgAgentTasks.find((x) => x.id === id);
+            if (t && t.status === 'running') t.status = 'done';
+          }).catch(() => {
+            const t = bgAgentTasks.find((x) => x.id === id);
+            if (t && t.status === 'running') t.status = 'failed';
+          });
+        }
+        return;
+      }
+      case 'add-dir': {
+        const { existsSync, statSync } = await import('node:fs');
+        const { resolve } = await import('node:path');
+        const p = cmd.path?.trim();
+        if (!p) {
+          queuedAppend({ id: `adddir-${Date.now()}`, kind: 'text', text: 'usage: /add-dir <path>', role: 'assistant' });
+        } else {
+          const abs = resolve(cwd, p);
+          try {
+            if (!existsSync(abs) || !statSync(abs).isDirectory()) {
+              queuedAppend({ id: `adddir-err-${Date.now()}`, kind: 'error', message: `not a directory: ${p}` });
+            } else {
+              const cfg = (policy as unknown as { config: { additionalDirs?: string[] } }).config;
+              if (!cfg.additionalDirs?.includes(abs)) cfg.additionalDirs = [...(cfg.additionalDirs ?? []), abs];
+              queuedAppend({ id: `adddir2-${Date.now()}`, kind: 'text', text: `added allowed directory: ${abs}`, role: 'assistant' });
+            }
+          } catch (err) {
+            queuedAppend({ id: `adddir-err2-${Date.now()}`, kind: 'error', message: String(err) });
+          }
+        }
+        return;
+      }
+      case 'cd': {
+        const { existsSync, statSync } = await import('node:fs');
+        const { resolve } = await import('node:path');
+        const p = cmd.path?.trim();
+        if (!p) {
+          queuedAppend({ id: `cd-${Date.now()}`, kind: 'text', text: `cwd: ${cwd}\nusage: /cd <path>`, role: 'assistant' });
+        } else {
+          const abs = resolve(cwd, p);
+          if (!existsSync(abs) || !statSync(abs).isDirectory()) {
+            queuedAppend({ id: `cd-err-${Date.now()}`, kind: 'error', message: `not a directory: ${p}` });
+          } else {
+            cwd = abs;
+            queuedAppend({ id: `cd2-${Date.now()}`, kind: 'text', text: `cwd → ${abs} (header refreshes on restart)`, role: 'assistant' });
+          }
+        }
+        return;
+      }
+      case 'attach': {
+        if (!cmd.file) {
+          queuedAppend({ id: `att-${Date.now()}`, kind: 'text', text: 'usage: /attach <file>', role: 'assistant' });
+        } else {
+          try {
+            const r = await registry.execute('read_file', { path: cmd.file }, { cwd, env: process.env, nonInteractive: true });
+            if (!r.ok) {
+              queuedAppend({ id: `att-err-${Date.now()}`, kind: 'error', message: `attach failed: ${(r.error as { message?: string }).message ?? 'read error'}` });
+            } else {
+              const body = String((r.value as { content?: string }).content ?? '');
+              attachedFiles.set(cmd.file, body.length);
+              queuedAppend({ id: `att2-${Date.now()}`, kind: 'text', text: `attached ${cmd.file} (${body.length} chars) — in context for future prompts`, role: 'assistant' });
+            }
+          } catch (err) {
+            queuedAppend({ id: `att-err2-${Date.now()}`, kind: 'error', message: String(err) });
+          }
+        }
+        return;
+      }
+      case 'drop': {
+        if (!cmd.file) {
+          attachedFiles.clear();
+          queuedAppend({ id: `drop-${Date.now()}`, kind: 'text', text: 'dropped all attached files', role: 'assistant' });
+        } else if (attachedFiles.delete(cmd.file)) {
+          queuedAppend({ id: `drop2-${Date.now()}`, kind: 'text', text: `dropped ${cmd.file}`, role: 'assistant' });
+        } else {
+          queuedAppend({ id: `drop-err-${Date.now()}`, kind: 'error', message: `not attached: ${cmd.file}` });
+        }
+        return;
+      }
+      case 'files': {
+        queuedAppend({ id: `files-${Date.now()}`, kind: 'text', text: attachedFiles.size === 0 ? 'No files in context (attach via /attach, @path, or /mention).' : `Files in context:\n${[...attachedFiles.entries()].map(([f, n]) => `  ${f} (${n} chars)`).join('\n')}`, role: 'assistant' });
+        return;
+      }
+      case 'image': {
+        if (!cmd.path) {
+          queuedAppend({ id: `img-${Date.now()}`, kind: 'text', text: 'usage: /image <path>  (or @<image> inline in a prompt)', role: 'assistant' });
+        } else {
+          attachedFiles.set(cmd.path, 0);
+          queuedAppend({ id: `img2-${Date.now()}`, kind: 'text', text: `attached image ${cmd.path} — reference it in your next prompt`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'paste': {
+        try {
+          const { execSync } = await import('node:child_process');
+          const probe = process.platform === 'win32' ? 'powershell -NoProfile -Command Get-Clipboard' : process.platform === 'darwin' ? 'pbpaste' : 'xclip -o -selection clipboard';
+          const text = execSync(probe, { encoding: 'utf-8' }).trim();
+          if (!text) {
+            queuedAppend({ id: `paste-${Date.now()}`, kind: 'text', text: 'Clipboard is empty.', role: 'assistant' });
+          } else {
+            queuedAppend({ id: `paste2-${Date.now()}`, kind: 'text', text: `pasted ${text.length} chars into context:\n${text.slice(0, 3000)}`, role: 'assistant' });
+          }
+        } catch {
+          queuedAppend({ id: `paste-err-${Date.now()}`, kind: 'error', message: 'clipboard unavailable on this system' });
+        }
+        return;
+      }
+      case 'ls': {
+        try {
+          const r = await registry.execute('list_directory', { path: cmd.path || '.' }, { cwd, env: process.env, nonInteractive: true });
+          if (!r.ok) {
+            queuedAppend({ id: `ls-err-${Date.now()}`, kind: 'error', message: `ls failed: ${(r.error as { message?: string }).message ?? 'error'}` });
+          } else {
+            const v = r.value as { entries?: Array<{ name: string; type: string }> };
+            const lines = (v.entries ?? []).map((e) => `  ${e.type === 'directory' ? e.name + '/' : e.name}`);
+            queuedAppend({ id: `ls2-${Date.now()}`, kind: 'text', text: `${cmd.path || '.'}:\n${outCap(lines.join('\n') || '(empty)')}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `ls-err2-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'tree': {
+        try {
+          const { readdirSync, statSync } = await import('node:fs');
+          const { join, relative } = await import('node:path');
+          const root = cmd.path ? join(cwd, cmd.path) : cwd;
+          const out: string[] = [];
+          const skip = new Set(['node_modules', '.git', 'dist', '.klyro', '.next']);
+          const walk = (dir: string, depth: number): void => {
+            if (depth > 3 || out.length > 100) return;
+            let entries: string[] = [];
+            try { entries = readdirSync(dir); } catch { return; }
+            for (const e of entries) {
+              if (skip.has(e)) continue;
+              const full = join(dir, e);
+              let isDir = false;
+              try { isDir = statSync(full).isDirectory(); } catch { continue; }
+              out.push(`${'  '.repeat(depth)}${isDir ? e + '/' : e}`);
+              if (isDir) walk(full, depth + 1);
+            }
+          };
+          walk(root, 0);
+          queuedAppend({ id: `tree-${Date.now()}`, kind: 'text', text: `${relative(cwd, root) || '.'}/\n${out.join('\n').slice(0, 4000)}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `tree-err-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'search': {
+        if (!cmd.query) {
+          queuedAppend({ id: `search-${Date.now()}`, kind: 'text', text: 'usage: /search <query>', role: 'assistant' });
+        } else {
+          try {
+            const r = await registry.execute('grep', { pattern: cmd.query, maxResults: 50 }, { cwd, env: process.env, nonInteractive: true });
+            if (!r.ok) {
+              queuedAppend({ id: `search-err-${Date.now()}`, kind: 'error', message: `search failed: ${(r.error as { message?: string }).message ?? 'error'}` });
+            } else {
+              queuedAppend({ id: `search2-${Date.now()}`, kind: 'text', text: `Results for "${cmd.query}":\n${outCap(JSON.stringify(r.value, null, 2))}`, role: 'assistant' });
+            }
+          } catch (err) {
+            queuedAppend({ id: `search-err2-${Date.now()}`, kind: 'error', message: String(err) });
+          }
+        }
+        return;
+      }
+      case 'web': {
+        if (!cmd.url) {
+          queuedAppend({ id: `web-${Date.now()}`, kind: 'text', text: 'usage: /web <url>', role: 'assistant' });
+        } else {
+          try {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 15_000);
+            const res = await fetch(cmd.url, { signal: ctrl.signal });
+            clearTimeout(t);
+            const text = (await res.text()).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 6000);
+            queuedAppend({ id: `web2-${Date.now()}`, kind: 'text', text: `${cmd.url} [${res.status}]:\n${text || '(no text content)'}`, role: 'assistant' });
+          } catch (err) {
+            queuedAppend({ id: `web-err-${Date.now()}`, kind: 'error', message: `fetch failed: ${err instanceof Error ? err.message : String(err)}` });
+          }
+        }
+        return;
+      }
+      case 'read': {
+        if (!cmd.path) {
+          queuedAppend({ id: `read-${Date.now()}`, kind: 'text', text: 'usage: /read <path>', role: 'assistant' });
+        } else {
+          try {
+            const r = await registry.execute('read_file', { path: cmd.path }, { cwd, env: process.env, nonInteractive: true });
+            if (!r.ok) {
+              queuedAppend({ id: `read-err-${Date.now()}`, kind: 'error', message: `read failed: ${(r.error as { message?: string }).message ?? 'error'}` });
+            } else {
+              queuedAppend({ id: `read2-${Date.now()}`, kind: 'text', text: `${cmd.path}:\n${outCap(String((r.value as { content?: string }).content ?? ''))}`, role: 'assistant' });
+            }
+          } catch (err) {
+            queuedAppend({ id: `read-err2-${Date.now()}`, kind: 'error', message: String(err) });
+          }
+        }
+        return;
+      }
+      case 'map': {
+        try {
+          const r = await registry.execute('repo_map', {}, { cwd, env: process.env, nonInteractive: true });
+          if (!r.ok) {
+            queuedAppend({ id: `map-err-${Date.now()}`, kind: 'error', message: `map failed: ${(r.error as { message?: string }).message ?? 'error'}` });
+          } else {
+            queuedAppend({ id: `map2-${Date.now()}`, kind: 'text', text: `Repository map:\n${outCap(typeof r.value === 'string' ? r.value : JSON.stringify(r.value, null, 2))}`, role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `map-err2-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'tokens': {
+        const { getModelInfo } = await import('../providers/model-info.js');
+        const info = getModelInfo(model);
+        const inp = lastStatus?.usageInput ?? 0;
+        const outp = lastStatus?.usageOutput ?? 0;
+        const total = inp + outp;
+        const pct = ((total / info.contextWindow) * 100).toFixed(1);
+        queuedAppend({ id: `tokens-${Date.now()}`, kind: 'text', text: `Tokens — ${model} (window ${info.contextWindow.toLocaleString()}):\n  in ${inp.toLocaleString()} / out ${outp.toLocaleString()} / total ${total.toLocaleString()} (${pct}%)`, role: 'assistant' });
+        return;
+      }
+      case 'commit': {
+        if (!cmd.message) {
+          queuedAppend({ id: `commit-${Date.now()}`, kind: 'text', text: 'usage: /commit <message>  (commits staged changes only — stage with git add first)', role: 'assistant' });
+        } else {
+          try {
+            const st = await execShell('git status --porcelain');
+            const staged = st.stdout.split('\n').filter((l) => /^[MADRC]/.test(l));
+            if (staged.length === 0) {
+              queuedAppend({ id: `commit2-${Date.now()}`, kind: 'text', text: 'Nothing staged — stage changes with `git add` first.', role: 'assistant' });
+            } else {
+              const safeMsg = cmd.message.replace(/"/g, "'");
+              const v = await execShell(`git commit -m "${safeMsg}"`);
+              queuedAppend({ id: `commit3-${Date.now()}`, kind: 'text', text: v.exitCode === 0 ? `committed ${staged.length} file(s):\n${outCap(v.stdout)}` : `commit failed:\n${outCap(v.stderr || v.stdout)}`, role: 'assistant' });
+            }
+          } catch (err) {
+            queuedAppend({ id: `commit-err-${Date.now()}`, kind: 'error', message: String(err) });
+          }
+        }
+        return;
+      }
+      case 'push': {
+        try {
+          queuedAppend({ id: `push-run-${Date.now()}`, kind: 'text', text: '[push] running `git push`...', role: 'assistant' });
+          const v = await execShell('git push', 300_000);
+          queuedAppend({ id: `push-res-${Date.now()}`, kind: 'text', text: v.exitCode === 0 ? `[push] done:\n${outCap(v.stdout + v.stderr)}` : `[push] failed:\n${outCap(v.stderr || v.stdout)}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `push-err-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'pull': {
+        try {
+          const v = await execShell('git pull --ff-only', 300_000);
+          queuedAppend({ id: `pull-${Date.now()}`, kind: 'text', text: v.exitCode === 0 ? `[pull] done:\n${outCap(v.stdout + v.stderr)}` : `[pull] failed:\n${outCap(v.stderr || v.stdout)}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `pull-err-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'pr': {
+        try {
+          const hasGh = await execShell('gh --version').then(() => true).catch(() => false);
+          if (!hasGh) {
+            queuedAppend({ id: `pr-${Date.now()}`, kind: 'text', text: 'gh CLI not installed — install from https://cli.github.com then use /pr [create|status|view].', role: 'assistant' });
+          } else {
+            const v = await execShell(`gh pr ${cmd.args || 'status'}`);
+            queuedAppend({ id: `pr2-${Date.now()}`, kind: 'text', text: outCap(v.stdout + v.stderr) || '(no output)', role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `pr-err-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'issue': {
+        try {
+          const hasGh = await execShell('gh --version').then(() => true).catch(() => false);
+          if (!hasGh) {
+            queuedAppend({ id: `issue-${Date.now()}`, kind: 'text', text: 'gh CLI not installed — install from https://cli.github.com.', role: 'assistant' });
+          } else {
+            const v = await execShell(cmd.id ? `gh issue view ${cmd.id}` : 'gh issue status');
+            queuedAppend({ id: `issue2-${Date.now()}`, kind: 'text', text: outCap(v.stdout + v.stderr) || '(no output)', role: 'assistant' });
+          }
+        } catch (err) {
+          queuedAppend({ id: `issue-err-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'editor': {
+        const file = cmd.file?.trim();
+        const ed = process.env.EDITOR ?? process.env.VISUAL ?? (process.platform === 'win32' ? 'notepad' : 'vi');
+        if (!file) {
+          queuedAppend({ id: `ed-${Date.now()}`, kind: 'text', text: `editor: ${ed}\nusage: /editor <file>`, role: 'assistant' });
+        } else {
+          try {
+            const { startBackground } = await import('../tools/shell/background.js');
+            const { resolve } = await import('node:path');
+            const abs = resolve(cwd, file);
+            const opener = process.platform === 'win32' ? `start "" "${abs}"` : process.platform === 'darwin' ? `open "${abs}"` : `xdg-open "${abs}"`;
+            startBackground(opener, cwd);
+            queuedAppend({ id: `ed2-${Date.now()}`, kind: 'text', text: `opened ${abs} in background`, role: 'assistant' });
+          } catch (err) {
+            queuedAppend({ id: `ed-err-${Date.now()}`, kind: 'error', message: String(err) });
+          }
+        }
+        return;
+      }
+      case 'keymap':
+      case 'vim':
+      case 'theme':
+      case 'statusline':
+      case 'output-style': {
+        const key = cmd.kind === 'keymap' ? 'klyro.keymap' : cmd.kind === 'vim' ? 'klyro.vim' : cmd.kind === 'theme' ? 'klyro.theme' : cmd.kind === 'statusline' ? 'klyro.statusline' : 'klyro.outputStyle';
+        const val = (cmd.kind === 'keymap' ? cmd.name : cmd.kind === 'vim' ? cmd.state : cmd.kind === 'theme' ? cmd.name : cmd.kind === 'statusline' ? cmd.format : cmd.style)?.trim();
+        const { runConfig } = await import('./config.js');
+        const capture = async (args: string[]): Promise<string> => {
+          const orig = process.stdout.write.bind(process.stdout);
+          let out = '';
+          (process.stdout as unknown as { write: (s: string) => boolean }).write = ((c: string) => { out += String(c); return true; }) as typeof process.stdout.write;
+          try { await runConfig(args); } finally { (process.stdout as unknown as { write: typeof orig }).write = orig; }
+          return out;
+        };
+        if (!val) {
+          const out = await capture(['get', key]);
+          queuedAppend({ id: `${cmd.kind}-${Date.now()}`, kind: 'text', text: out.trim() || `${cmd.kind}: (not set)\nusage: /${cmd.kind} <value>`, role: 'assistant' });
+        } else {
+          await capture(['set', key, val]);
+          queuedAppend({ id: `${cmd.kind}2-${Date.now()}`, kind: 'text', text: `${cmd.kind} set to ${val}`, role: 'assistant' });
+        }
+        return;
+      }
+      case 'debug': {
+        const info = [
+          `klyro debug:`,
+          `  node ${process.version}  platform ${process.platform}/${process.arch}`,
+          `  cwd ${cwd}`,
+          `  provider ${currentProvider} ${currentBaseUrl}`,
+          `  model ${model}  effort ${effortLevel}  maxSteps ${currentMaxSteps}  fast ${fastMode ? 'on' : 'off'}`,
+          `  mode ${displayMode}  agent ${activeAgent}`,
+          `  apiKey: ${currentApiKey ? 'set (' + currentApiKey.length + ' chars)' : 'empty'}`,
+          `  session ${tuiSessionId?.slice(0, 8) ?? '(none)'}  attached ${attachedFiles.size}  aliases ${aliases.size}  prompts ${savedPrompts.size}`,
+        ];
+        queuedAppend({ id: `debug-${Date.now()}`, kind: 'text', text: info.join('\n'), role: 'assistant' });
+        return;
+      }
+      case 'whoami': {
+        let user = process.env.USER ?? process.env.USERNAME ?? 'unknown';
+        try { user = (await import('node:os')).userInfo().username; } catch { /* keep env */ }
+        queuedAppend({ id: `who-${Date.now()}`, kind: 'text', text: `user: ${user}\nprovider: ${currentProvider} (${currentBaseUrl})\nmodel: ${model}`, role: 'assistant' });
+        return;
+      }
+      case 'reload': {
+        try {
+          const ctx = await buildLevel6Context({ cwd });
+          ctxPrefix = ctx.formatted ? `\n\n<context>\n${ctx.formatted}\n</context>` : '';
+          const md = await import('../context/klyro-md.js').then((m) => m.loadKlyroMd(cwd)).catch(() => '');
+          klyroBlock = md ? `\n\n<KLYRO.md>\n${md.slice(0, 4000)}\n</KLYRO.md>` : '';
+          queuedAppend({ id: `reload-${Date.now()}`, kind: 'text', text: 'reloaded project context + KLYRO.md', role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `reload-err-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'reset': {
+        effortLevel = 'medium';
+        currentMaxSteps = EFFORT_STEPS.medium!;
+        fastMode = false;
+        displayMode = 'default';
+        (policy as unknown as { config: Record<string, unknown> }).config.mode = 'default';
+        activeAgent = 'default';
+        verboseMode = false;
+        detailsMode = false;
+        rawMode = false;
+        queuedStatus({ maxSteps: currentMaxSteps });
+        queuedAppend({ id: `reset-${Date.now()}`, kind: 'text', text: 'settings reset to defaults (effort medium, mode default, agent default)', role: 'assistant' });
+        return;
+      }
+      case 'bug': {
+        queuedAppend({ id: `bug-${Date.now()}`, kind: 'text', text: `Report a bug: https://github.com/Siddu-lingampelli/Klyro/issues\nInclude: klyro --version, node ${process.version}, provider ${currentProvider}, steps to reproduce.`, role: 'assistant' });
+        return;
+      }
+      case 'changelog': {
+        try {
+          const v = await execShell('git log --oneline -15');
+          queuedAppend({ id: `cl-${Date.now()}`, kind: 'text', text: v.exitCode === 0 && v.stdout.trim() ? `Recent changes:\n${v.stdout.slice(0, 3000)}` : 'No git history here — see npm klyro versions for releases.', role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `cl-err-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
+      case 'promptcmd': {
+        const rest = cmd.args?.trim() ?? '';
+        if (!rest) {
+          queuedAppend({ id: `pc-${Date.now()}`, kind: 'text', text: savedPrompts.size === 0 ? 'No saved prompts.\nusage: /prompt save <name> <text> | /prompt <name>' : `Saved prompts:\n${[...savedPrompts.keys()].map((k) => `  ${k}`).join('\n')}\nrun via /prompt <name>`, role: 'assistant' });
+        } else if (rest.startsWith('save ')) {
+          const m = /^save\s+(\S+)\s+([\s\S]+)$/.exec(rest);
+          if (!m) {
+            queuedAppend({ id: `pc-err-${Date.now()}`, kind: 'error', message: 'usage: /prompt save <name> <text>' });
+          } else {
+            savedPrompts.set(m[1]!, m[2]!);
+            persistMap(promptFile, savedPrompts);
+            queuedAppend({ id: `pc2-${Date.now()}`, kind: 'text', text: `saved prompt "${m[1]}"`, role: 'assistant' });
+          }
+        } else {
+          const name = rest.split(/\s+/)[0]!;
+          const text = savedPrompts.get(name);
+          if (!text) {
+            queuedAppend({ id: `pc-err2-${Date.now()}`, kind: 'error', message: `no saved prompt: ${name}` });
+          } else {
+            await runWithBridge(text);
+          }
+        }
+        return;
+      }
+      case 'alias': {
+        const rest = cmd.args?.trim() ?? '';
+        if (!rest) {
+          queuedAppend({ id: `al-${Date.now()}`, kind: 'text', text: aliases.size === 0 ? 'No aliases.\nusage: /alias <name> <command>' : `Aliases:\n${[...aliases.entries()].map(([k, v]) => `  /${k} → ${v}`).join('\n')}`, role: 'assistant' });
+        } else {
+          const m = /^(\S+)\s+([\s\S]+)$/.exec(rest);
+          if (!m) {
+            queuedAppend({ id: `al-err-${Date.now()}`, kind: 'error', message: 'usage: /alias <name> <command>' });
+          } else {
+            aliases.set(m[1]!, m[2]!);
+            persistMap(aliasFile, aliases);
+            queuedAppend({ id: `al2-${Date.now()}`, kind: 'text', text: `alias /${m[1]} → ${m[2]}`, role: 'assistant' });
+          }
+        }
+        return;
+      }
+      case 'commands': {
+        const { COMMAND_DEFS } = await import('./slash/parser.js');
+        const custom = [...aliases.keys()].map((k) => `  /${k} (alias)`);
+        void custom;
+        queuedAppend({ id: `cmds-${Date.now()}`, kind: 'text', text: `Commands (${COMMAND_DEFS.length + aliases.size + savedPrompts.size}):\n${COMMAND_DEFS.map((d) => `  /${d.name} — ${d.hint}`).join('\n')}${aliases.size > 0 ? `\ncustom aliases:\n${[...aliases.entries()].map(([k, v]) => `  /${k} → ${v}`).join('\n')}` : ''}${savedPrompts.size > 0 ? `\nsaved prompts: ${[...savedPrompts.keys()].join(', ')}` : ''}`, role: 'assistant' });
+        return;
+      }
+      case 'env': {
+        const { existsSync } = await import('node:fs');
+        void existsSync;
+        const a = cmd.args?.trim() ?? '';
+        if (!a) {
+          const rows = Object.keys(process.env).filter((k) => k.startsWith('KLYRO_') || ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'NO_COLOR'].includes(k)).map((k) => {
+            const v = process.env[k] ?? '';
+            const secret = /KEY|SECRET|TOKEN/.test(k);
+            return `  ${k}=${secret ? (v ? '(set, ' + v.length + ' chars)' : '(empty)') : v || '(empty)'}`;
+          });
+          queuedAppend({ id: `env-${Date.now()}`, kind: 'text', text: rows.length === 0 ? 'No KLYRO_* env set.\nusage: /env KEY=value (session-only)' : `Environment:\n${rows.join('\n')}\nset via /env KEY=value (session-only)`, role: 'assistant' });
+        } else {
+          const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(a);
+          if (!m) {
+            queuedAppend({ id: `env-err-${Date.now()}`, kind: 'error', message: 'usage: /env KEY=value' });
+          } else {
+            process.env[m[1]!] = m[2]!;
+            queuedAppend({ id: `env2-${Date.now()}`, kind: 'text', text: `set ${m[1]} (session-only)`, role: 'assistant' });
+          }
+        }
+        return;
+      }
+      case 'deps': {
+        try {
+          const { readFileSync } = await import('node:fs');
+          const { join } = await import('node:path');
+          const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf-8')) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+          const d = Object.entries(pkg.dependencies ?? {}).map(([k, v]) => `  ${k}@${v}`);
+          const dd = Object.entries(pkg.devDependencies ?? {}).map(([k, v]) => `  ${k}@${v} (dev)`);
+          queuedAppend({ id: `deps-${Date.now()}`, kind: 'text', text: d.length + dd.length === 0 ? 'No dependencies in package.json.' : `Dependencies:\n${[...d, ...dd].join('\n').slice(0, 3000)}`, role: 'assistant' });
+        } catch {
+          queuedAppend({ id: `deps-err-${Date.now()}`, kind: 'error', message: 'no package.json in cwd' });
+        }
+        return;
+      }
+      case 'install': {
+        try {
+          const { existsSync } = await import('node:fs');
+          const { join } = await import('node:path');
+          const mgr = existsSync(join(cwd, 'pnpm-lock.yaml')) ? 'pnpm install' : existsSync(join(cwd, 'package-lock.json')) ? 'npm install' : existsSync(join(cwd, 'bun.lockb')) ? 'bun install' : existsSync(join(cwd, 'yarn.lock')) ? 'yarn install' : 'npm install';
+          queuedAppend({ id: `inst-run-${Date.now()}`, kind: 'text', text: `[install] running \`${mgr}\`...`, role: 'assistant' });
+          const v = await execShell(mgr, 600_000);
+          queuedAppend({ id: `inst-res-${Date.now()}`, kind: 'text', text: v.exitCode === 0 ? '[install] done' : `[install] failed:\n${outCap(v.stderr || v.stdout)}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `inst-err-${Date.now()}`, kind: 'error', message: String(err) });
+        }
+        return;
+      }
       case 'prompt': {
         // Regular prompts never reach onSlash — no-op for exhaustiveness.
         return;
       }
-      case 'unknown':
+      case 'unknown': {
+        // Alias expansion: /alias <name> <command> redirects unknown commands
+        const m = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(cmd.raw.trim());
+        const target = m ? aliases.get(m[1]!.toLowerCase()) : undefined;
+        if (m && target) {
+          const extra = m[2] ? ` ${m[2]}` : '';
+          await handleSlash(parse(target + extra));
+          return;
+        }
         queuedAppend({
           id: `unk-${Date.now()}`,
           kind: 'error',
-          message: `unknown command: ${cmd.raw} (try /help)`,
+          message: `unknown command: ${cmd.raw} (try /help or /commands)`,
         });
         return;
+      }
     }
   }
 

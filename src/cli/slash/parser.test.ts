@@ -98,6 +98,74 @@ describe('slash command parser', () => {
     expect(parse('@src/index.ts')).toEqual({ kind: 'mention', path: 'src/index.ts' });
   });
 
+  it('parses P2 workflow commands', () => {
+    expect(parse('/review')).toEqual({ kind: 'review', target: undefined });
+    expect(parse('/code-review').kind).toBe('code-review');
+    expect(parse('/security-review').kind).toBe('security-review');
+    expect(parse('/test src/a.test.ts')).toEqual({ kind: 'test', target: 'src/a.test.ts' });
+    expect(parse('/lint').kind).toBe('lint');
+    expect(parse('/build').kind).toBe('build');
+    expect(parse('/run npm test')).toEqual({ kind: 'run', command: 'npm test' });
+    expect(parse('/fix').kind).toBe('fix');
+    expect(parse('/explain foo')).toEqual({ kind: 'explain', target: 'foo' });
+    expect(parse('/format').kind).toBe('format');
+    expect(parse('/ask why?')).toEqual({ kind: 'ask', question: 'why?' });
+  });
+
+  it('parses P2 checkpoint/activity commands', () => {
+    expect(parse('/redo').kind).toBe('redo');
+    expect(parse('/checkpoint').kind).toBe('checkpoint');
+    expect(parse('/accept').kind).toBe('accept');
+    expect(parse('/reject').kind).toBe('reject');
+    expect(parse('/details').kind).toBe('details');
+    expect(parse('/verbose').kind).toBe('verbose');
+    expect(parse('/raw').kind).toBe('raw');
+    expect(parse('/activity').kind).toBe('activity');
+    expect(parse('/tasks').kind).toBe('tasks');
+    expect(parse('/ps').kind).toBe('ps');
+    expect(parse('/stop abc')).toEqual({ kind: 'stop', id: 'abc' });
+    expect(parse('/queue').kind).toBe('queue');
+    expect(parse('/retry').kind).toBe('retry');
+    expect(parse('/kill abc')).toEqual({ kind: 'kill', id: 'abc' });
+  });
+
+  it('parses P2 mcp/agent/file/git/config commands', () => {
+    expect(parse('/mcp enable gh')).toEqual({ kind: 'mcp', sub: 'enable gh' });
+    expect(parse('/agents').kind).toBe('agents');
+    expect(parse('/agent tester')).toEqual({ kind: 'agent', name: 'tester' });
+    expect(parse('/subtask do x')).toEqual({ kind: 'subtask', task: 'do x' });
+    expect(parse('/background job')).toEqual({ kind: 'background', task: 'job' });
+    expect(parse('/attach f.ts')).toEqual({ kind: 'attach', file: 'f.ts' });
+    expect(parse('/ls src')).toEqual({ kind: 'ls', path: 'src' });
+    expect(parse('/search foo')).toEqual({ kind: 'search', query: 'foo' });
+    expect(parse('/web https://x')).toEqual({ kind: 'web', url: 'https://x' });
+    expect(parse('/read f')).toEqual({ kind: 'read', path: 'f' });
+    expect(parse('/map').kind).toBe('map');
+    expect(parse('/tokens').kind).toBe('tokens');
+    expect(parse('/commit msg')).toEqual({ kind: 'commit', message: 'msg' });
+    expect(parse('/push').kind).toBe('push');
+    expect(parse('/pr').kind).toBe('pr');
+    expect(parse('/theme dark')).toEqual({ kind: 'theme', name: 'dark' });
+    expect(parse('/debug').kind).toBe('debug');
+    expect(parse('/whoami').kind).toBe('whoami');
+    expect(parse('/reload').kind).toBe('reload');
+    expect(parse('/reset').kind).toBe('reset');
+    expect(parse('/prompt save a b')).toEqual({ kind: 'promptcmd', args: 'save a b' });
+    expect(parse('/alias a b')).toEqual({ kind: 'alias', args: 'a b' });
+    expect(parse('/commands').kind).toBe('commands');
+    expect(parse('/deps').kind).toBe('deps');
+    expect(parse('/install').kind).toBe('install');
+  });
+
+  it('suggestCommands returns top prefix matches', async () => {
+    const { suggestCommands } = await import('./parser.js');
+    const s = suggestCommands('/c', 6);
+    expect(s.length).toBeGreaterThan(0);
+    expect(s.length).toBeLessThanOrEqual(6);
+    expect(s[0]!.name.startsWith('c')).toBe(true);
+    expect(suggestCommands('/xyz', 6)).toEqual([]);
+  });
+
   it('parses /diff', () => {
     expect(parse('/diff')).toEqual({ kind: 'diff' });
   });

@@ -4,11 +4,12 @@
  */
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
+import { execFileSync } from 'node:child_process';
 import type { StatusSnapshot } from './status.js';
 import type { TranscriptItem } from './transcript.js';
 import { TuiApprovalBridge } from './approval.js';
 import type { PlanStep } from '../agent/runtime.js';
-import { parse as parseSlash } from '../cli/slash/parser.js';
+import { parse as parseSlash, suggestCommands } from '../cli/slash/parser.js';
 import { tokens, g } from './tokens.js';
 
 export interface AppProps {
@@ -28,7 +29,13 @@ let _id = 0;
 function nextId(p: string): string { _id++; return `${p}-${_id}`; }
 
 function Header({ cwd, model, version, width }: { cwd: string; model: string; version: string; width: number }) {
-  const branch = (() => { try { const { execSync } = require('node:child_process') as typeof import('node:child_process'); return execSync('git rev-parse --abbrev-ref HEAD', { cwd, stdio: ['ignore','pipe','ignore'] }).toString().trim(); } catch { return ''; } })();
+  const branch = useMemo(() => {
+    try {
+      return execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    } catch {
+      return '';
+    }
+  }, [cwd]);
   const showLinks = width >= 120;
   return (
     <Box flexDirection="column" marginBottom={1}>
@@ -236,8 +243,19 @@ export function App(props: AppProps): React.JSX.Element {
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
+  // `/` autocomplete — top 6 prefix matches while completing a command name (no space yet)
+  const slashSuggest = input.startsWith('/') && !input.slice(1).includes(' ') && !awaitingApproval
+    ? suggestCommands(input, 6)
+    : [];
+
   useInput((inputStr, key) => {
     if (key.escape && queuedInputs.length > 0) { setQueuedInputs((prev) => prev.slice(1)); return; }
+    // Tab completes the top slash suggestion (e.g. `/c` → `/clear `)
+    if ((key.tab || inputStr === '\t') && slashSuggest.length > 0) {
+      const top = slashSuggest[0]!;
+      setInput(`/${top.name} `);
+      return;
+    }
     // Scroll keys (work in any mode, including while running).
     if (isFullscreen && maxOffset > 0) {
       if (key.home) { commands.jumpTop(); return; }
@@ -266,7 +284,7 @@ export function App(props: AppProps): React.JSX.Element {
   const cost = (status.usageInput / 1000 * 0.003 + status.usageOutput / 1000 * 0.015);
   const totalTokens = status.usageInput + status.usageOutput;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / 120_000) * 100) : 0;
-  const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  †‘†“ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
+  const baseHints = status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑/↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
   const hints = maxOffset > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
 
   return (
@@ -288,8 +306,8 @@ export function App(props: AppProps): React.JSX.Element {
                 if (gr.verb === 'Edited') return `Edited ${gr.items.length} files`;
                 return `${gr.verb} ${gr.items.length} items`;
               })();
-              const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? 'œ—' : `${gr.totalMs}ms`;
-              const marker = isExpanded ? '–¼' : 'œ“';
+              const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? g('failure') : `${gr.totalMs}ms`;
+              const marker = isExpanded ? g('expanded') : g('collapsed');
               const markerColor = gr.status === 'error' ? tokens.colors.err as string : gr.status === 'running' ? tokens.colors.warn as string : tokens.colors.ok as string;
               return (
                 <Box key={gr.id} flexDirection="column" marginBottom={1}>
@@ -321,7 +339,7 @@ export function App(props: AppProps): React.JSX.Element {
                 </Box>
               );
             }
-            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.err as string}>  {g('guide')}   œ— {it.message}</Text></Box>;
+            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.err as string}>  {g('guide')}   {g('failure')} {it.message}</Text></Box>;
             if (it.kind === 'policy') return null;
             if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
             if (it.kind === 'diff') return (
@@ -371,6 +389,14 @@ export function App(props: AppProps): React.JSX.Element {
           <Text backgroundColor={tokens.colors.accentSoft as string} color={tokens.colors.accent as string} bold>
             {' ↓ '}{pendingNew}{' new '}{pendingNew === 1 ? 'message' : 'messages'}{' '}
           </Text>
+        </Box>
+      ) : null}
+      {slashSuggest.length > 0 ? (
+        <Box flexDirection="column" paddingLeft={2}>
+          {slashSuggest.map((s, i) => (
+            <Text key={s.name} color={i === 0 ? (tokens.colors.accent as string) : (tokens.colors.dim as string)}>{i === 0 ? '▸' : ' '} /{s.name}  — {s.hint}</Text>
+          ))}
+          <Text color={tokens.colors.dim as string}>  tab to complete</Text>
         </Box>
       ) : null}
       <Box flexDirection="column">
