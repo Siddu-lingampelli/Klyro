@@ -644,6 +644,54 @@ describe('App', () => {
     expect(choice).toBe('deny');
   });
 
+  it('shows a working spinner while running (Thinking + status)', async () => {
+    const { lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        initialStatus={{ status: 'running' }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 120));
+    const frame = lastFrame() ?? '';
+    // Animated dots spinner (any braille frame) or its labels must show.
+    expect(frame).toMatch(/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Thinking|working/);
+    expect(frame).toContain('Thinking');
+    expect(frame).toContain('working');
+  });
+
+  it('running tool group shows a spinner, resolved group shows latency', async () => {
+    let hooks: {
+      append: (i: TranscriptItem) => void;
+      updateTool: (idCall: string, patch: { result: string; isError: boolean; latencyMs: number; status: 'done' | 'error' }) => void;
+    } | null = null;
+    const { lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialStatus={{ status: 'running' }}
+        onMounted={(h) => {
+          hooks = { append: h.append, updateTool: h.updateTool };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    hooks!.append({ id: 't1', kind: 'tool', name: 'read_file', id_call: 'c1', args: '{"path":"a.ts"}', status: 'running' });
+    await new Promise((r) => setTimeout(r, 120));
+    // Running group: spinner next to the verb (braille frame or fallback text).
+    expect(lastFrame() ?? '').toMatch(/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Read/);
+    hooks!.updateTool('c1', { result: 'ok', isError: false, latencyMs: 42, status: 'done' });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(lastFrame() ?? '').toMatch(/42ms/);
+  });
+
   it('Shift+Up / Shift+Down scroll by one line', async () => {
     const { stdin, lastFrame } = render(
       <App

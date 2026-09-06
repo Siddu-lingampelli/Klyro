@@ -4,6 +4,7 @@
  */
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Box, Text, useInput, useStdout } from 'ink';
+import Spinner from 'ink-spinner';
 import { execFileSync } from 'node:child_process';
 import type { StatusSnapshot } from './status.js';
 import type { TranscriptItem, ToolResultPatch } from './transcript.js';
@@ -624,10 +625,12 @@ export function App(props: AppProps): React.JSX.Element {
               const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? g('failure') : `${gr.totalMs}ms`;
               const marker = isExpanded ? g('expanded') : g('collapsed');
               const markerColor = gr.status === 'error' ? tokens.colors.err as string : gr.status === 'running' ? tokens.colors.warn as string : tokens.colors.ok as string;
+              const running = gr.status === 'running';
               return (
                 <Box key={gr.id} flexDirection="column" marginBottom={1}>
                   <Box>
                     <Text color={tokens.colors.guide as string}>  {g('guide')}   </Text>
+                    {running ? <Text color={markerColor}><Spinner type="dots" /> </Text> : null}
                     <Text color={markerColor}>{marker} {verbLine}</Text>
                     <Text color={tokens.colors.dim as string}>  {right}</Text>
                   </Box>
@@ -678,7 +681,7 @@ export function App(props: AppProps): React.JSX.Element {
             return null;
           }) : null}
           {showThinking && status.status === 'running' && !streamingIdRef.current ? (
-            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.dim as string}>Thinking... (esc to cancel)</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
+            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.accent as string}><Spinner type="dots" /> </Text><Text color={tokens.colors.dim as string}>Thinking... (esc to cancel)</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
           ) : null}
           {showPlan && plan.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
@@ -729,7 +732,7 @@ export function App(props: AppProps): React.JSX.Element {
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
       </Box>
       <Box justifyContent="space-between">
-        <Text color={tokens.colors.dim as string}>{baseHints}{maxTop > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
+        <Text color={tokens.colors.dim as string}>{status.status === 'running' ? (<Text color={tokens.colors.accent as string}><Spinner type="dots" /> working  ·  </Text>) : null}{baseHints}{maxTop > 0 && isFullscreen ? '  ·  PgUp/Dn scroll' : ''}</Text>
         <Text color={tokens.colors.dim as string}>{cost > 0 ? `$${cost.toFixed(2)} · ` : ''}{ctxPct}% ctx · {status.model}{status.status === 'running' ? ' ●' : ''}</Text>
       </Box>
     </Box>
