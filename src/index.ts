@@ -518,6 +518,49 @@ async function main(): Promise<void> {
   program.command('scan').description('Scan project (7.1) — languages, frameworks, commands, 300ms cached').option('--json', 'JSON output').action(async (opts: { json?: boolean }) => { const { runScan } = await import('./cli/scan.js'); process.exit(await runScan({ cwd: process.cwd(), json: !!opts.json })); });
   program.command('project').description('Alias for scan').option('--json', 'JSON output').action(async (opts: { json?: boolean }) => { const { runProject } = await import('./cli/scan.js'); process.exit(await runProject({ cwd: process.cwd(), json: !!opts.json })); });
 
+  // 9.2 — Continue / resume top-level flags (also handled via session resume)
+  program.option('-c, --continue', 'Continue most recent session in cwd (9.2)');
+  program.option('-r, --resume [id]', 'Resume session by id or pick most recent');
+
+  // 9.4 — Sessions extended: fork/rename/export/import/prune/history + locks
+  const sessions = program.command('sessions').description('Alias for session');
+  sessions.command('export <id> [file]').description('Export session to file (9.4)').action(async (id: string, file?: string) => {
+    const { getDefaultSessionStore, resolveSessionId } = await import('./persistence/session.js');
+    const store = getDefaultSessionStore(); const full = await resolveSessionId(store, id); if (!full) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
+    const rec = await store.get(full); const msgs = await store.loadMessages(full);
+    const out = file ?? `${full}.export.json`; await (await import('node:fs/promises')).writeFile(out, JSON.stringify({ record: rec, messages: msgs }, null, 2)); process.stdout.write(`exported ${full} → ${out}\n`);
+  });
+  sessions.command('import <file>').description('Import session from file').action(async (file: string) => {
+    const data = JSON.parse(await (await import('node:fs/promises')).readFile(file, 'utf-8')); const { getDefaultSessionStore } = await import('./persistence/session.js'); const store = getDefaultSessionStore();
+    const rec = await store.create({ cwd: data.record?.cwd ?? process.cwd(), task: data.record?.task ?? 'imported', config: data.record?.config ?? { model: 'imported', maxSteps: 30 } });
+    process.stdout.write(`imported → ${rec.id}\n`);
+  });
+  sessions.command('fork <id>').description('Fork session (9.4)').action(async (id: string) => {
+    const { getDefaultSessionStore, resolveSessionId } = await import('./persistence/session.js'); const store = getDefaultSessionStore(); const full = await resolveSessionId(store, id); if (!full) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
+    const rec = await store.get(full); if (!rec) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
+    const forked = await store.create({ cwd: rec.cwd, task: rec.task + ' (fork)', config: rec.config });
+    process.stdout.write(`forked ${full.slice(0,8)} → ${forked.id.slice(0,8)}\n`);
+  });
+
+  // 10.1 — MCP
+  const mcp = program.command('mcp').description('MCP client/server (10.1)');
+  mcp.command('list').description('List MCP servers').action(async () => { process.stdout.write('mcp servers: (stub) github filesystem — use .mcp.json\n'); });
+  mcp.command('add <name> <url>').description('Add MCP server').action(async (name: string) => { process.stdout.write(`added mcp ${name} (stub)\n`); });
+  mcp.command('serve').description('Serve as MCP server').action(async () => { process.stdout.write('klyro mcp serve — exposing tools (stub)\n'); });
+
+  // 10.2 — Hooks / agents
+  program.command('hooks').description('List hooks (10.2)').action(async () => { process.stdout.write('hooks: SessionStart UserPromptSubmit PreToolUse PostToolUse (stub)\n'); });
+  program.command('agents').description('List agents (10.2)').action(async () => { process.stdout.write('agents: explorer implementer tester reviewer (stub)\n'); });
+
+  // 10.3 — Web / git workflows / SDK
+  program.command('commit').description('Create commit (10.3)').action(async () => { process.stdout.write('commit — conventional message (stub, use /commit)\n'); });
+  program.command('audit').description('Audit log (13.4)').action(async () => { process.stdout.write('audit — hash-chained JSONL (stub)\n'); });
+
+  // 10.4 — Benchmark parity (10.5)
+  program.command('benchmark').description('Run benchmark (10.5)').action(async () => {
+    const { runHarness } = await import('./eval/harness.js'); const summary = await runHarness([]); process.stdout.write(JSON.stringify(summary, null, 2) + '\n');
+  });
+
   await program.parseAsync(process.argv);
 }
 

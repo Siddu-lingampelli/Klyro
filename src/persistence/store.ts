@@ -101,6 +101,18 @@ export class SessionStore {
     }
   }
 
+  private projectHash(cwd: string): string {
+    let h = 0; for (let i = 0; i < cwd.length; i++) h = ((h << 5) - h + cwd.charCodeAt(i)) | 0;
+    return Math.abs(h).toString(36);
+  }
+  private perProjectIndexPath(cwd: string): string { return path.join(this.dir, `index-${this.projectHash(cwd)}.json`); }
+
+  private titleFor(task: string): string {
+    // heuristic title via first 6 words, or model.small would be used if available
+    const w = task.trim().split(/\s+/).slice(0, 6).join(' ');
+    return w.length > 40 ? w.slice(0, 40) + '…' : w || 'untitled';
+  }
+
   async create(opts: { cwd: string; task: string; config: SessionConfig }): Promise<SessionRecord> {
     await this.ensureDir();
     const id = randomUUID();
@@ -114,11 +126,45 @@ export class SessionStore {
       updatedAt: now,
       config: opts.config,
     };
+    (record as unknown as Record<string, unknown>).title = this.titleFor(opts.task);
     await fs.writeFile(path.join(this.dir, `${id}.json`), JSON.stringify({ record, messages: [], observations: [] }, null, 2));
+    await this.appendJsonl(id, { type: 'session.create', record, ts: now });
     const idx = await this.readIndex();
     idx[id] = record;
     await this.writeIndex(idx);
+    // per-project index
+    try {
+      const pp = this.perProjectIndexPath(opts.cwd);
+      let pIdx: Record<string, SessionRecord> = {};
+      try { pIdx = JSON.parse(await fs.readFile(pp, 'utf-8')); } catch {}
+      pIdx[id] = record;
+      await fs.writeFile(pp, JSON.stringify(pIdx, null, 2), 'utf-8');
+    } catch {}
     return record;
+  }
+
+  private jsonlPath(id: string): string { return path.join(this.dir, `${id}.jsonl`); }
+  async appendJsonl(id: string, entry: unknown): Promise<void> {
+    const p = this.jsonlPath(id);
+    await fs.mkdir(path.dirname(p), { recursive: true });
+    const line = JSON.stringify(entry) + '\n';
+    // append + fsync for tool results
+    const fh = await fs.open(p, 'a');
+    try { await fh.write(line); await fh.sync(); } finally { await fh.close(); }
+  }
+  async readJsonl(id: string): Promise<unknown[]> {
+    try {
+      const raw = await fs.readFile(this.jsonlPath(id), 'utf-8');
+      const lines = raw.split('\n').filter((l) => l.trim());
+      const out: unknown[] = [];
+      for (const line of lines) {
+        try { out.push(JSON.parse(line)); } catch {
+          // truncated last line tolerated — skip
+          continue;
+        }
+      }
+      return out;
+    } catch { return []; }
   }
 
   private async readSession(id: string): Promise<{ record: SessionRecord; messages: StoredMessage[]; observations: StoredObservation[] }> {
