@@ -82,7 +82,7 @@ export function App(props: AppProps): React.JSX.Element {
   const [plan, setPlan] = useState<PlanStep[]>([]);
   const [status, setStatus] = useState<StatusSnapshot>({ model: props.initialModel, step: 0, maxSteps: props.maxSteps, usageInput: 0, usageOutput: 0, repairs: 0, status: 'idle', ...props.initialStatus });
   const [elapsed, setElapsed] = useState(0);
-  const [queued, setQueued] = useState<string | null>(null);
+  const [queuedInputs, setQueuedInputs] = useState<string[]>([]);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [scrollOffset, setScrollOffset] = useState(0);
   const streamingIdRef = useRef<string | null>(null);
@@ -101,7 +101,16 @@ export function App(props: AppProps): React.JSX.Element {
   const visibleGrouped = isFullscreen ? grouped.slice(scrollOffset, scrollOffset + viewportH) : grouped;
 
   useEffect(() => bridge.subscribe((p) => setAwaitingApproval(p !== null)), [bridge]);
-  useEffect(() => { if (queued && status.status !== 'running' && !awaitingApproval) { const toSend = queued; setQueued(null); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: toSend, role: 'user' } as TranscriptItem]); streamingIdRef.current = null; const cmd = parseSlash(toSend.trim()); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); } }, [queued, status.status, awaitingApproval]);
+  useEffect(() => {
+    if (queuedInputs.length > 0 && status.status !== 'running' && !awaitingApproval) {
+      const toSend = queuedInputs[0]!;
+      setQueuedInputs((prev) => prev.slice(1));
+      setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: toSend, role: 'user' } as TranscriptItem]);
+      streamingIdRef.current = null;
+      const cmd = parseSlash(toSend.trim());
+      if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd);
+    }
+  }, [queuedInputs, status.status, awaitingApproval]);
   useEffect(() => { if (status.status !== 'running') return; const start = Date.now() - elapsed; const t = setInterval(() => setElapsed(Date.now() - start), 1000); return () => clearInterval(t); }, [status.status, elapsed]);
   useEffect(() => { if (isAtBottom) setScrollOffset(maxOffset); }, [transcript.length, plan.length, maxOffset, isAtBottom]);
 
@@ -123,6 +132,7 @@ export function App(props: AppProps): React.JSX.Element {
   const scrollDown = (n = 3) => setScrollOffset((p) => Math.min(maxOffset, p + n));
 
   useInput((inputStr, key) => {
+    if (key.escape && queuedInputs.length > 0) { setQueuedInputs((prev) => prev.slice(1)); return; }
     if (key.pageUp || (key.ctrl && inputStr === 'u')) { scrollUp(5); return; }
     if (key.pageDown || (key.ctrl && inputStr === 'd')) { scrollDown(5); return; }
     if (key.upArrow && (key.shift || key.ctrl)) { scrollUp(1); return; }
@@ -131,7 +141,13 @@ export function App(props: AppProps): React.JSX.Element {
     if (key.ctrl && inputStr === 'o') { const groups = grouped.filter((x): x is Group => typeof (x as Group).verb === 'string'); const last = groups[groups.length - 1]; if (last) toggleGroup(last.id); return; }
     if (status.status === 'running') {
       if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
-      if (key.return) { const v = input.trim(); if (!v) return; setQueued(v); setInput(''); setTranscript((prev) => [...prev, { id: nextId('queued'), kind: 'text', text: `queued: ${v.slice(0, 80)}`, role: 'assistant' } as TranscriptItem]); return; }
+      if (key.return) {
+        const v = input.trim(); if (!v) return;
+        if (queuedInputs.length >= 3) return; // max 3 queued per §6.6
+        setQueuedInputs((prev) => [...prev, v]);
+        setInput('');
+        return;
+      }
       if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
       if (!key.ctrl && !key.meta) setInput((v) => v + inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
       return;
@@ -171,20 +187,34 @@ export function App(props: AppProps): React.JSX.Element {
                 return `${gr.verb} ${gr.items.length} items`;
               })();
               const right = gr.status === 'running' ? `${(elapsed / 1000).toFixed(1)}s` : gr.status === 'error' ? '✗' : `${gr.totalMs}ms`;
+              const marker = isExpanded ? '▼' : '✓';
+              const markerColor = gr.status === 'error' ? tokens.ansi.err as string : gr.status === 'running' ? tokens.ansi.warn as string : tokens.ansi.ok as string;
               return (
                 <Box key={gr.id} flexDirection="column" marginBottom={1}>
                   <Box>
                     <Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text>
-                    <Text>{isExpanded ? g('expanded') : g('collapsed')} {verbLine}</Text>
+                    <Text color={markerColor}>{marker} {verbLine}</Text>
                     <Text color={tokens.ansi.dim as string}>  {right}</Text>
                   </Box>
-                  {isExpanded ? gr.items.map((it) => (
-                    <Box key={it.id} paddingLeft={4}>
-                      <Text color={tokens.ansi.guide as string}>{g('end')} </Text>
-                      <Text>{it.name}</Text>
-                      <Text color={tokens.ansi.dim as string}> {it.args.slice(0, 50)}</Text>
-                    </Box>
-                  )) : null}
+                  {isExpanded ? gr.items.map((it) => {
+                    let friendly = '';
+                    try {
+                      const a = JSON.parse(it.args) as Record<string, unknown>;
+                      const p = (a.path as string) ?? (a.pattern as string) ?? (a.command as string) ?? '';
+                      const short = p ? String(p).split('/').pop()?.slice(0, 40) ?? p : '';
+                      if (it.name === 'read_file' && short) friendly = `${short}  ${it.result ? String(it.result).split('\n').length + ' lines' : ''}`.trim();
+                      else if (it.name === 'shell_exec' && p) friendly = `$ ${String(p).slice(0, 40)}`;
+                      else if (short) friendly = short;
+                      else friendly = it.args.slice(0, 40);
+                    } catch { friendly = it.args.slice(0, 40); }
+                    return (
+                      <Box key={it.id} paddingLeft={4}>
+                        <Text color={tokens.ansi.guide as string}>{g('end')} </Text>
+                        <Text color={tokens.ansi.dim as string}>{friendly}</Text>
+                        {it.isError ? <Text color={tokens.ansi.err as string}>  ✗</Text> : null}
+                      </Box>
+                    );
+                  }) : null}
                 </Box>
               );
             }
@@ -202,7 +232,7 @@ export function App(props: AppProps): React.JSX.Element {
               );
             }
             if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.err as string}>  {g('guide')}   ✗ {it.message}</Text></Box>;
-            if (it.kind === 'policy') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   [policy] {it.action} {it.name}</Text></Box>;
+            if (it.kind === 'policy') return null;
             if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.ansi.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
             if (it.kind === 'diff') return (
               <Box key={it.id} flexDirection="column" paddingLeft={2} marginBottom={1}>
@@ -227,6 +257,13 @@ export function App(props: AppProps): React.JSX.Element {
               <Box><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
               {plan.slice(0, 8).map((p) => (
                 <Box key={p.id}><Text color={tokens.ansi.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.ansi.ok as string : p.status === 'in_progress' ? tokens.ansi.accent as string : tokens.ansi.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {p.title}</Text></Box>
+              ))}
+            </Box>
+          ) : null}
+          {queuedInputs.length > 0 ? (
+            <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
+              {queuedInputs.map((q, i) => (
+                <Text key={i} color={tokens.ansi.dim as string}>queued: {q.slice(0, 60)}{i === 0 ? '  esc to drop' : ''}</Text>
               ))}
             </Box>
           ) : null}
