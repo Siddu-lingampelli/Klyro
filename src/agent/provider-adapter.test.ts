@@ -40,3 +40,88 @@ describe('httpChatAdapter thinking channel', () => {
     expect(kinds).toContain('text_delta');
   });
 });
+
+describe('httpChatAdapter tool assembly (P0.1)', () => {
+  async function collect(body: string) {
+    const adapter = httpChatAdapter({ baseURL: 'https://x.example', apiKey: '', fetchImpl: sseFetch(body) });
+    const evs = [];
+    for await (const ev of adapter.stream(baseReq)) evs.push(ev);
+    return evs;
+  }
+
+  it('routes deltas by index when later frames omit id/name', async () => {
+    const body =
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\""}}]}},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"a\\"}"}}]}},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n' +
+      'data: [DONE]\n\n';
+    const evs = await collect(body);
+    const deltas = evs.filter((e) => e.kind === 'tool_call_delta');
+    expect(evs).toContainEqual({ kind: 'tool_call_start', id: 'c1', name: 'read_file' });
+    // All fragments carry the real id — no synthetic call_* ids.
+    expect(deltas.length).toBeGreaterThan(0);
+    for (const d of deltas) expect((d as { id: string }).id).toBe('c1');
+    expect(evs.filter((e) => e.kind === 'message_end').length).toBe(1);
+  });
+
+  it('holds fragments arriving before identity, then flushes on start', async () => {
+    const body =
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"a\\""}}]}},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c9","function":{"name":"read_file","arguments":":1}"}}]}},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n' +
+      'data: [DONE]\n\n';
+    const evs = await collect(body);
+    expect(evs).toContainEqual({ kind: 'tool_call_start', id: 'c9', name: 'read_file' });
+    const joined = evs.filter((e) => e.kind === 'tool_call_delta').map((e) => (e as { argsJson: string }).argsJson).join('');
+    expect(joined).toBe('{"a":1}');
+    expect(evs.filter((e) => e.kind === 'message_end').length).toBe(1);
+  });
+
+  it('assembles multiple tool calls independently', async () => {
+    const body =
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"a","arguments":"{\\"x\\""}}]}},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"b","arguments":"{\\"y\\""}}]}},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":1}"}},{"index":1,"function":{"arguments":":2}"}}]},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n' +
+      'data: [DONE]\n\n';
+    const evs = await collect(body);
+    const byId = new Map<string, string>();
+    for (const e of evs) {
+      if (e.kind === 'tool_call_delta') {
+        const d = e as { id: string; argsJson: string };
+        byId.set(d.id, (byId.get(d.id) ?? '') + d.argsJson);
+      }
+    }
+    expect(byId.get('c1')).toBe('{"x":1}');
+    expect(byId.get('c2')).toBe('{"y":2}');
+  });
+
+  it('emits exactly one terminal event when finish_reason and [DONE] both arrive', async () => {
+    const body =
+      'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n' +
+      'data: [DONE]\n\n';
+    const evs = await collect(body);
+    expect(evs.filter((e) => e.kind === 'message_end').length).toBe(1);
+    expect(evs.filter((e) => e.kind === 'error').length).toBe(0);
+  });
+
+  it('terminates a truncated stream (no [DONE]) with one message_end', async () => {
+    const body =
+      'data: {"choices":[{"index":0,"delta":{"content":"half"},"finish_reason":null}]}\n\n';
+    const evs = await collect(body);
+    expect(evs.filter((e) => e.kind === 'message_end').length).toBe(1);
+  });
+
+  it('surfaces identity-less fragments as incomplete calls instead of dropping', async () => {
+    const body =
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"a\\":1}"}}]}},"finish_reason":null}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n' +
+      'data: [DONE]\n\n';
+    const evs = await collect(body);
+    const starts = evs.filter((e) => e.kind === 'tool_call_start');
+    expect(starts.length).toBe(1);
+    const joined = evs.filter((e) => e.kind === 'tool_call_delta').map((e) => (e as { argsJson: string }).argsJson).join('');
+    expect(joined).toBe('{"a":1}');
+  });
+});

@@ -254,6 +254,7 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       aborted: 'aborted',
       no_final: 'aborted',
       verify_failed: 'verify_failed',
+      stuck: 'stuck',
     };
     try {
       await store.setStatus(sessionId, statusMap[result.status] ?? 'complete', result.finalText);

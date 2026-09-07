@@ -8,8 +8,9 @@
  *  1. `system` is a top-level field, not a message with role=system.
  *  2. Tool definitions use `input_schema` not `parameters`, and have no
  *     `type: 'function'` wrapper.
- *  3. `tool_use_id` becomes our `id`; the tool input is sent as a single
- *     `input_json_delta` block.
+ *  3. `tool_use_id` becomes our `id`; tool input arrives fragmented across
+ *     `input_json_delta` frames, assembled per content_block index (never
+ *     assumed whole, never silently dropped).
  *
  * Auth: `x-api-key: <key>`. Version header is sent as `anthropic-version`.
  * Auth can be a Bearer token (for proxies) — the adapter accepts either.
@@ -170,12 +171,14 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
   const reader = resp.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buf = '';
-  // Track in-progress tool calls so we can emit start/delta/end.
-  const toolBuffers = new Map<string, { name: string; argsJson: string }>();
-  // Map content_block index → tool_use id (persists after tool completes to handle late deltas)
-  const indexToToolId = new Map<number, string>();
-  // Active thinking-block index (Anthropic reasoning channel).
-  const thinkingState: { idx: number | null } = { idx: null };
+  // Per-block assembly keyed by content_block index (tool input IS
+  // fragmented across input_json_delta frames — never assume otherwise).
+  const state: AnthropicStreamState = {
+    blocks: new Map(),
+    orphans: new Map(),
+    thinkingIdx: null,
+    usage: {},
+  };
   // message_stop already yields message_end — don't emit a second one at EOF.
   let sawMessageEnd = false;
 
@@ -208,7 +211,7 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
       for (const e of events) {
         let parsed: AnthropicSseEvent;
         try { parsed = JSON.parse(e.data) as AnthropicSseEvent; } catch { continue; }
-        const out = translateSse(e.event, parsed, toolBuffers, indexToToolId, thinkingState);
+        const out = translateSse(e.event, parsed, state);
         for (const ev of out) {
           if (ev.kind === 'message_end') sawMessageEnd = true;
           yield ev;
@@ -223,27 +226,80 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
     reader.releaseLock();
   }
 
-  if (!sawMessageEnd) yield { kind: 'message_end', finishReason: 'stop' };
+  // Truncated stream: close open blocks so the runtime finalizes them as
+  // (malformed) structured errors instead of hanging, then terminate.
+  for (const b of state.blocks.values()) {
+    if (b.open) {
+      b.open = false;
+      yield { kind: 'tool_call_end', id: b.id };
+    }
+  }
+  state.blocks.clear();
+  // Fragments that could never be attributed to a tool block are a stream
+  // integrity failure — surface loudly, never silently drop.
+  if (state.orphans.size > 0 && !sawMessageEnd) {
+    const count = [...state.orphans.values()].reduce((n, s) => n + s.length, 0);
+    state.orphans.clear();
+    yield {
+      kind: 'error',
+      code: 'ORPHAN_TOOL_DELTAS',
+      message: `stream ended with ${count} chars of tool input that match no content block`,
+      retryable: false,
+    };
+    return;
+  }
+  state.orphans.clear();
+  if (!sawMessageEnd) {
+    yield {
+      kind: 'message_end',
+      finishReason: 'stop',
+      ...(state.usage.input !== undefined || state.usage.output !== undefined
+        ? { usage: { input: state.usage.input ?? 0, output: state.usage.output ?? 0 } }
+        : {}),
+    };
+  }
 }
 
-function translateSse(
-  event: string,
-  parsed: AnthropicSseEvent,
-  toolBuffers: Map<string, { name: string; argsJson: string }>,
-  indexToToolId: Map<number, string>,
-  thinking?: { idx: number | null },
-): StreamEvent[] {
+/**
+ * Mutable per-stream assembly state. Blocks are keyed by content_block
+ * index; the tool id is carried inside the block entry. There is no global
+ * "current tool" — concurrent or interleaved blocks stay correctly routed.
+ */
+interface AnthropicStreamState {
+  blocks: Map<number, { id: string; name: string; argsJson: string; open: boolean }>;
+  /** Fragments for an index with no open block yet (flushed on block start). */
+  orphans: Map<number, string>;
+  thinkingIdx: number | null;
+  usage: { input?: number; output?: number };
+}
+
+function translateSse(event: string, parsed: AnthropicSseEvent, state: AnthropicStreamState): StreamEvent[] {
   const out: StreamEvent[] = [];
   switch (event) {
+    case 'message_start': {
+      const usage = (parsed.message as { usage?: { input_tokens?: number } } | undefined)?.usage;
+      if (typeof usage?.input_tokens === 'number') state.usage.input = usage.input_tokens;
+      return out;
+    }
+    case 'message_delta': {
+      const usage = parsed.usage as { output_tokens?: number } | undefined;
+      if (typeof usage?.output_tokens === 'number') {
+        state.usage.output = (state.usage.output ?? 0) + usage.output_tokens;
+      }
+      return out;
+    }
     case 'content_block_start': {
       const block = parsed.content_block as { type: string; id?: string; name?: string; input?: unknown } | undefined;
       const idx = parsed.index as number | undefined;
-      if (block?.type === 'tool_use' && block.id && block.name) {
-        toolBuffers.set(block.id, { name: block.name, argsJson: '' });
-        if (idx !== undefined) indexToToolId.set(idx, block.id);
+      if (block?.type === 'tool_use' && block.id && block.name && idx !== undefined) {
+        // Flush any fragments that arrived before the block start.
+        const stashed = state.orphans.get(idx);
+        state.orphans.delete(idx);
+        state.blocks.set(idx, { id: block.id, name: block.name, argsJson: stashed ?? '', open: true });
         out.push({ kind: 'tool_call_start', id: block.id, name: block.name });
-      } else if ((block?.type === 'thinking' || block?.type === 'redacted_thinking') && thinking && idx !== undefined) {
-        thinking.idx = idx;
+        if (stashed) out.push({ kind: 'tool_call_delta', id: block.id, argsJson: stashed });
+      } else if ((block?.type === 'thinking' || block?.type === 'redacted_thinking') && idx !== undefined) {
+        state.thinkingIdx = idx;
       }
       return out;
     }
@@ -255,30 +311,46 @@ function translateSse(
       } else if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking) {
         out.push({ kind: 'thinking_delta', text: delta.thinking });
       } else if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
-        const id = findToolIdByIndex(index, toolBuffers, indexToToolId);
-        if (id) {
-          const buf = toolBuffers.get(id);
-          if (buf) {
-            buf.argsJson += delta.partial_json;
-            out.push({ kind: 'tool_call_delta', id, argsJson: delta.partial_json });
+        const entry = index !== undefined ? state.blocks.get(index) : undefined;
+        if (entry && entry.open) {
+          entry.argsJson += delta.partial_json;
+          out.push({ kind: 'tool_call_delta', id: entry.id, argsJson: delta.partial_json });
+        } else if (index !== undefined) {
+          const open = [...state.blocks.values()].filter((b) => b.open);
+          if (open.length === 1) {
+            // Single in-flight tool: attribute here (documented heuristic).
+            open[0]!.argsJson += delta.partial_json;
+            out.push({ kind: 'tool_call_delta', id: open[0]!.id, argsJson: delta.partial_json });
+          } else {
+            // No safe attribution — stash for a later block start, or
+            // surface as ORPHAN_TOOL_DELTAS at stream end. Never drop.
+            state.orphans.set(index, (state.orphans.get(index) ?? '') + delta.partial_json);
           }
+        } else {
+          state.orphans.set(-1, (state.orphans.get(-1) ?? '') + delta.partial_json);
         }
       }
       return out;
     }
     case 'content_block_stop': {
       const index = parsed.index as number | undefined;
-      if (thinking && index !== undefined && index === thinking.idx) thinking.idx = null;
-      const id = findToolIdByIndex(index, toolBuffers, indexToToolId);
-      if (id) {
-        toolBuffers.delete(id);
-        // Keep index mapping for late deltas that may arrive after stop (rare)
-        out.push({ kind: 'tool_call_end', id });
+      if (index !== undefined && index === state.thinkingIdx) state.thinkingIdx = null;
+      const entry = index !== undefined ? state.blocks.get(index) : undefined;
+      if (entry && entry.open) {
+        entry.open = false;
+        state.blocks.delete(index!);
+        out.push({ kind: 'tool_call_end', id: entry.id });
       }
       return out;
     }
     case 'message_stop': {
-      out.push({ kind: 'message_end', finishReason: 'stop' });
+      out.push({
+        kind: 'message_end',
+        finishReason: 'stop',
+        ...(state.usage.input !== undefined || state.usage.output !== undefined
+          ? { usage: { input: state.usage.input ?? 0, output: state.usage.output ?? 0 } }
+          : {}),
+      });
       return out;
     }
     case 'error': {
@@ -294,23 +366,6 @@ function translateSse(
     default:
       return out;
   }
-}
-
-/** Match an Anthropic content_block index to the tool_use id we emitted. */
-function findToolIdByIndex(
-  index: number | undefined,
-  buffers: Map<string, { name: string; argsJson: string }>,
-  indexToToolId?: Map<number, string>,
-): string | undefined {
-  if (index === undefined) return undefined;
-  if (indexToToolId) {
-    const direct = indexToToolId.get(index);
-    if (direct) return direct;
-  }
-  // Single-buffer fallback: if only one in-flight tool, any delta belongs to it
-  if (buffers.size === 1) return buffers.keys().next().value;
-  // No reliable mapping — drop the delta rather than misroute to wrong tool (prevents _parse_error loops)
-  return undefined;
 }
 
 function toAnthropicMessages(messages: Message[]): AnthropicMessage[] {
@@ -373,4 +428,4 @@ function toAnthropicTool(t: ToolDefinition): { name: string; description: string
 }
 
 // Re-export for testability.
-export const _internal = { toAnthropicMessages, toAnthropicTool, findToolIdByIndex };
+export const _internal = { toAnthropicMessages, toAnthropicTool, translateSse };

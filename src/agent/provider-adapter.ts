@@ -266,10 +266,41 @@ async function* streamChatCompletions(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  // Track per-tool-call id by index.
-  const toolIds = new Map<number, string>();
-  const toolNames = new Map<number, string>();
+  // Per-block assembly keyed by stream index. Later deltas may omit id and
+  // name, so the index — not the id — is the source of truth for fragment
+  // routing. Fragments arriving before identity are held, not dropped.
+  interface OpenAIToolBlock { id?: string; name?: string; argsJson: string; started: boolean; ended: boolean }
+  const blocks = new Map<number, OpenAIToolBlock>();
   let pendingUsage: { input: number; output: number } | undefined;
+  // Canonical contract: exactly one terminal event per stream.
+  let terminalEmitted = false;
+  function* emitTerminal(finishReason?: string, usage?: { input: number; output: number }): Generator<StreamEvent> {
+    if (terminalEmitted) return;
+    terminalEmitted = true;
+    for (const b of blocks.values()) {
+      if (b.started && !b.ended && b.id) {
+        b.ended = true;
+        yield { kind: 'tool_call_end', id: b.id };
+      }
+    }
+    // Fragments that never gained an identity are surfaced as incomplete
+    // calls (the runtime turns them into structured errors) — never dropped.
+    let incomplete = 0;
+    for (const b of blocks.values()) {
+      if (!b.started && (b.argsJson || b.id || b.name)) {
+        const id = b.id ?? `incomplete_${incomplete++}`;
+        yield { kind: 'tool_call_start', id, name: b.name ?? 'unknown' };
+        if (b.argsJson) yield { kind: 'tool_call_delta', id, argsJson: b.argsJson };
+        yield { kind: 'tool_call_end', id };
+        b.started = true;
+        b.ended = true;
+      }
+    }
+    const end: StreamEvent = { kind: 'message_end' };
+    if (finishReason) end.finishReason = finishReason;
+    if (usage) end.usage = usage;
+    yield end;
+  }
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -284,7 +315,7 @@ async function* streamChatCompletions(
           if (!line.startsWith('data:')) continue;
           const data = line.slice(5).trim();
           if (data === '[DONE]') {
-            yield { kind: 'message_end' };
+            yield* emitTerminal(undefined, pendingUsage);
             return;
           }
           let chunk: ChatCompletionsChunk;
@@ -318,16 +349,20 @@ async function* streamChatCompletions(
               yield { kind: 'thinking_delta', text: thinking };
             }
             for (const tc of choice.delta.tool_calls ?? []) {
-              if (tc.id && tc.function?.name) {
-                toolIds.set(tc.index, tc.id);
-                toolNames.set(tc.index, tc.function.name);
-                yield { kind: 'tool_call_start', id: tc.id, name: tc.function.name };
-              } else if (tc.id) {
-                toolIds.set(tc.index, tc.id);
+              let b = blocks.get(tc.index);
+              if (!b) {
+                b = { argsJson: '', started: false, ended: false };
+                blocks.set(tc.index, b);
               }
-              if (tc.function?.arguments) {
-                const id = toolIds.get(tc.index) ?? `call_${tc.index}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-                yield { kind: 'tool_call_delta', id, argsJson: tc.function.arguments };
+              if (tc.id) b.id = tc.id;
+              if (tc.function?.name) b.name = tc.function.name;
+              if (tc.function?.arguments) b.argsJson += tc.function.arguments;
+              if (b.id && b.name && !b.started) {
+                b.started = true;
+                yield { kind: 'tool_call_start', id: b.id, name: b.name };
+                if (b.argsJson) yield { kind: 'tool_call_delta', id: b.id, argsJson: b.argsJson };
+              } else if (b.started && b.id && tc.function?.arguments) {
+                yield { kind: 'tool_call_delta', id: b.id, argsJson: tc.function.arguments };
               }
             }
             if (choice.finish_reason) {
@@ -335,32 +370,18 @@ async function* streamChatCompletions(
                 ? { input: chunk.usage.prompt_tokens, output: chunk.usage.completion_tokens }
                 : undefined);
               pendingUsage = undefined;
-              // Clear tool tracking per message to avoid stale ids on next turn
-              const ids = [...toolIds.values()];
-              toolIds.clear();
-              toolNames.clear();
-              for (const id of ids) yield { kind: 'tool_call_end', id };
-              yield { kind: 'message_end', finishReason: choice.finish_reason, usage };
+              yield* emitTerminal(choice.finish_reason, usage);
             }
           }
         }
       }
     }
-    if (toolIds.size) {
-      for (const id of toolIds.values()) yield { kind: 'tool_call_end', id };
-      if (pendingUsage) {
-        yield { kind: 'message_end', usage: pendingUsage };
-      } else {
-        yield { kind: 'message_end' };
-      }
-    } else if (pendingUsage) {
-      yield { kind: 'message_end', usage: pendingUsage };
-    } else {
-      yield { kind: 'message_end' };
-    }
+    yield* emitTerminal(undefined, pendingUsage);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    yield { kind: 'error', code: 'STREAM', message: msg, retryable: true };
+    if (!terminalEmitted) {
+      const msg = err instanceof Error ? err.message : String(err);
+      yield { kind: 'error', code: 'STREAM', message: msg, retryable: true };
+    }
   } finally {
     clearTimeout(timer);
     req.signal?.removeEventListener('abort', onAbort);

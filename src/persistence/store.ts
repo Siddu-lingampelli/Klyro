@@ -14,7 +14,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-export type SessionStatus = 'open' | 'complete' | 'verify_failed' | 'aborted' | 'max_steps';
+export type SessionStatus = 'open' | 'complete' | 'verify_failed' | 'aborted' | 'max_steps' | 'stuck';
 
 export interface SessionConfig {
   model: string;

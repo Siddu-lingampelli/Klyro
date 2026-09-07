@@ -1,755 +1,1092 @@
-# Terminal UI Design — Claude Code-like TUI
+# Klyro — Cline-Style Terminal TUI Implementation
 
-> **Theme:** White background, Klyro Orange (#FF6B1A) accents. Dark mode mirrors with deep gray + same orange.
-> **Stack suggestion:** Rust + Ratatui (or Go + Bubble Tea). React/Ink works too.
-> **Goal:** Faithful Claude Code terminal experience — file explorer, sessions, sub-agents, chat scroll, expand/collapse, command palette.
+Purpose: Build Klyro's terminal UI like Cline's current CLI TUI: native terminal rendering with OpenTUI, React components, a scrollable transcript, keyboard-driven interaction, streaming output, tool activity, and a fixed input area.
 
----
+Important: This is TUI / terminal only. No browser, HTML, CSS, DOM, or web UI.
 
-## 1. High-Level Layout
+The reference describes Cline's TUI as OpenTUI-based and identifies ChatMessageList as the core transcript component.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ ▌ claude-code │ main │ ◉ 3 sessions │ ⌘ palette  │ ? help   │ ●●● ●●  │ ⊞ ▢│ ← TOP BAR
-├────────────┬─────────────────────────────────────────────┬──────────────────┤
-│            │                                             │                  │
-│  SIDEBAR   │             CHAT / WORKSPACE                │   INSPECTOR      │
-│  (left)    │             (center)                        │   (right)        │
-│            │                                             │                  │
-│  Sessions  │  · scrollable messages                      │  · tool calls    │
-│  Files     │  · tool output                             │  · diff viewer   │
-│  Agents    │  · code blocks w/ expand                    │  · agent tree    │
-│  MCP       │  · thinking blocks (collapsible)            │  · file preview  │
-│  Hooks     │                                             │                  │
-│            │                                             │                  │
-├────────────┴─────────────────────────────────────────────┴──────────────────┤
-│ > Type a message…                                          ⏎ send  ⇧⏎ newline │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+## 1. Technology
 
-**Three columns, full terminal height, bottom prompt bar.**
+Use:
 
-Column widths:
-- Sidebar: 28 cols (collapsible to 0)
-- Inspector: 36 cols (collapsible)
-- Center: flex
+- TypeScript
+- Node.js
+- React
+- OpenTUI
+- @opentui/react
 
-Toggle keys: `⌘B` sidebar, `⌘I` inspector.
-
----
-
-## 2. Color Tokens
-
-### Light mode (default — white & orange)
+Architecture:
 
 ```
---bg            #FFFFFF       panel
---bg-elevated   #FAF7F2       slightly warm cream
---bg-subtle     #F5F0E8       hover, selected row
---fg            #1A1A1A       primary text
---fg-muted      #6B6B6B       secondary
---fg-dim        #9A9A9A       tertiary, hints
-
---orange        #FF6B1A       brand primary, accents, focus rings
---orange-hot    #FF8A3D       hover state
---orange-deep   #CC4F0A       pressed
---orange-soft   #FFF1E6       selection bg, badges
-
---border        #E8E0D2       panel dividers
---border-strong #1A1A1A       active panel
-
---success       #2E7D32        green check
---warning       #C77700        amber
---danger        #C62828        red
---info          #FF6B1A        same as brand
-
---code-bg       #FAF7F2        inline code, code blocks
---code-border   #E8E0D2
+Klyro CLI
+   │
+   ▼
+OpenTUI
+   │
+   ▼
+React TUI
+   │
+   ├── ChatView
+   ├── ChatMessageList
+   ├── ChatEntryView
+   ├── PromptInput
+   ├── StatusBar
+   ├── PermissionDialog
+   └── ActivityView
 ```
 
-### Dark mode (mirror)
+Do not create a browser application.
+
+## 2. Main TUI Layout
+
+The main chat screen should be:
 
 ```
---bg            #1A1A1A
---bg-elevated   #232323
---bg-subtle     #2C2C2C
---fg            #F5F5F5
---fg-muted      #A0A0A0
---fg-dim        #707070
-
---orange        #FF8A3D       (lifted for contrast)
---orange-hot    #FFA566
---orange-deep   #E07020
---orange-soft   #3A2418       (soft on dark)
-
---border        #333333
---border-strong #FF8A3D
-
---code-bg       #1F1F1F
---code-border   #333333
+┌──────────────────────────────────────────────────────────────┐
+│ KLYRO                                      ~/project          │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  You                                                         │
+│  Add authentication to the application                      │
+│                                                              │
+│  Klyro                                                       │
+│  I'll inspect the project first.                             │
+│                                                              │
+│  ✓ Read 14 files                                             │
+│  ✓ Searched src/                                             │
+│  ✓ Modified 4 files                                         │
+│                                                              │
+│  Running tests...                                            │
+│  ✓ 27 tests passed                                           │
+│                                                              │
+│                                                              │
+├──────────────────────────────────────────────────────────────┤
+│ › Message Klyro...                                           │
+├──────────────────────────────────────────────────────────────┤
+│ enter send · shift+enter newline                 $0.03  8%    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-**Convention:** Orange is the only saturated color in the chrome. Status colors (green/red/amber) appear only inside content. This keeps the brand loud but content readable.
-
----
-
-## 3. Top Bar
+The important layout is:
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ ▌ claude-code │ main │ ◉ 3 sessions │ ⌘ palette  │ ? help   │ ●●● ●●  │ ⊞ ▢│
-└──────────────────────────────────────────────────────────────────────────────┘
+Header
+   ↓
+ChatMessageList   ← flexible / scrollable
+   ↓
+PromptInput       ← fixed
+   ↓
+StatusBar         ← fixed
 ```
 
-Elements left → right:
+## 3. ChatView
 
-| Element | Width | Content |
-|---|---|---|
-| Logo | 12 | `▌ claude-code` (orange bar + dim text) |
-| Branch | auto | `│ main │` — git branch, dim |
-| Session count | auto | `│ ◉ 3 sessions │` — orange dot if active |
-| Palette hint | auto | `│ ⌘ palette` |
-| Help hint | auto | `│ ? help` |
-| Model status | flex | `●●● ●●` — dots showing context window fill (orange → filled, dim → empty) |
-| Layout toggles | 6 | `⊞ ▢` — current layout mode |
-
-**Context dots:** Split the context window into 5 segments. Each dot fills with orange as the segment fills. Last dot pulses when >90%.
-
----
-
-## 4. Left Sidebar — Navigator
+File:
 
 ```
-┌────────────┐
-│ ▾ Sessions │  ← collapsible header
-│   ◉ Build… │
-│   ○ Refac… │
-│   ○ Fix b… │
-│            │
-│ ▸ Files    │  ← collapsed
-│ ▸ Agents   │
-│ ▸ MCP      │
-│ ▸ Hooks    │
-│            │
-│ [+ new]    │  ← orange action
-└────────────┘
+apps/cli/src/tui/views/chat-view.tsx
 ```
 
-### 4.1 Sessions panel
+Use a column layout:
 
-Each row:
-```
-◉ Build auth flow     2m  ← active session (orange dot)
-○ Refactor parser    12m
-○ Fix bug #42        1h
-```
+```tsx
+<box
+  flexDirection="column"
+  width="100%"
+  height="100%"
+>
+  <Header />
 
-- `◉` orange filled = active
-- `○` dim outline = paused
-- Hover: bg-subtle
-- Selected: orange-soft bg + orange left border 2px
-- Right-aligned timestamp, dim
+  <ChatMessageList
+    ref={transcriptScrollRef}
+    entries={entries}
+    isStreaming={isStreaming}
+  />
 
-### 4.2 Files panel
+  <PromptInput />
 
-```
-▾ Files
-  📁 src/
-    📄 main.rs     1.2k
-    📄 lib.rs      890
-  📁 tests/
-  📄 Cargo.toml
-  ─────────────
-  📄 README.md
+  <StatusBar />
+</box>
 ```
 
-- File tree, indent 2 per level
-- `▾` / `▸` for expand
-- File icon (📄📁) dim
-- File size right-aligned, fg-dim
-- Modified files: orange dot to the right
-- `Enter` to open in inspector
-- `Space` to expand/collapse
-
-### 4.3 Agents panel (sub-agents)
+The transcript gets:
 
 ```
-▾ Agents
-  ◉ main           running
-  ├ ◉ explorer     done     1.2s
-  ├ ◯ researcher   waiting
-  └ ◯ verifier     idle
+flexGrow={1}
 ```
 
-- Tree showing the agent hierarchy
-- Status badges: `running` (orange pulse), `done` (green), `waiting` (amber), `idle` (dim), `error` (red)
-- Click an agent to see its messages in the inspector
+The input does not belong inside the transcript.
 
-### 4.4 MCP / Hooks panels
+## 4. ChatMessageList
 
-Simple lists with connection status dots.
-
----
-
-## 5. Center — Chat / Workspace
+File:
 
 ```
-┌─────────────────────────────────────────────┐
-│                                             │
-│  ╭─ You ─────────────────────────────────╮ │
-│  │ Add a /health endpoint that returns   │ │
-│  │ JSON status                            │ │
-│  ╰────────────────────────────────────────╯ │
-│                                             │
-│  ╭─ Claude ─────────────────── ◯ thinking ╮ │
-│  │                                          │ │
-│  │ I'll create the endpoint and register   │ │
-│  │ it in the router.                        │ │
-│  │                                          │ │
-│  │ ▾ Tool call: edit_file                  │ │
-│  │   src/routes.rs                         │ │
-│  │   + 12 / - 3                            │ │
-│  │   [expand ▾]                            │ │
-│  │                                          │ │
-│  │ ▾ Done (1.2s)                          │ │
-│  ╰──────────────────────────────────────────╯ │
-│                                             │
-│  ╭─ You ──────────────────── resume ──╮    │
-│  │ Continue.                              │    │
-│  ╰─────────────────────────────────────────╯ │
-│                                             │
-└─────────────────────────────────────────────┘
+apps/cli/src/tui/components/chat-message-list.tsx
 ```
 
-### 5.1 Message bubbles
+This is the core TUI component.
 
-Two roles, distinct but minimal:
+```tsx
+<scrollbox
+  ref={scrollboxRef}
+  flexGrow={1}
+  stickyScroll
+  stickyStart="bottom"
+>
+  <box
+    flexDirection="column"
+    paddingX={1}
+    paddingY={1}
+    gap={1}
+  >
+    {entries.map((entry) => (
+      <ChatEntryView
+        key={entry.id}
+        entry={entry}
+      />
+    ))}
 
-**User bubble:**
-- Right-aligned or full-width? **Full-width** (easier to read in terminal)
-- Border: 1px solid `--border`, no fill
-- Header: `You` in fg-muted, 11px
-- Body: fg primary
+    {isStreaming && (
+      <box flexDirection="row" gap={1}>
+        <spinner name="dots" />
 
-**Assistant bubble:**
-- Border: 1px solid `--orange-soft`
-- Left edge: 2px solid `--orange` (brand accent)
-- Header: `Claude` + model name (small, dim) + status icon
-- Body: full markdown — headings, lists, inline code with `--code-bg`
-
-### 5.2 Thinking blocks (collapsible)
-
-```
-╭─ Claude ──────────────── ◯ thinking 0.8s ─╮
-│ ▾ Thinking                                │
-│   The user wants a health endpoint...    │
-│   I'll add it under /health and make it   │
-│   return { status: "ok", uptime }         │
-│ ▸ collapsed by default — click to expand  │
-╰──────────────────────────────────────────╯
-```
-
-- Animated `◯` spinner while thinking (orange dots cycling)
-- Default collapsed after thinking finishes
-- Shows duration when collapsed: `thought 0.8s`
-
-### 5.3 Tool calls
-
-```
-│ ▾ Tool call · edit_file              0.3s │
-│   📄 src/routes.rs                          │
-│   ┌────────────────────────────────────┐    │
-│   │ +  pub async fn health() -> Json {  │    │
-│   │      Json(json!({"status":"ok"}))  │    │
-│   │ +  }                                 │    │
-│   │                                     │    │
-│   │ -  // TODO                          │    │
-│   └────────────────────────────────────┘    │
-│   +12 / -3                                  │
+        <text fg="gray">
+          Thinking... (esc to cancel)
+        </text>
+      </box>
+    )}
+  </box>
+</scrollbox>
 ```
 
-- Header: tool name (orange) · file · duration
-- Body: diff with `+` green and `-` red on bg-subtle
-- Status icon right: ✓ green, ✗ red, ⏳ orange spinner, ⊘ dim (skipped)
+Cline uses this same fundamental pattern: OpenTUI's native scrollbox, flexGrow={1}, stickyScroll, and stickyStart="bottom".
 
-### 5.4 Code blocks
+## 5. Transcript Entries
 
-```
-┌─ python ────────────────────── ⧉ copy ─┐
-│ def hello():                            │
-│     print("world")                      │
-└─────────────────────────────────────────┘
-```
+Do not render raw agent events directly.
 
-- Filename label top-left if language known
-- `⧉ copy` button top-right, hover orange
-- Line numbers in fg-dim, gutter 4 chars wide
-- No background fill — let terminal theme show through; use border to delimit
-- Horizontal scroll for long lines (shift+arrow)
+Use a clean transcript model:
 
-### 5.5 Streaming
-
-When assistant is generating:
-- Border pulses (orange → orange-hot → orange, 1.2s loop)
-- A trailing `▌` cursor blinks at end of last token
-- Tool calls appear inline as they fire, with live spinners
-- Auto-scroll to bottom unless user has scrolled up — then show "↓ new messages" pill
-
----
-
-## 6. Right Inspector
-
-Three modes, switchable with `⌘1` `⌘2` `⌘3` or tabs:
-
-### 6.1 Tool calls mode
-
-```
-┌─ Inspector · Tools ────────┐
-│ ✓ edit_file   src/routes.rs│
-│   +12 / -3     0.3s         │
-│ ─────────────────────────  │
-│ ✓ read_file   Cargo.toml   │
-│   890 bytes    0.1s        │
-│ ─────────────────────────  │
-│ ⏳ bash       cargo test   │
-│   running...    2.1s       │
-└────────────────────────────┘
+```ts
+type TranscriptEntry =
+  | UserEntry
+  | AssistantEntry
+  | ActivityEntry
+  | PlanEntry
+  | PermissionEntry
+  | ErrorEntry;
 ```
 
-Chronological list of every tool call in the current session. Click to jump to it in the chat.
+Example:
 
-### 6.2 Diff mode
+```ts
+type UserEntry = {
+  id: string;
+  kind: "user";
+  text: string;
+};
 
-```
-┌─ Inspector · Diff ─────────────┐
-│ src/routes.rs     +12 / -3    │
-├────────────────────────────────┤
-│ @@ -10,3 +10,14 @@             │
-│  fn router() {                 │
-│ -    // TODO                   │
-│ -    route("/")                │
-│ +    route("/")                │
-│ +    route("/health")          │
-│ +    route("/api")             │
-│  }                             │
-│                                │
-│ [✓ Accept] [✗ Reject] [≪ Prev] │
-│              [Next ≫]         │
-└────────────────────────────────┘
-```
+type AssistantEntry = {
+  id: string;
+  kind: "assistant";
+  text: string;
+  streaming?: boolean;
+};
 
-Full-file diff with syntax highlight. Approve/reject buttons at the bottom.
-
-### 6.3 Agent tree mode
-
-```
-┌─ Inspector · Agents ───────┐
-│ ◉ main                     │
-│  ├─ ✓ explorer   1.2s      │
-│  │   ↳ 3 tool calls        │
-│  ├─ ◯ researcher  waiting  │
-│  │   ↳ delegated: parse    │
-│  └─ ◯ verifier    idle     │
-│                             │
-│ Click any to filter chat ↗ │
-└─────────────────────────────┘
+type ActivityEntry = {
+  id: string;
+  kind: "activity";
+  title: string;
+  status: "running" | "success" | "failed";
+  details?: ActivityDetail[];
+};
 ```
 
-Live agent hierarchy. Clicking a node filters the chat to only show messages from that agent's perspective.
+## 6. ChatEntryView
 
----
-
-## 7. Bottom Prompt Bar
+File:
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ ▌ Add a /health endpoint…                                  ⏎ send ⇧⏎ nl  / │
-└──────────────────────────────────────────────────────────────────────────────┘
+apps/cli/src/tui/components/chat-entry-view.tsx
 ```
 
-- Single-line input with auto-grow (max 8 lines, then scrolls)
-- Left orange bar when focused
-- Placeholder: dim
-- Right hints: `⏎ send` `⇧⏎ newline` `/` commands
-- Slash menu pops above when `/` typed:
+Responsibilities:
 
 ```
-│ /help       Show all commands             │
-│ /clear      Clear current session          │
-│ /compact    Compress context               │
-│ /model      Switch model            ◀──   │
-│ /resume     Resume a session               │
-│ /agents     Manage sub-agents              │
+TranscriptEntry
+      ↓
+ChatEntryView
+      ↓
+OpenTUI components
 ```
 
-- `Tab` autocomplete
-- `↑` / `↓` history (per session)
-- `Ctrl+R` history search
-
----
-
-## 8. Command Palette
-
-`⌘K` (or `Ctrl+K`):
+Examples:
 
 ```
-┌────────────────────────────────────────┐
-│ 🔍 Type a command…                     │
-├────────────────────────────────────────┤
-│ > New session                          │
-│   Switch session                   ◀   │
-│   Toggle sidebar                       │
-│   Toggle inspector                     │
-│   Change model                         │
-│   Open file…                           │
-│   Run slash command…                   │
-│   Toggle theme                         │
-└────────────────────────────────────────┘
+User
+> Add authentication
 ```
 
-- Floating modal, centered, 60% width
-- Fuzzy filter as you type
-- `↵` run, `esc` close
-- Recently used at top
-
----
-
-## 9. Modal Dialogs
-
-### Permission prompt
-
 ```
-┌─ Allow Bash command? ────────────────┐
-│                                      │
-│   $ rm -rf node_modules              │
-│                                      │
-│   This will delete 247 files.        │
-│                                      │
-│   [ Allow ]  [ Allow always ]  [✗]   │
-└──────────────────────────────────────┘
+Assistant
+• Klyro
+
+I'll inspect the project first.
 ```
 
-### Plan approval
-
 ```
-┌─ Plan ────────────────────────────────┐
-│ 1. Add /health route                  │
-│ 2. Register in router                 │
-│ 3. Add test                           │
-│                                       │
-│ Estimated: 3 file changes             │
-│                                       │
-│ [✓ Approve]  [✗ Reject]  [✎ Edit]    │
-└───────────────────────────────────────┘
+Activity
+✓ Read 14 files
 ```
 
-Modals: centered, 70% width, border-strong, soft drop shadow drawn with box chars. Buttons: orange outline for primary, dim for secondary.
-
----
-
-## 10. Status & Notifications
-
-### Bottom-right toast (transient)
-
 ```
-                                    ┌─ ✓ File saved ────────┐
-                                    └───────────────────────┘
+Running activity
+◌ Running tests...
 ```
 
-- Slides up from bottom-right
-- Auto-dismiss 3s
-- Types: `info` (orange), `success` (green), `warning` (amber), `error` (red)
-
-### Context window indicator (top bar)
-
-The `●●● ●●` in the top bar:
-- 5 dots, each = 20% of context
-- Empty dot: fg-dim
-- Half-full: orange-soft
-- Full: orange
-- Near-full (last dot): pulse animation
-
-### Spinner states
-
-| State | Glyph | Color |
-|---|---|---|
-| Thinking | ◌◍◌◍ cycling | orange |
-| Tool running | ⏳ rotating | orange |
-| Awaiting permission | ⏸ static | amber |
-| Done | ✓ | green |
-| Error | ✗ | red |
-
----
-
-## 11. Keyboard Map
-
 ```
-Navigation
-  ⌘B                toggle sidebar
-  ⌘I                toggle inspector
-  ⌘1/2/3            inspector tabs (tools / diff / agents)
-  ⌘K                command palette
-  ?                  help overlay
-  Esc                close modal / cancel
-
-Chat
-  ⏎                  send
-  ⇧⏎                 newline
-  ↑ / ↓              history (when empty) / cursor (when typing)
-  ⌘↑ / ⌘↓            scroll chat
-  ⌥ click            open link / expand tool
-
-Selection
-  ⇧ click             range select
-  ⌘C / ⌘X            copy / cut
-  ⌘A                 select all
-
-Session
-  ⌘N                 new session
-  ⌘R                 resume session
-  ⌘.                 interrupt current run
-  ⌘⇧S                save & name session
+Failure
+✗ Tests failed
 ```
 
----
+## 7. Activity Aggregation
 
-## 12. Render Loop & State
+The agent may internally generate hundreds of events.
 
-```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│   Events     │───▶│  Reducer     │───▶│    State     │
-│  (keys,      │    │  (pure fn)   │    │  (immutable) │
-│   resize,    │    │              │    │              │
-│   stream)    │    │              │    │              │
-└──────────────┘    └──────────────┘    └──────┬───────┘
-                                                │
-                                                ▼
-                                       ┌──────────────┐
-                                       │     View     │
-                                       │  (pure fn)   │
-                                       │  state→tree  │
-                                       └──────┬───────┘
-                                              │
-                                              ▼
-                                       ┌──────────────┐
-                                       │   Diff &     │
-                                       │   Paint      │
-                                       │  (ratatui)   │
-                                       └──────────────┘
-```
+Do not display all of them.
 
-- **State:** `AppState { sidebar, inspector, chat, prompt, modals, theme, agents }`
-- **Events:** key, mouse, resize, stream-token, stream-tool, stream-end, agent-spawn, agent-done, toast
-- **View:** pure `state -> VNode`, diff against last frame
-- **Render:** ratatui buffers → terminal
-
-**Frame budget:** 16ms (60fps). Streaming tokens → repaint only the active message, not the whole screen.
-
----
-
-## 13. Animation Specs
-
-All animations are subtle, ≤ 200ms, easing: `ease-out`.
-
-| Element | Animation |
-|---|---|
-| Sidebar toggle | slide 180ms |
-| Modal open | scale 0.95 → 1.0 + fade 120ms |
-| Toast | slide-up 160ms, slide-down 120ms on dismiss |
-| Spinner | 100ms per frame |
-| Context dot pulse | 1.2s loop |
-| Thinking cursor | blink 1s |
-| Button hover | bg color transition 80ms |
-
-Respect `prefers-reduced-motion` from the terminal — most terminals don't expose it, so use a config flag.
-
----
-
-## 14. Responsive Behavior
-
-| Width | Behavior |
-|---|---|
-| ≥ 120 cols | full 3-column layout |
-| 80–119 cols | collapse inspector to icon strip |
-| 60–79 cols | collapse sidebar, inspector becomes overlay |
-| < 60 cols | single column, full-screen chat, modals full-screen |
-
-Height: minimum 24 rows. Below that, show a "terminal too small" message.
-
----
-
-## 15. File Structure (suggested)
+Bad:
 
 ```
-src/
-  main.rs
-  app/
-    state.rs          AppState
-    events.rs         Event enum
-    reducer.rs        state transitions
-  ui/
-    layout.rs         3-column grid
-    topbar.rs
-    sidebar/
-      mod.rs
-      sessions.rs
-      files.rs
-      agents.rs
-    chat/
-      mod.rs
-      message.rs
-      tool_call.rs
-      code_block.rs
-      markdown.rs
-    inspector/
-      mod.rs
-      tools.rs
-      diff.rs
-      agent_tree.rs
-    prompt.rs
-    palette.rs
-    modal.rs
-    toast.rs
-  theme/
-    tokens.rs         color constants
-    light.rs
-    dark.rs
-  input/
-    keys.rs           keymap
-    mouse.rs
-  render/
-    diff.rs           frame diffing
-    buffer.rs
+tool started
+queued: f
+queued: f
+tool input
+tool output
+queued: df
+tool finished
+tool started
+...
 ```
 
----
-
-## 16. Implementation Tips
-
-1. **Start with the chat scroll.** It's the heart. Get virtualized scrolling working — only render visible messages + a buffer above/below. For 10k messages this is essential.
-2. **Theme tokens first.** Define every color as a token before writing any view code. Swap light/dark = one constant change.
-3. **Markdown rendering** is its own subsystem. Use `pulldown-cmark` (Rust) or `marked` (JS). Handle streaming markdown by re-parsing on each token chunk (debounce to 50ms).
-4. **Syntax highlighting** for code blocks: `syntect` (Rust) or `shiki` (JS). Cache by `(lang, source_hash)`.
-5. **Diff rendering:** for tool calls, prefer showing only the changed region with `@@` context, not the full file.
-6. **Mouse support:** enable with `EnableMouseCellMotion`/`EnableMouseAllMotion`. Many terminals send mouse events, but be sure left/right click work and scroll wheel maps to chat scroll when over the chat region.
-7. **Resilience:** render must never panic. Wrap every view in a `catch_unwind`. A bad markdown token shouldn't kill the app.
-8. **Test in iTerm2, Kitty, WezTerm, Alacritty, and Windows Terminal.** Color rendering differs — use 24-bit true color (`\x1b[38;2;R;G;Bm`) which all modern terminals support.
-
----
-
-## 17. Visual Style Rules
-
-- **No emojis as primary UI** — they're noisy. Use them only as file-type indicators or status icons.
-- **No background fills on body text** — terminal backgrounds are noisy; keep text bare.
-- **Borders are the visual language.** Use `─` `│` `┌` `┐` `└` `┘` `╭` `╮` `╰` `╯` `▾` `▸` `▌` `▏` consistently.
-- **Orange is rare.** A panel border + a left accent bar + a button. That's it per screen.
-- **Whitespace is content.** Don't fill empty space with rules. Let it breathe.
-- **Numbers and timestamps always dim.** They're reference, not focus.
-
----
-
-## 18. Mouse Interaction Map
+Instead:
 
 ```
-┌────────────────────────────────────────┐
-│ TOP BAR    │ click logo → home         │
-│            │ click branch → git panel │
-├────────────┼───────────────────────────│
-│ SIDEBAR    │ click row → select       │
-│            │ click ▸ → expand         │
-│            │ click ● → active toggle  │
-│            │ right-click → menu       │
-├────────────┼───────────────────────────│
-│ CHAT       │ click bubble → focus     │
-│            │ click tool → expand      │
-│            │ scroll → chat scroll     │
-│            │ select text → copy       │
-├────────────┼───────────────────────────│
-│ INSPECTOR  │ click item → jump        │
-│            │ click ✓/✗ → approve/rej  │
-├────────────┴───────────────────────────│
-│ PROMPT    │ click → focus             │
-└────────────────────────────────────────┘
+✓ Read 14 files
+✓ Searched 38 files
+✓ Ran 5 commands
+✓ Modified 6 files
 ```
 
-Scroll wheel over chat scrolls chat. Scroll wheel over sidebar scrolls sidebar. They don't fight.
-
----
-
-## 19. Empty States
-
-### No sessions yet
+Architecture:
 
 ```
-┌────────────────────────────────────────┐
-│                                        │
-│         ◌ No sessions yet              │
-│                                        │
-│   Start a new conversation to begin.   │
-│                                        │
-│       [ + New session ]                │
-│                                        │
-│   Tip: ⌘N to start, ⌘K for commands   │
-│                                        │
-└────────────────────────────────────────┘
+Agent Events
+     │
+     ▼
+Activity Aggregator
+     │
+     ▼
+TranscriptEntry[]
+     │
+     ▼
+ChatMessageList
 ```
 
-### Empty chat (mid-session)
+Raw events can remain available internally.
 
-```
-│   Ask me anything about this codebase. │
-│                                        │
-│   ▸ "explain the auth flow"            │
-│   ▸ "find the bug in parser.rs"        │
-│   ▸ "add a /health endpoint"           │
-```
+## 8. Scrolling
 
-Suggestions in `--orange-soft` boxes, click to send.
+Do not create a custom scrolling engine.
 
----
+Use OpenTUI:
 
-## 20. Accessibility
-
-- All colors meet WCAG AA contrast against their background (orange on white = 4.5:1, orange on dark = 5:1).
-- Don't rely on color alone — every status has an icon (✓ ✗ ⏳ ◌).
-- Full keyboard control — no mouse required.
-- Focus ring: 2px orange outline on the active panel.
-- Screen reader: pipe terminal text to a TTS-friendly mode (`--tts` flag) that reads message roles and content linearly.
-
----
-
-## 21. Theming
-
-Users can override any token. Settings file:
-
-```
-~/.config/claude-code/theme.toml
-
-[light]
-bg = "#FFFFFF"
-orange = "#FF6B1A"
-
-[dark]
-bg = "#1A1A1A"
-orange = "#FF8A3D"
+```tsx
+<scrollbox
+  ref={scrollboxRef}
+  flexGrow={1}
+  stickyScroll
+  stickyStart="bottom"
+>
 ```
 
-Hot-reload with `⌘⇧T`.
+The source specifically describes Cline as using OpenTUI's native scrollbox rather than a custom virtual list.
 
----
+## 9. Transcript Scroll Handle
 
-## Summary
+Expose scrolling through a React ref.
 
-This UI is **chat-first, chrome-minimal, orange-accented**. The brand color appears at exactly three places per screen: an active left border on the assistant message, the active selection in the sidebar, and one CTA button. Everything else is white/cream/dark gray with crisp 1px borders. The result feels like Claude Code: technical, fast, no-nonsense — but warm where it matters.
+```ts
+export type TranscriptCommand =
+  | "messages_half_page_up"
+  | "messages_half_page_down"
+  | "messages_first"
+  | "messages_last";
 
-**Build order:**
-1. Theme tokens + color system
-2. Layout grid (3-column)
-3. Chat scroll + message rendering
-4. Prompt bar + slash menu
-5. Sidebar (sessions + files)
-6. Inspector (tools/diff/agents)
-7. Command palette
-8. Modals & toasts
-9. Streaming polish
-10. Theme toggle + final QA
+export type TranscriptScrollHandle = {
+  runTranscriptCommand(
+    command: TranscriptCommand,
+  ): void;
+};
+```
+
+Implementation:
+
+```ts
+const scrollboxRef = useRef<any>(null);
+
+const runTranscriptCommand = useCallback(
+  (command: TranscriptCommand) => {
+    const scrollbox = scrollboxRef.current;
+
+    if (!scrollbox) {
+      return;
+    }
+
+    switch (command) {
+      case "messages_half_page_up":
+        scrollbox.scrollBy(-scrollbox.height / 4);
+        return;
+
+      case "messages_half_page_down":
+        scrollbox.scrollBy(scrollbox.height / 4);
+        return;
+
+      case "messages_first":
+        scrollbox.scrollTo(0);
+        return;
+
+      case "messages_last":
+        scrollbox.scrollTo(scrollbox.scrollHeight);
+        return;
+    }
+  },
+  [],
+);
+```
+
+This is the same four-command abstraction described in the Cline implementation.
+
+## 10. useImperativeHandle
+
+Expose the handle to the parent:
+
+```ts
+useImperativeHandle(
+  ref,
+  () => ({
+    runTranscriptCommand,
+  }),
+  [runTranscriptCommand],
+);
+```
+
+Parent:
+
+```ts
+const transcriptScrollRef =
+  useRef<TranscriptScrollHandle | null>(null);
+```
+
+Then:
+
+```tsx
+<ChatMessageList
+  ref={transcriptScrollRef}
+  entries={entries}
+  isStreaming={isStreaming}
+/>
+```
+
+## 11. Keyboard Controls
+
+File:
+
+```
+apps/cli/src/tui/hooks/transcript-keybinds.ts
+```
+
+Default:
+
+```
+PageUp       → messages_half_page_up
+Ctrl+U       → messages_half_page_up
+
+PageDown     → messages_half_page_down
+Ctrl+D       → messages_half_page_down
+
+Ctrl+Home    → messages_first
+Ctrl+End     → messages_last
+```
+
+These are the documented Cline-style mappings.
+
+## 12. Root Keyboard
+
+File:
+
+```
+apps/cli/src/tui/hooks/use-root-keyboard.ts
+```
+
+Flow:
+
+```
+Keyboard
+   ↓
+useRootKeyboard
+   ↓
+matchTranscriptKeybind()
+   ↓
+TranscriptCommand
+   ↓
+transcriptScrollRef
+   ↓
+ChatMessageList
+   ↓
+OpenTUI ScrollBox
+```
+
+Implementation:
+
+```ts
+useKeyboard((key) => {
+  const command = matchTranscriptKeybind(key);
+
+  if (!command) {
+    return;
+  }
+
+  key.preventDefault();
+
+  transcriptScrollRef.current
+    ?.runTranscriptCommand(command);
+});
+```
+
+## 13. Auto Scroll
+
+When a new user message is submitted:
+
+```
+User presses Enter
+       ↓
+Add user message
+       ↓
+userSubmissionScrollKey++
+       ↓
+scrollToBottom()
+```
+
+Use:
+
+```ts
+useEffect(() => {
+  if (!userSubmissionScrollKey) {
+    return;
+  }
+
+  const scrollToBottom = () => {
+    const scrollbox = scrollboxRef.current;
+
+    if (!scrollbox) {
+      return;
+    }
+
+    scrollbox.scrollTo(scrollbox.scrollHeight);
+  };
+
+  scrollToBottom();
+
+  queueMicrotask(scrollToBottom);
+
+  const timeout = setTimeout(
+    scrollToBottom,
+    0,
+  );
+
+  return () => {
+    clearTimeout(timeout);
+  };
+}, [userSubmissionScrollKey]);
+```
+
+The source describes this immediate + microtask + timeout pattern as a way to allow React/OpenTUI layout to settle.
+
+## 14. Streaming
+
+Streaming should look like:
+
+```
+Model
+ ↓
+delta
+ ↓
+Assistant transcript entry
+ ↓
+TUI updates
+ ↓
+OpenTUI layout
+ ↓
+stickyScroll
+ ↓
+bottom remains visible
+```
+
+Do not call:
+
+```
+scrollToBottom();
+```
+
+for every individual token.
+
+Use the scrollbox's sticky behavior.
+
+## 15. User Scroll During Streaming
+
+Normal behavior:
+
+```
+At bottom
+   ↓
+Agent streams
+   ↓
+Follow new content
+```
+
+But:
+
+```
+User scrolls up
+   ↓
+User reads previous output
+   ↓
+Don't fight the user
+```
+
+When the user returns to the bottom:
+
+```
+Bottom reached
+   ↓
+Auto-follow resumes
+```
+
+The provided Cline research describes this as smart auto-pin behavior: being at the bottom allows new content to follow; scrolling away releases the auto-pin.
+
+## 16. Streaming Performance
+
+Do not force React to rebuild the entire application for every token.
+
+Use a streaming entry:
+
+```ts
+{
+  id: "assistant-1",
+  kind: "assistant",
+  text: "...",
+  streaming: true
+}
+```
+
+Update only the active streaming entry.
+
+The Cline research specifically notes imperative mutation/appending of session.entries during streaming to avoid React re-renders for every delta.
+
+## 17. Prompt Input
+
+File:
+
+```
+apps/cli/src/tui/components/prompt-input.tsx
+```
+
+Keep it outside the scrollbox:
+
+```
+┌──────────────────────────────────────────┐
+│ transcript                               │
+│                                          │
+│ messages                                 │
+│                                          │
+│ messages                                 │
+├──────────────────────────────────────────┤
+│ › Type your message...                   │
+├──────────────────────────────────────────┤
+│ enter send · shift+enter newline         │
+└──────────────────────────────────────────┘
+```
+
+The transcript scrolls.
+
+The input remains fixed.
+
+## 18. Input Behavior
+
+Required:
+
+```
+Enter
+    → submit
+
+Shift+Enter
+    → newline
+
+Esc
+    → cancel streaming / close active interaction
+
+Ctrl+C
+    → cancel current operation / exit when appropriate
+```
+
+Typing must never modify the transcript.
+
+## 19. Header
+
+Keep it small.
+
+Example:
+
+```
+KLYRO v0.1.0
+claude-sonnet · ~/projects/my-app
+```
+
+or:
+
+```
+KLYRO
+~/projects/my-app
+```
+
+Do not create an IDE-style sidebar.
+
+## 20. Status Bar
+
+Bottom:
+
+```
+────────────────────────────────────────────────────────
+enter send · shift+enter newline       $0.03 · 8% ctx
+```
+
+Possible information:
+
+- model
+- tokens
+- cost
+- context %
+- git branch
+- streaming state
+
+Keep it compact.
+
+## 21. Permission UI
+
+When Klyro needs permission:
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Permission required                                  │
+│                                                      │
+│ Run: pnpm test                                       │
+│                                                      │
+│ [y] Allow   [a] Always   [n] Deny   [e] Explain     │
+└──────────────────────────────────────────────────────┘
+```
+
+The permission dialog should temporarily capture keyboard input.
+
+After closing:
+
+```
+Permission dialog
+       ↓
+restore transcript/input focus
+```
+
+## 22. Tool Activity
+
+Default:
+
+```
+✓ Read 14 files
+✓ Searched 38 files
+✓ Ran 5 commands
+✓ Modified 6 files
+```
+
+Expandable:
+
+```
+▼ Ran 5 commands
+
+  $ pnpm test
+  $ pnpm build
+  $ git diff --check
+  $ pnpm lint
+  $ pnpm typecheck
+```
+
+This keeps the TUI clean without losing information.
+
+## 23. Markdown Rendering
+
+Assistant responses should support terminal Markdown:
+
+```
+# Authentication
+
+I've implemented the authentication flow.
+
+## Changes
+
+• Added auth service
+• Added login endpoint
+• Added middleware
+```
+
+Support:
+
+- headings
+- bold
+- italic
+- lists
+- code
+- code blocks
+- links
+- tables where practical
+
+Everything must render for the terminal.
+
+No HTML.
+
+## 24. Code Blocks
+
+Example:
+
+```
+┌────────────────────────────────────────────┐
+│ const user = await auth.login(credentials) │
+│                                            │
+│ return createSession(user);                │
+└────────────────────────────────────────────┘
+```
+
+Use terminal syntax highlighting if OpenTUI's available components support it.
+
+## 25. Diff UI
+
+When files are modified:
+
+```
+✓ src/auth/service.ts
+
+  + export async function login(...)
+  +   ...
+  - old implementation
+```
+
+Default view should be compact.
+
+Allow detailed diff inspection separately.
+
+## 26. Plan UI
+
+Example:
+
+```
+◇ Plan
+
+  1. Add authentication service
+  2. Add login endpoint
+  3. Add session middleware
+  4. Add tests
+```
+
+As work progresses:
+
+```
+◇ Plan
+
+  ✓ 1. Add authentication service
+  ✓ 2. Add login endpoint
+  ◌ 3. Add session middleware
+  ○ 4. Add tests
+```
+
+## 27. Agent Activity
+
+The UI should feel like an agent working:
+
+```
+• Klyro
+
+Analyzing repository...
+
+✓ Read 14 files
+✓ Searched src/
+✓ Found authentication-related code
+
+◇ Plan
+
+  1. Create auth service
+  2. Add login endpoint
+  3. Add middleware
+
+✓ Modified 4 files
+
+Running tests...
+
+✓ 27 passed
+
+Done.
+```
+
+Not:
+
+```
+tool_call
+tool_call
+tool_call
+tool_result
+tool_result
+JSON
+JSON
+JSON
+```
+
+## 28. TUI State
+
+Keep UI state separate from agent state.
+
+```
+Agent Runtime
+     │
+     ▼
+Events
+     │
+     ▼
+TUI State Reducer
+     │
+     ▼
+React
+     │
+     ▼
+OpenTUI
+```
+
+Do not make the agent directly call:
+
+```
+console.log()
+```
+
+The agent emits events.
+
+The TUI decides how to display them.
+
+## 29. Event Model
+
+Example:
+
+```ts
+type KlyroUIEvent =
+  | {
+      type: "user.message";
+      text: string;
+    }
+  | {
+      type: "assistant.delta";
+      text: string;
+    }
+  | {
+      type: "tool.started";
+      tool: string;
+    }
+  | {
+      type: "tool.finished";
+      tool: string;
+      success: boolean;
+    }
+  | {
+      type: "permission.requested";
+      tool: string;
+    }
+  | {
+      type: "verification.started";
+    }
+  | {
+      type: "verification.finished";
+      success: boolean;
+    };
+```
+
+## 30. Complete Architecture
+
+```
+                    KLYRO
+                      │
+                      ▼
+               Agent Runtime
+                      │
+                      ▼
+                Event Stream
+                      │
+                      ▼
+             TUI Event Reducer
+                      │
+                      ▼
+             Transcript State
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+ ChatMessageList              PromptInput
+          │
+          ▼
+     OpenTUI ScrollBox
+          │
+          ▼
+       Terminal
+```
+
+## 31. File Structure
+
+```
+apps/cli/src/tui/
+│
+├── app.tsx
+│
+├── views/
+│   ├── home-view.tsx
+│   └── chat-view.tsx
+│
+├── components/
+│   ├── header.tsx
+│   ├── chat-message-list.tsx
+│   ├── chat-entry-view.tsx
+│   ├── prompt-input.tsx
+│   ├── status-bar.tsx
+│   ├── activity-view.tsx
+│   ├── plan-view.tsx
+│   ├── diff-view.tsx
+│   ├── permission-dialog.tsx
+│   └── markdown-view.tsx
+│
+├── hooks/
+│   ├── use-root-keyboard.ts
+│   ├── use-prompt-input.ts
+│   └── transcript-keybinds.ts
+│
+├── state/
+│   ├── tui-state.ts
+│   └── tui-reducer.ts
+│
+└── types.ts
+```
+
+## 32. What NOT to Build
+
+Do not initially build:
+
+```
+❌ Browser UI
+❌ HTML/CSS
+❌ Custom scrolling engine
+❌ Custom scroll physics
+❌ Custom viewport mathematics
+❌ Custom terminal mouse parser
+❌ Custom virtual list
+❌ IDE-style sidebar
+❌ Dashboard UI
+❌ Huge permanent tool cards
+❌ Raw event spam
+```
+
+Use OpenTUI for terminal rendering and scrolling.
+
+## 33. Final UX
+
+Klyro should ultimately feel like:
+
+```
+KLYRO v0.1.0
+claude-sonnet · ~/projects/my-app
+
+> Add authentication to this app
+
+• Klyro
+
+I'll inspect the project first.
+
+  ✓ Read 14 files
+  ✓ Searched src/
+  ✓ Found auth-related files
+
+◇ Plan
+
+  1. Add authentication service
+  2. Create login endpoint
+  3. Add session middleware
+  4. Add tests
+
+  ✓ src/auth/service.ts
+  ✓ src/api/login.ts
+  ✓ src/middleware/auth.ts
+
+  Running tests...
+
+  ✓ 27 tests passed
+
+Authentication has been implemented.
+
+────────────────────────────────────────────────────────
+› Message Klyro...
+────────────────────────────────────────────────────────
+enter send · shift+enter newline
+```
+
+The middle transcript scrolls, while the input and status stay fixed.
+
+## 34. The Core Rule
+
+The implementation should stay this simple:
+
+```
+                  TERMINAL
+                     │
+                     ▼
+                   OpenTUI
+                     │
+          ┌──────────┴──────────┐
+          │                     │
+       ScrollBox            Keyboard
+          │                     │
+          │                     ▼
+          │              TranscriptCommand
+          │                     │
+          └──────────────┬──────┘
+                         ▼
+                ChatMessageList
+```
+
+The actual scrolling is only:
+
+```
+scrollbox.scrollBy(...)
+scrollbox.scrollTo(...)
+```
+
+with:
+
+```tsx
+<scrollbox
+  flexGrow={1}
+  stickyScroll
+  stickyStart="bottom"
+>
+```

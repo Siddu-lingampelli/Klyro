@@ -125,7 +125,7 @@ export type RuntimeEvent =
   | { kind: 'tool_call_end'; id: string; name: string; input: Record<string, unknown> }
   | { kind: 'policy_decision'; id: string; name: string; action: 'allow' | 'ask' | 'deny'; reason?: string }
   | { kind: 'tool_result'; id: string; name: string; output: unknown; isError: boolean; latencyMs: number }
-  | { kind: 'usage'; input: number; output: number }
+  | { kind: 'usage'; input: number; output: number; estimated?: boolean }
   | { kind: 'final_text'; text: string }
   | { kind: 'aborted' }
   | { kind: 'plan_update'; plan: PlanStep[] }
@@ -137,14 +137,14 @@ export type RuntimeEvent =
   | { kind: 'checkpoint_saved'; sessionId: string };
 
 export interface RunResult {
-  status: 'complete' | 'max_steps' | 'aborted' | 'no_final' | 'verify_failed' | 'limit' | 'blocked';
+  status: 'complete' | 'max_steps' | 'aborted' | 'no_final' | 'verify_failed' | 'limit' | 'blocked' | 'stuck';
   steps: number;
   toolCalls: number;
   finalText: string;
   transcript: Message[];
   /** Whether any file-mutating tool ran (drives --require-verify semantics). */
   hasEdits: boolean;
-  usage: { input: number; output: number };
+  usage: { input: number; output: number; estimated?: boolean };
   /** Number of policy-driven user prompts the user accepted. */
   repairs?: number;
   /** Verification outcome (Level 8) */
@@ -217,7 +217,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     }
     return [{ role: 'user', content: [text(opts.task)] }];
   })();
-  const usage = { input: 0, output: 0 };
+  const usage: { input: number; output: number; estimated?: boolean } = { input: 0, output: 0 };
   let steps = 0;
   let toolCallCount = 0;
   let finalText = '';
@@ -300,6 +300,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   // 5.2 — stuck detection state
   const callHistory: string[] = [];
   const fileEditCounts = new Map<string, number>();
+  let stuckTriggers = 0;
+  let stuckAbort = false;
 
   outer: while (steps < maxSteps) {
     // 5.1 limits: max-cost, max-time
@@ -387,6 +389,16 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           usage.output += ev.usage.output;
           telemetry.recordUsage(ev.usage.input, ev.usage.output);
           emit?.({ kind: 'usage', input: usage.input, output: usage.output });
+        } else {
+          // Providers that omit usage (Ollama, vLLM, proxies): estimate from
+          // the actual request + generated output so cost accounting never
+          // silently records zero. Marked estimated for the UI/debugging.
+          const est = estimateTurnUsage(reqSystem, reqMessages, textBuf, pendingToolCalls);
+          usage.input += est.input;
+          usage.output += est.output;
+          usage.estimated = true;
+          telemetry.recordUsage(est.input, est.output);
+          emit?.({ kind: 'usage', input: usage.input, output: usage.output, estimated: true });
         }
       } else if (ev.kind === 'error') {
         telemetry.recordError(`stream_error: ${ev.code}`);
@@ -408,20 +420,45 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       }
     }
 
-    // Build the assistant message.
+    // Build the assistant message. Tool calls are finalized here: JSON is
+    // parsed and schema-validated BEFORE policy/execution. Malformed calls
+    // become structured MALFORMED_TOOL_CALL results — garbage arguments must
+    // never reach a real tool.
     const assistantContent: Message['content'] = [];
     if (textBuf) assistantContent.push(text(textBuf));
     const finalizedCalls: ToolUseBlock[] = [];
+    let hadInvalidTool = false;
     for (const tc of pendingToolCalls.values()) {
-      let input: Record<string, unknown> = {};
-      try {
-        input = JSON.parse(tc.argsJson || '{}');
-      } catch {
-        input = { _parse_error: true, raw: tc.argsJson };
+      const validated = validateFinalizedCall(deps.registry, tc.id, tc.name, tc.argsJson);
+      if (!validated.ok) {
+        hadInvalidTool = true;
+        // Record the model's tool_use (empty input — safe to replay to any
+        // provider) and answer it immediately with a structured error.
+        assistantContent.push(toolUse(tc.id, tc.name, {}));
+        emit?.({ kind: 'tool_call_end', id: tc.id, name: tc.name, input: {} });
+        const errMsg: Message = {
+          role: 'tool',
+          content: [mkToolResult(tc.id, tc.name, validated.output, true)],
+        };
+        transcript.push(errMsg);
+        await checkpoint(errMsg, {
+          toolCallId: tc.id, toolName: tc.name,
+          input: { raw: redact(tc.argsJson).slice(0, 500) }, output: validated.output, isError: true,
+        });
+        let attempted: Record<string, unknown> = {};
+        try {
+          attempted = JSON.parse(tc.argsJson) as Record<string, unknown>;
+        } catch {
+          attempted = {};
+        }
+        telemetry.recordToolError(toolUse(tc.id, tc.name, attempted), validated.code);
+        emitKlyro({ type: 'tool.result', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: tc.id, name: tc.name, output: validated.output, isError: true, latencyMs: 0 });
+        emit?.({ kind: 'tool_result', id: tc.id, name: tc.name, output: validated.output, isError: true, latencyMs: 0 });
+        continue;
       }
-      finalizedCalls.push(toolUse(tc.id, tc.name, input));
-      assistantContent.push(toolUse(tc.id, tc.name, input));
-      emit?.({ kind: 'tool_call_end', id: tc.id, name: tc.name, input });
+      finalizedCalls.push(toolUse(tc.id, tc.name, validated.input));
+      assistantContent.push(toolUse(tc.id, tc.name, validated.input));
+      emit?.({ kind: 'tool_call_end', id: tc.id, name: tc.name, input: validated.input });
     }
     const assistantMsg: Message = { role: 'assistant', content: assistantContent };
     transcript.push(assistantMsg);
@@ -440,6 +477,14 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
     }
     if (finalizedCalls.length === 0) {
+      if (hadInvalidTool) {
+        // The model attempted a tool call that failed validation; the error is
+        // already a tool_result in the transcript — loop so the model can
+        // repair next turn instead of treating an answerable error as a
+        // completion. Bounded by maxSteps and stuck detection (P0-3).
+        emit?.({ kind: 'step_end', step: steps });
+        continue;
+      }
       finalText = textBuf;
       // Level 8 — Verification + Autonomous Repair (gated on hasEdits below — pure analysis skips verify)
       const verifyEnabled = opts.verify?.enabled !== false;
@@ -691,6 +736,23 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       return { obs, latencyMs };
     };
 
+    // 5.2 stuck termination (P0-3): the FIRST detection injects one
+    // "change approach" synthetic message for the next model turn; the SECOND
+    // detection aborts the automated loop with a `stuck` status so a repeated
+    // tool loop never burns unbounded tokens. Covers both signals: identical
+    // call ×3 and same-file edited >8×.
+    const markStuck = async (msg: string): Promise<void> => {
+      stuckTriggers++;
+      emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: msg } as unknown as import('../events/catalog.js').KlyroEvent);
+      if (stuckTriggers === 1) {
+        const note: Message = { role: 'user', content: [text(`[system note] Stuck detected: ${msg}. Stop repeating the same action; change approach.`)] };
+        transcript.push(note);
+        await checkpoint(note);
+      } else {
+        stuckAbort = true;
+      }
+    };
+
     // Commit phase: fold one execution result into the transcript, in original
     // call order. The only writer — call sequentially, never concurrently.
     const commitResult = async (
@@ -737,7 +799,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           const cnt = (fileEditCounts.get(fileChanged.path) ?? 0) + 1;
           fileEditCounts.set(fileChanged.path, cnt);
           if (cnt > 8) {
-            emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: `same file edited >8×: ${fileChanged.path}` } as unknown as import('../events/catalog.js').KlyroEvent);
+            await markStuck(`same file edited >8×: ${fileChanged.path}`);
           }
         }
       }
@@ -747,11 +809,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       if (callHistory.length > 10) callHistory.shift();
       const last3 = callHistory.slice(-3);
       if (last3.length === 3 && last3[0] === last3[1] && last3[1] === last3[2]) {
-        emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: `identical call ×3: ${sig}` } as unknown as import('../events/catalog.js').KlyroEvent);
-        // Inject system note for next turn
-        const note: Message = { role: 'user', content: [text(`[system note] Stuck detected: identical call ×3: ${sig}. Try a different approach.`)] };
-        transcript.push(note);
-        await checkpoint(note);
+        await markStuck(`identical call ×3: ${sig}`);
       }
     };
 
@@ -802,6 +860,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     if (store && sessionId) {
       try { await store.setStatus(sessionId, 'open'); } catch { /* ignore */ }
     }
+    // 5.2 — terminate the automated loop once stuck recurs after the note
+    if (stuckAbort) break;
   }
 
   if (opts.signal?.aborted) {
@@ -812,12 +872,119 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     await closeTracer();
     return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
   }
+
+  // 5.2 — stuck termination (P0-3): bounded stop instead of unbounded token burn.
+  if (stuckAbort) {
+    emit?.({ kind: 'final_text', text: finalText });
+    if (store && sessionId) {
+      try { await store.setStatus(sessionId, 'stuck', finalText); } catch { /* ignore */ }
+    }
+    await closeTracer();
+    return { status: 'stuck', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+  }
+
   emit?.({ kind: 'final_text', text: finalText });
   if (store && sessionId) {
     try { await store.setStatus(sessionId, 'max_steps', finalText); } catch { /* ignore */ }
   }
   await closeTracer();
   return { status: 'max_steps', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+}
+
+/**
+ * Estimate usage for a turn whose provider omitted it (Ollama, vLLM,
+ * proxies). Input is measured from the actual request via the tokenizer;
+ * output is a chars/4 heuristic over generated text + tool arguments.
+ */
+function estimateTurnUsage(
+  system: string | undefined,
+  messages: Message[],
+  textOut: string,
+  toolCalls: Map<string, { argsJson: string }>,
+): { input: number; output: number } {
+  let argsChars = 0;
+  for (const tc of toolCalls.values()) argsChars += tc.argsJson.length;
+  return {
+    input: totalTokens(system, messages),
+    output: Math.max(1, Math.ceil((textOut.length + argsChars) / 4)),
+  };
+}
+
+type FinalizedValidation =
+  | { ok: true; input: Record<string, unknown> }
+  | { ok: false; code: string; output: { code: string; tool: string; message: string; retryable: boolean } };
+
+/**
+ * Validate one assembled tool call before it reaches policy or execution.
+ * Returns the parsed+schema-validated input, or a structured error output
+ * (MALFORMED_TOOL_CALL / UNKNOWN_TOOL) that the runtime records as a tool
+ * result without executing anything.
+ */
+function validateFinalizedCall(
+  registry: ToolRegistry,
+  id: string,
+  name: string,
+  argsJson: string,
+): FinalizedValidation {
+  void id;
+  let parsed: unknown = {};
+  if (argsJson.trim()) {
+    try {
+      parsed = JSON.parse(argsJson);
+    } catch {
+      return {
+        ok: false,
+        code: 'MALFORMED_TOOL_CALL',
+        output: {
+          code: 'MALFORMED_TOOL_CALL',
+          tool: name,
+          message: 'Tool arguments were incomplete or invalid JSON. Re-issue the call with complete arguments.',
+          retryable: true,
+        },
+      };
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      code: 'MALFORMED_TOOL_CALL',
+      output: {
+        code: 'MALFORMED_TOOL_CALL',
+        tool: name,
+        message: 'Tool arguments must be a JSON object. Re-issue the call with complete arguments.',
+        retryable: true,
+      },
+    };
+  }
+  const tool = registry.get(name);
+  if (!tool) {
+    return {
+      ok: false,
+      code: 'UNKNOWN_TOOL',
+      output: {
+        code: 'MALFORMED_TOOL_CALL',
+        tool: name,
+        message: `Unknown tool "${name}". Use one of the available tools.`,
+        retryable: true,
+      },
+    };
+  }
+  const checked = tool.inputSchema.safeParse(parsed);
+  if (!checked.success) {
+    const first = checked.error.issues[0];
+    const detail = first ? ` (${first.path.join('.') || 'input'}: ${first.message})` : '';
+    return {
+      ok: false,
+      code: 'MALFORMED_TOOL_CALL',
+      output: {
+        code: 'MALFORMED_TOOL_CALL',
+        tool: name,
+        message: `Tool arguments failed validation${detail}. Re-issue the call with correct arguments.`,
+        retryable: true,
+      },
+    };
+  }
+  return { ok: true, input: parsed as Record<string, unknown> };
 }
 
 function redactOutput(v: unknown): unknown {

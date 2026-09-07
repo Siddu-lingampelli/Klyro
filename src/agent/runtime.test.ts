@@ -439,6 +439,112 @@ describe('runtime: level-7 telemetry', () => {
     expect(seenSystems[1]).toMatch(/Last error: user_denied: shell_exec/);
   });
 
+  it('never executes malformed tool calls — structured MALFORMED_TOOL_CALL instead', async () => {
+    const { z } = await import('zod');
+    const { defineTool } = await import('../tools/types.js');
+    let executed = 0;
+    const reg = new ToolRegistry().register(defineTool({
+      name: 'probe_exec',
+      description: 'must not run',
+      inputSchema: z.object({ path: z.string() }),
+      permission: 'read' as const,
+      isConcurrencySafe: true,
+      execute: async () => { executed++; return { ok: true as const, value: {} }; },
+    }));
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'probe_exec' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'ok' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const r = await run(
+      { task: 'malformed', cwd, model: 'mock', maxSteps: 3, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(executed).toBe(0);
+    expect(r.toolCalls).toBe(0);
+    const toolMsgs = r.transcript.filter((m) => m.role === 'tool');
+    expect(toolMsgs.length).toBe(1);
+    expect(JSON.stringify(toolMsgs[0])).toContain('MALFORMED_TOOL_CALL');
+  });
+
+  it('rejects schema-invalid arguments without executing', async () => {
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'write_file' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"x.txt"}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'ok' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const r = await run(
+      { task: 'schemabad', cwd, model: 'mock', maxSteps: 3, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.toolCalls).toBe(0);
+    expect(JSON.stringify(r.transcript)).toContain('MALFORMED_TOOL_CALL');
+  });
+
+  it('estimates usage when the provider omits it, flags estimated', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'hello there' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const seen: Array<{ input: number; output: number; estimated?: boolean }> = [];
+    const r = await run(
+      {
+        task: 'estimate me', cwd, model: 'mock', maxSteps: 2, nonInteractive: true,
+        onEvent: (ev) => { if (ev.kind === 'usage') seen.push({ input: ev.input, output: ev.output, estimated: ev.estimated }); },
+      },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('complete');
+    expect(r.usage.input).toBeGreaterThan(0);
+    expect(r.usage.output).toBeGreaterThan(0);
+    expect(r.usage.estimated).toBe(true);
+    expect(seen[0]?.estimated).toBe(true);
+  });
+
+  it('prefers provider-reported usage over estimates', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'hi' },
+        { kind: 'message_end', finishReason: 'stop', usage: { input: 100, output: 20 } },
+      ],
+    ]);
+    const r = await run(
+      { task: 'reported', cwd, model: 'mock', maxSteps: 2, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.usage).toMatchObject({ input: 100, output: 20 });
+    expect(r.usage.estimated).toBeUndefined();
+  });
+
   it('records tool execution errors (UNSUPPORTED tool) into the telemetry', async () => {
     // Register only write_file but the model calls read_file → tool error.
     const reg = new ToolRegistry().register(writeFileTool);

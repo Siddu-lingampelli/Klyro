@@ -150,6 +150,71 @@ describe('anthropicAdapter', () => {
       expect((err as any).code).toBe('transport');
       expect((err as any).message).toContain('ECONNREFUSED');
     });
+
+    it('routes concurrent tool blocks by index without cross-talk', async () => {
+      const body = sse([
+        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'a', input: {} } }],
+        ['content_block_start', { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_2', name: 'b', input: {} } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"x"' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"y"' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: ':2}' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: ':1}' } }],
+        ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+        ['content_block_stop', { type: 'content_block_stop', index: 1 }],
+        ['message_stop', { type: 'message_stop' }],
+      ]);
+      const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl: makeFetch(body) });
+      const events = [];
+      for await (const ev of adapter.stream({ model: 'm', messages: [], tools: [] })) events.push(ev);
+      const byId = new Map<string, string>();
+      for (const e of events) {
+        if (e.kind === 'tool_call_delta') {
+          const d = e as { id: string; argsJson: string };
+          byId.set(d.id, (byId.get(d.id) ?? '') + d.argsJson);
+        }
+      }
+      expect(byId.get('toolu_1')).toBe('{"x":1}');
+      expect(byId.get('toolu_2')).toBe('{"y":2}');
+    });
+
+    it('carries provider usage from message_start/message_delta into message_end', async () => {
+      const body = sse([
+        ['message_start', { type: 'message_start', message: { usage: { input_tokens: 120, output_tokens: 0 } } }],
+        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } }],
+        ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+        ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 12 } }],
+        ['message_stop', { type: 'message_stop' }],
+      ]);
+      const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl: makeFetch(body) });
+      const events = [];
+      for await (const ev of adapter.stream({ model: 'm', messages: [], tools: [] })) events.push(ev);
+      const end = events.find((e) => e.kind === 'message_end');
+      expect(end).toMatchObject({ kind: 'message_end', usage: { input: 120, output: 12 } });
+    });
+
+    it('closes open blocks on a truncated stream instead of hanging', async () => {
+      const body = sse([
+        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: {} } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"path":' } }],
+      ]);
+      const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl: makeFetch(body) });
+      const events = [];
+      for await (const ev of adapter.stream({ model: 'm', messages: [], tools: [] })) events.push(ev);
+      expect(events).toContainEqual({ kind: 'tool_call_end', id: 'toolu_1' });
+      expect(events.filter((e) => e.kind === 'message_end')).toHaveLength(1);
+    });
+
+    it('surfaces unattributable fragments as ORPHAN_TOOL_DELTAS, never drops', async () => {
+      const body = sse([
+        ['content_block_delta', { type: 'content_block_delta', index: 7, delta: { type: 'input_json_delta', partial_json: '{"x":1}' } }],
+      ]);
+      const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl: makeFetch(body) });
+      const events = [];
+      for await (const ev of adapter.stream({ model: 'm', messages: [], tools: [] })) events.push(ev);
+      const err = events.find((e) => e.kind === 'error');
+      expect(err).toMatchObject({ kind: 'error', code: 'ORPHAN_TOOL_DELTAS' });
+    });
   });
 });
 
