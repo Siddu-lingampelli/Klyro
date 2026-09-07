@@ -615,8 +615,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       sessionId,
     };
     const allSafe = finalizedCalls.length > 1 && finalizedCalls.every((c) => deps.registry.get(c.name)?.isConcurrencySafe !== false);
-    const runOne = async (call: typeof finalizedCalls[number]): Promise<void> => {
-      // Use per-call handling without continue (runOne is not a loop)
+    // Gate phase: policy decision + approval prompt for one call. Runs
+    // sequentially (approval UI is one-modal-at-a-time). Commits deny/user-deny
+    // results immediately — gate runs in call order so these stay ordered.
+    // Returns true when the call is approved for execution.
+    const gateCall = async (call: typeof finalizedCalls[number]): Promise<boolean> => {
       const decision = await deps.policy.evaluate(
         { name: call.name, input: call.input },
         { cwd: opts.cwd, nonInteractive: opts.nonInteractive },
@@ -637,7 +640,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         emitKlyro({ type: 'tool.result', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, output: { error: 'POLICY_DENIED' }, isError: true, latencyMs: 0 });
         telemetry.recordToolError(call, 'policy_denied');
         emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: decision.reason }, isError: true, latencyMs: 0 });
-        return;
+        return false;
       }
 
       if (decision.action === 'ask') {
@@ -659,16 +662,39 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           await checkpoint(denyMsg2, { toolCallId: call.id, toolName: call.name, input: call.input, output: { error: 'POLICY_DENIED', reason: 'user denied' }, isError: true });
           telemetry.recordToolError(call, 'user_denied');
           emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: 'user denied' }, isError: true, latencyMs: 0 });
-          return;
+          return false;
         }
         // Handle 'edit' choice: for now treat as allow with edited input (future: re-prompt)
         repairs++;
       }
+      return true;
+    };
 
+    // Execute phase: run the tool with no transcript writes, so concurrent
+    // executions can't interleave. A throw here becomes a tool error (an
+    // executor crash must never kill the step).
+    const execTool = async (
+      call: typeof finalizedCalls[number],
+    ): Promise<{ obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number }> => {
       const t0 = Date.now();
       emitKlyro({ type: 'tool.call', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, input: call.input });
-      const obs = await deps.registry.execute(call.name, call.input, toolCtx);
+      let obs: import('../tools/types.js').ToolResult<unknown>;
+      try {
+        obs = await deps.registry.execute(call.name, call.input, toolCtx);
+      } catch (err) {
+        obs = { ok: false, error: { code: 'EXEC_CRASH', message: err instanceof Error ? err.message : String(err) } } as import('../tools/types.js').ToolResult<unknown>;
+      }
       const latencyMs = Date.now() - t0;
+      return { obs, latencyMs };
+    };
+
+    // Commit phase: fold one execution result into the transcript, in original
+    // call order. The only writer — call sequentially, never concurrently.
+    const commitResult = async (
+      call: typeof finalizedCalls[number],
+      obs: import('../tools/types.js').ToolResult<unknown>,
+      latencyMs: number,
+    ): Promise<void> => {
       const output = obs.ok ? redactOutput(obs.value) : redactOutput({ error: obs.error });
       const toolMsg: Message = {
         role: 'tool',
@@ -726,14 +752,39 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       }
     };
 
-    // 3.5 — parallel if all concurrencySafe, sequential otherwise
-    // BUG-002: preserve call order — run sequentially even when allSafe to avoid out-of-order transcript
-    // Parallel execution previously pushed tool_results out of order via Promise.all
+    // Sequential path: gate → execute → commit per call, in order.
+    const runOne = async (call: typeof finalizedCalls[number]): Promise<void> => {
+      if (!(await gateCall(call))) return;
+      const { obs, latencyMs } = await execTool(call);
+      await commitResult(call, obs, latencyMs);
+    };
+
+    // 3.5 — parallel when every call is concurrencySafe, sequential otherwise.
+    // Gate runs sequentially in both paths (approval UI is one-at-a-time).
+    // Parallel path executes concurrently but commits in original call order,
+    // so the transcript reads exactly as if the calls ran in order (this is
+    // what the old BUG-002 sequential fallback was protecting).
     if (allSafe) {
+      const approved: typeof finalizedCalls = [];
       for (const call of finalizedCalls) {
         toolCallCount++;
-        await runOne(call);
+        if (await gateCall(call)) approved.push(call);
         if (opts.signal?.aborted) break;
+      }
+      if (approved.length > 0 && !opts.signal?.aborted) {
+        const settled = await Promise.allSettled(approved.map((c) => execTool(c)));
+        for (let i = 0; i < approved.length; i++) {
+          const s = settled[i]!;
+          if (s.status === 'fulfilled') {
+            await commitResult(approved[i]!, s.value.obs, s.value.latencyMs);
+          } else {
+            await commitResult(
+              approved[i]!,
+              { ok: false, error: { code: 'EXEC_CRASH', message: String(s.reason) } } as import('../tools/types.js').ToolResult<unknown>,
+              0,
+            );
+          }
+        }
       }
     } else {
       for (const call of finalizedCalls) {

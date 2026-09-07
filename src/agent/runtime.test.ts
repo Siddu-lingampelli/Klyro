@@ -100,6 +100,63 @@ describe('runtime', () => {
     expect(r.toolCalls).toBe(1);
   });
 
+  it('runs concurrencySafe tools in parallel but commits results in call order', async () => {
+    const { z } = await import('zod');
+    const { defineTool } = await import('../tools/types.js');
+    // Both tools block until released: if execution were sequential, the
+    // second execute would never start before the first finished.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const started: string[] = [];
+    const mkProbe = (name: string) => defineTool({
+      name,
+      description: 'parallelism probe',
+      inputSchema: z.object({}),
+      permission: 'read' as const,
+      isConcurrencySafe: true,
+      execute: async () => {
+        started.push(name);
+        await gate;
+        return { ok: true as const, value: { name } };
+      },
+    });
+    const reg = new ToolRegistry().register(mkProbe('probe_a')).register(mkProbe('probe_b'));
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'probe_a' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'tool_call_start', id: 'c2', name: 'probe_b' },
+        { kind: 'tool_call_delta', id: 'c2', argsJson: '{}' },
+        { kind: 'tool_call_end', id: 'c2' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'done' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const task = run(
+      { task: 'probe', cwd, model: 'mock', maxSteps: 3, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    // Let the runtime reach the parallel execute phase, then assert overlap.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(started.sort()).toEqual(['probe_a', 'probe_b']);
+    release();
+    const r = await task;
+    expect(r.status).toBe('complete');
+    expect(r.toolCalls).toBe(2);
+    // Transcript order matches call order despite concurrent execution.
+    const toolMsgs = r.transcript.filter((m) => m.role === 'tool');
+    expect(toolMsgs.length).toBe(2);
+    expect(JSON.stringify(toolMsgs[0])).toContain('probe_a');
+    expect(JSON.stringify(toolMsgs[1])).toContain('probe_b');
+  });
+
   it('feeds policy denial back as a tool_result', async () => {
     const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
     const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
