@@ -17,7 +17,7 @@ import { run } from '../agent/runtime.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, clonePolicyConfig, PolicyEngine } from '../policy/engine.js';
 import { buildLevel6Context } from '../context/level6.js';
-import { DenyAllApprovalPrompt, StdinApprovalPrompt } from '../policy/approval.js';
+import { DenyAllApprovalPrompt, PatternApprovalCache, StdinApprovalPrompt } from '../policy/approval.js';
 import { TuiApprovalBridge } from '../tui/approval.js';
 import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
@@ -82,6 +82,14 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // Clone: /mode and /sandbox mutate this config — it must never leak into
   // the shared DEFAULT_POLICY_CONFIG across sessions.
   const policy = new PolicyEngine(builtinRules(), clonePolicyConfig());
+  // Persisted permission rules (home + project settings layers) — "always"
+  // choices from previous sessions apply without re-prompting.
+  try {
+    const { loadPermissionRules } = await import('./config.js');
+    policy.applyRules(await loadPermissionRules(cwd));
+  } catch {
+    /* ignore — engine defaults stand */
+  }
   const providerKind = inferProviderFromBaseURL(baseUrl);
   // Local Ollama exposes OpenAI-compat but hostname could contain "anthropic"
   // via proxy — don't try anthropic adapter with empty key (would 401).
@@ -118,9 +126,29 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // App and the runtime so the modal can resolve the runtime's ask().
   const tuiBridge = new TuiApprovalBridge();
   const useTui = opts.forceTty || process.stdin.isTTY;
-  const approval = opts.nonInteractive
+  // Ask-once-per-pattern: session cache + optional persist. `a` records for
+  // the session, `A` additionally appends the pattern to settings and the
+  // live engine (matches the modal's [a] session / [A] always→settings).
+  const approvalBase: DenyAllApprovalPrompt | TuiApprovalBridge | StdinApprovalPrompt = opts.nonInteractive
     ? new DenyAllApprovalPrompt()
     : (useTui ? tuiBridge : new StdinApprovalPrompt());
+  const approval = opts.nonInteractive
+    ? approvalBase
+    : new PatternApprovalCache(approvalBase, {
+        onPersist: async (pattern) => {
+          const { persistAllowRule } = await import('./config.js');
+          const res = await persistAllowRule(pattern);
+          policy.addAllow(pattern);
+          queuedAppend({
+            id: `allow-${Date.now()}`,
+            kind: 'text',
+            text: res.added
+              ? `allowed always: ${pattern} (saved to ${res.path} — revoke by deleting the line)`
+              : `allowed always: ${pattern} (already in ${res.path})`,
+            role: 'assistant',
+          });
+        },
+      });
 
   let inflight: Promise<unknown> | null = null;
   let lastStatus: import('../tui/status.js').StatusSnapshot | null = null;

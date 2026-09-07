@@ -23,6 +23,7 @@ import type { ToolContext } from '../tools/types.js';
 import type { PolicyEngine } from '../policy/engine.js';
 import type { ApprovalPrompt } from '../policy/approval.js';
 import { redact } from '../policy/secret-redactor.js';
+import { patternForCall } from '../policy/patterns.js';
 import { RuntimeTelemetry, emptyTelemetryBlock, summarizeToolCall } from '../context/level7.js';
 import * as path from 'node:path';
 import { verify, diagnosticForModel, type VerifyResult } from '../verification/engine.js';
@@ -649,6 +650,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           toolName: call.name,
           reason: decision.reason,
           summary: summarizeToolCall(call),
+          input: call.input,
+          pattern: patternForCall(call.name, call.input),
         });
         // Approval UI in TUI handles y/a/A/n/e/? — e edits input, ? explains
         if (choice === 'deny') {

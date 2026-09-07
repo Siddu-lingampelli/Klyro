@@ -305,6 +305,45 @@ export async function loadMergedConfig(cwd = process.cwd(), flags: Record<string
   return merged;
 }
 
+export interface PermissionRules {
+  allow: string[];
+  deny: string[];
+  ask: string[];
+}
+
+function asStringArray(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((e): e is string => typeof e === 'string') : [];
+}
+
+/**
+ * Permission glob rules (`tool(glob)` grammar) from the merged config
+ * layers — home settings, project settings, project local. Fed into the
+ * policy engine at startup so persisted "always allow" patterns apply
+ * without re-prompting.
+ */
+export async function loadPermissionRules(cwd = process.cwd()): Promise<PermissionRules> {
+  const merged = await loadMergedConfig(cwd, {});
+  return {
+    allow: asStringArray(merged.allow),
+    deny: asStringArray(merged.deny),
+    ask: asStringArray(merged.ask),
+  };
+}
+
+/**
+ * Persist an "always allow" pattern to the home settings file
+ * (~/.klyro/settings.json, honors KLYRO_CONFIG). Returns whether it was
+ * added (false when already present) and the file written.
+ */
+export async function persistAllowRule(rule: string): Promise<{ added: boolean; path: string }> {
+  const cfg = await loadConfig();
+  const allow = asStringArray(cfg.allow);
+  if (allow.includes(rule)) return { added: false, path: getConfigPath() };
+  cfg.allow = [...allow, rule];
+  await saveConfig(cfg);
+  return { added: true, path: getConfigPath() };
+}
+
 export async function saveConfig(obj: Record<string, unknown>): Promise<void> {
   const p = getConfigPath();
   await fs.mkdir(path.dirname(p), { recursive: true });

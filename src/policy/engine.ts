@@ -163,6 +163,32 @@ export class PolicyEngine {
     // Precedence: deny → allow → ask
     return check(this.config.deny, 'deny') ?? check(this.config.allow, 'allow') ?? check(this.config.ask, 'ask') ?? null;
   }
+
+  /**
+   * Session rule management — appends a glob rule (`tool(glob)` grammar)
+   * if not already present. Used for persisted "always allow" patterns
+   * (loaded at startup) and live additions (approval `always→settings`).
+   */
+  addAllow(rule: string): void {
+    const list = (this.config.allow ??= []);
+    if (!list.includes(rule)) list.push(rule);
+  }
+
+  addDeny(rule: string): void {
+    const list = (this.config.deny ??= []);
+    if (!list.includes(rule)) list.push(rule);
+  }
+
+  addAsk(rule: string): void {
+    const list = (this.config.ask ??= []);
+    if (!list.includes(rule)) list.push(rule);
+  }
+
+  applyRules(rules: { allow?: string[]; deny?: string[]; ask?: string[] }): void {
+    for (const r of rules.allow ?? []) this.addAllow(r);
+    for (const r of rules.deny ?? []) this.addDeny(r);
+    for (const r of rules.ask ?? []) this.addAsk(r);
+  }
 }
 
 /** Builtin set of rules. Order matters: first match wins. */

@@ -121,6 +121,13 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   }
   const registry = builtinRegistry();
   const policy = new PolicyEngine(builtinRules(), clonePolicyConfig());
+  // Persisted "always allow" patterns apply to one-shot runs too.
+  try {
+    const { loadPermissionRules } = await import('./config.js');
+    policy.applyRules(await loadPermissionRules(opts.cwd));
+  } catch {
+    /* ignore — engine defaults stand */
+  }
   const systemPrompt = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt);
 
   // Level 9 — session setup (create or resume)

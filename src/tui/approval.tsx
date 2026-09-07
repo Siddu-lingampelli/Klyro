@@ -13,7 +13,7 @@
  *      a Promise.
  *   3. The App polls getPending() on every render to show a modal.
  *   4. The App's useInput handler sees a pending prompt and routes
- *      y/n/a to the resolver.
+ *      y/a/A/n to the resolver (A = always-persist to settings).
  *
  * Non-TTY mode (no Ink mounted) keeps using StdinApprovalPrompt; this
  * module is only used when the TUI is active.
@@ -89,7 +89,7 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
     const c = inputStr.toLowerCase();
     if (c === 'y') { bridge.resolve('allow'); return; }
     if (c === 'a') { bridge.resolve('always'); return; }
-    if (c === 'A') { bridge.resolve('always'); return; }
+    if (c === 'A') { bridge.resolve('always-persist'); return; }
     if (c === 'd' || c === 'n') { bridge.resolve('deny'); return; }
     if (c === 'e') {
       // Edit: for MVP, treat as deny with edit hint — model will be told to re-read and retry
