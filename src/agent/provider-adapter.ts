@@ -23,7 +23,7 @@ export type StreamEvent =
   | { kind: 'tool_call_start'; id: string; name: string }
   | { kind: 'tool_call_delta'; id: string; argsJson: string }
   | { kind: 'tool_call_end'; id: string }
-  | { kind: 'error'; code: string; message: string; retryable: boolean };
+  | { kind: 'error'; code: string; message: string; retryable: boolean; status?: string; retryAfterMs?: number };
 
 export interface ToolDefinition {
   name: string;
@@ -58,6 +58,22 @@ export interface HttpAdapterOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
+
+/**
+ * Parse a `Retry-After` response header value into milliseconds.
+ * Returns undefined when absent or unparseable. Handles both forms:
+ * delay-seconds ("120") and HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT",
+ * clamped at 0 when the date is in the past).
+ */
+export function parseRetryAfterMs(value: string | null | undefined): number | undefined {
+  if (value == null) return undefined;
+  const v = value.trim();
+  if (!v) return undefined;
+  if (/^\d+$/.test(v)) return Number(v) * 1000;
+  const t = Date.parse(v);
+  if (!Number.isNaN(t)) return Math.max(0, t - Date.now());
+  return undefined;
+}
 
 /** Convert a Zod schema to a permissive JSON Schema object for tool defs. */
 export function zodToJsonSchema(schema: z.ZodType<unknown>): Record<string, unknown> {
@@ -254,11 +270,15 @@ async function* streamChatCompletions(
     req.signal?.removeEventListener('abort', onAbort);
     const rawErr = await res.text().catch(() => '');
     const errText = redact(rawErr).slice(0, 500);
+    const retryable = res.status >= 500 || res.status === 429;
+    const retryAfterMs = retryable ? parseRetryAfterMs(res.headers?.get('retry-after')) : undefined;
     yield {
       kind: 'error',
       code: `HTTP_${res.status}`,
       message: `provider returned ${res.status}: ${errText}`,
-      retryable: res.status >= 500 || res.status === 429,
+      retryable,
+      status: String(res.status),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
     };
     return;
   }

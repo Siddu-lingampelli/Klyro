@@ -275,11 +275,14 @@ async function main(): Promise<void> {
     .option('--max-repairs <n>', 'Max autonomous repair attempts (default 3)', (v) => parsePositiveInt('--max-repairs', v))
     .option('--persist', 'Enable session persistence (Level 9, default: enabled)')
     .option('--require-verify', 'Fail with exit 8 if no verification passed after edits (6.5)')
+    .option('--agent <name>', 'Run under an orchestrator context enabling spawn_agent/task_list/task_get (explorer|implementer|tester|reviewer)')
+    .option('--max-depth <n>', 'Max spawn depth for child agents (default 1)', (v) => parsePositiveInt('--max-depth', v))
     .action(async (prompt: string, opts: {
       model?: string; maxSteps?: number; maxTokens?: number; temperature?: number;
       timeout?: number; baseUrl?: string; apiKey?: string;
       output?: string; dryRun?: boolean; provider?: string; resume?: string;
       resumeSession?: string; verify?: boolean; verifyCommand?: string; maxRepairs?: number; persist?: boolean; requireVerify?: boolean;
+      agent?: string; maxDepth?: number;
     }) => {
       const model = opts.model ?? process.env.KLYRO_MODEL;
       if (!model) {
@@ -313,6 +316,8 @@ async function main(): Promise<void> {
           maxRepairAttempts: opts.maxRepairs,
           persist: opts.persist,
           requireVerify: !!opts.requireVerify,
+          agent: opts.agent,
+          maxDepth: opts.maxDepth,
         });
         process.exit(code);
       } catch (err) {

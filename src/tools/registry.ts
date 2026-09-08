@@ -26,6 +26,9 @@ import { findSymbolTool } from './symbols/find-symbol.js';
 import { lspDiagnosticsTool, lspGotoDefinitionTool } from './lsp/diagnostics.js';
 import { expandResultTool } from './expand-result.js';
 import { memoryWriteTool } from './memory-write.js';
+import { spawnAgentTool } from './agent/spawn-agent.js';
+import { taskListTool } from './agent/task-list.js';
+import { taskGetTool } from './agent/task-get.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { zodToJsonSchema } from './schema.js';
 
@@ -117,5 +120,8 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(lspGotoDefinitionTool);
   r.register(expandResultTool);
   r.register(memoryWriteTool);
+  r.register(spawnAgentTool);
+  r.register(taskListTool);
+  r.register(taskGetTool);
   return r;
 };

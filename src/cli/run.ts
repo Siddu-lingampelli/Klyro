@@ -13,6 +13,8 @@ import * as readline from 'node:readline/promises';
 import { stdin as input, stdout, stderr } from 'node:process';
 import { httpChatAdapter } from '../agent/provider-adapter.js';
 import { anthropicAdapter } from '../agent/anthropic-adapter.js';
+import { retryingAdapter } from '../agent/retry.js';
+import { globalBus } from '../events/bus.js';
 import { run } from '../agent/runtime.js';
 import type { Message } from '../agent/message.js';
 import { builtinRegistry } from '../tools/registry.js';
@@ -75,6 +77,9 @@ export interface RunCliOptions {
   persist?: boolean;
   sessionId?: string;
   sessionsDir?: string;
+  /** P1.4 — run the task under a named child-capable orchestrator context. */
+  agent?: string;
+  maxDepth?: number;
 }
 
 function readEnv(name: string, fallback?: string): string | undefined {
@@ -83,6 +88,12 @@ function readEnv(name: string, fallback?: string): string | undefined {
 }
 
 export async function runOnce(opts: RunCliOptions): Promise<number> {
+  // P0.5 — load <cwd>/.env first so KLYRO_* vars resolve without `export`.
+  // Never throws (missing file is a no-op); explicit env wins (no-clobber).
+  try {
+    const { loadDotenv } = await import('./dotenv.js');
+    loadDotenv(opts.cwd);
+  } catch { /* ignore */ }
   const output = opts.output ?? 'human';
 
   if (opts.dryRun) {
@@ -95,6 +106,28 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     clearReadHistory();
   } catch { /* ignore */ }
 
+  // P1.4 — validate --agent early so typos fail fast (exit 2) even without API keys.
+  if (opts.agent) {
+    const { BUILTIN_AGENTS: _known } = await import('../agent/orchestrator.js');
+    if (!_known.some((a) => a.id === opts.agent)) {
+      stderr.write(`klyro: unknown agent: ${opts.agent} (known: ${_known.map((a) => a.id).join(', ')})\n`);
+      return 2;
+    }
+  }
+
+  // Box so retry telemetry (emitted before the session exists) picks up the
+  // real sessionId once create/resume assigns it below.
+  const sessionIdForRetry = { id: 'ephemeral' };
+  const onRetryEmit = (info: { attempt: number; status: string; retryAfterMs?: number }): void => {
+    globalBus.emit({
+      type: 'provider.retry',
+      ts: Date.now(),
+      sessionId: sessionIdForRetry.id,
+      attempt: info.attempt,
+      status: info.status,
+      ...(info.retryAfterMs !== undefined ? { retryAfterMs: info.retryAfterMs } : {}),
+    });
+  };
   let adapter = opts.adapter;
   if (!adapter) {
     const provider = opts.provider ?? 'openai';
@@ -105,18 +138,18 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       return 2;
     }
     if (provider === 'anthropic') {
-      adapter = anthropicAdapter({
+      adapter = retryingAdapter(anthropicAdapter({
         baseURL: baseUrl,
         apiKey,
         timeoutMs: opts.timeoutMs ?? 60_000,
         authHeader: opts.authHeader,
-      });
+      }), { onRetry: onRetryEmit });
     } else {
       if (!baseUrl) {
         stderr.write('klyro: KLYRO_BASE_URL is not set (or pass --base-url)\n');
         return 2;
       }
-      adapter = httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: opts.timeoutMs ?? 60_000 });
+      adapter = retryingAdapter(httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: opts.timeoutMs ?? 60_000 }), { onRetry: onRetryEmit });
     }
   }
   const registry = builtinRegistry();
@@ -128,6 +161,21 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   } catch {
     /* ignore — engine defaults stand */
   }
+  // Best-effort MCP tools: never fatal, never prompts. src/mcp/registry.ts
+  // lands from a sibling agent — the lazy import keeps runtime + builds green
+  // until then (import failure is caught below). @ts-ignore is used instead
+  // of @ts-expect-error so it stays inert after the sibling file lands.
+  let closeMcp: (() => Promise<void>) | undefined;
+  try {
+    // @ts-ignore — sibling-owned module may not exist yet
+    const { loadAndRegisterMcp } = await import('../mcp/registry.js');
+    const mcp = await loadAndRegisterMcp({ cwd: opts.cwd, registry, policy });
+    for (const e of mcp.errors) stderr.write(`klyro: mcp ${e.server}: ${e.message}\n`);
+    if (mcp.registered.length > 0 && output === 'human') {
+      stderr.write(`klyro: mcp tools: ${mcp.registered.join(', ')}\n`);
+    }
+    closeMcp = mcp.closeAll;
+  } catch { /* ignore — MCP is optional */ }
   const systemPrompt = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt);
 
   // Level 9 — session setup (create or resume)
@@ -168,6 +216,9 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   } else if (opts.resumePath) {
     initialTranscript = loadTranscript(opts.resumePath);
   }
+  // Publish the real sessionId to retry telemetry (stays 'ephemeral' when
+  // persistence is disabled or the session was never created).
+  sessionIdForRetry.id = sessionId ?? 'ephemeral';
 
   const ac = new AbortController();
   const onSigint = (): void => {
@@ -192,6 +243,48 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       };
 
   let result: Awaited<ReturnType<typeof run>>;
+  // P1.4 — if --agent is requested, stand up a parent orchestrator so the
+  // model can call spawn_agent / task_list / task_get. The root run keeps
+  // depth 0; children are capped at maxDepth (default 1 per r-6-10.fix.md).
+  let agentBridge: import('../agent/orchestrator.js').AgentSpawnBridge | undefined;
+  let parentContext: import('../agent/runtime.js').RunOptions['parentContext'];
+  if (opts.agent) {
+    const { AgentOrchestrator, BUILTIN_AGENTS } = await import('../agent/orchestrator.js');
+    const def = BUILTIN_AGENTS.find((a) => a.id === opts.agent)!; // validated above
+    const maxDepth = opts.maxDepth ?? 1;
+    const rootDeps = { adapter, registry, policy, approval: new DenyAllApprovalPrompt(), systemPrompt };
+    const orchestrator = new AgentOrchestrator({ sessionId: sessionId ?? 'ephemeral', deps: rootDeps });
+    const allowedTools = new Set(registry.list().map((t) => t.name));
+    parentContext = {
+      sessionId: sessionId ?? 'ephemeral',
+      depth: 0,
+      maxDepth,
+      allowedTools,
+      model: def.model ?? opts.model,
+    };
+    agentBridge = orchestrator.bridgeFor({
+      sessionId: sessionId ?? 'ephemeral',
+      cwd: opts.cwd,
+      depth: 0,
+      maxDepth,
+      allowedTools,
+      model: def.model ?? opts.model,
+    });
+  } else if (opts.maxDepth !== undefined) {
+    const allowedTools = new Set(registry.list().map((t) => t.name));
+    const { AgentOrchestrator } = await import('../agent/orchestrator.js');
+    const rootDeps = { adapter, registry, policy, approval: new DenyAllApprovalPrompt(), systemPrompt };
+    const orchestrator = new AgentOrchestrator({ sessionId: sessionId ?? 'ephemeral', deps: rootDeps });
+    parentContext = { sessionId: sessionId ?? 'ephemeral', depth: 0, maxDepth: opts.maxDepth, allowedTools, model: opts.model };
+    agentBridge = orchestrator.bridgeFor({
+      sessionId: sessionId ?? 'ephemeral',
+      cwd: opts.cwd,
+      depth: 0,
+      maxDepth: opts.maxDepth,
+      allowedTools,
+      model: opts.model,
+    });
+  }
   try {
     result = await run(
     {
@@ -206,6 +299,8 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       initialTranscript,
       verify: verifyOpts,
       persist: store && sessionId ? { store, sessionId } : undefined,
+      ...(agentBridge ? { agentBridge } : {}),
+      ...(parentContext ? { parentContext } : {}),
       onEvent: (ev) => {
         if (output === 'json') {
           stdout.write(JSON.stringify(ev) + '\n');
@@ -244,6 +339,7 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     );
   } finally {
     doneSigint();
+    try { await closeMcp?.(); } catch { /* ignore */ }
   }
 
   if (store && sessionId) {
@@ -356,9 +452,21 @@ export async function makeRunSystemPrompt(
   const prefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
   let klyroBlock = '';
   try {
-    const { loadKlyroMd } = await import('../context/klyro-md.js');
-    const md = await loadKlyroMd(cwd);
-    if (md) klyroBlock = `\n\n<KLYRO.md>\n${md.slice(0, 4000)}\n</KLYRO.md>`;
+    // P0.3 trust gate: unapproved context files are excluded in headless
+    // mode (secure default-deny) and each exclusion is bus-visible.
+    const { loadKlyroMdFiles } = await import('../context/klyro-md.js');
+    const { ContextTrust } = await import('../context/trust.js');
+    const { globalBus } = await import('../events/bus.js');
+    const files = await loadKlyroMdFiles(cwd);
+    const { trusted, untrusted } = new ContextTrust().check(files);
+    for (const { file, reason } of untrusted) {
+      globalBus.emit({ type: 'context.trust_prompt', ts: Date.now(), sessionId: 'ephemeral', path: file.path, reason, trusted: false });
+    }
+    if (untrusted.length > 0) {
+      stderr.write(`klyro: trust gate excluded ${untrusted.length} unapproved context file(s): ${untrusted.map((u) => u.file.path).join(', ')}\n`);
+    }
+    const kept = trusted.map((f) => `# ${f.path}\n${f.content}`).join('\n\n---\n\n');
+    if (kept) klyroBlock = `\n\n<KLYRO.md>\n${kept.slice(0, 4000)}\n</KLYRO.md>`;
   } catch { /* ignore */ }
   return (ctx) => {
     const t = ctx.telemetry ? '\n\n' + ctx.telemetry : '';

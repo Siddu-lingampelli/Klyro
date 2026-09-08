@@ -13,6 +13,8 @@ import { render } from 'ink';
 import { App } from '../tui/app.js';
 import { httpChatAdapter } from '../agent/provider-adapter.js';
 import { anthropicAdapter } from '../agent/anthropic-adapter.js';
+import { retryingAdapter } from '../agent/retry.js';
+import { globalBus } from '../events/bus.js';
 import { run } from '../agent/runtime.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, clonePolicyConfig, PolicyEngine } from '../policy/engine.js';
@@ -40,6 +42,12 @@ export interface ReplOptions {
 }
 
 export async function startRepl(opts: ReplOptions = {}): Promise<number> {
+  // P0.5 — load <cwd>/.env first so provider resolution below sees KLYRO_*
+  // vars without `export`. Never throws; explicit env wins (no-clobber).
+  try {
+    const { loadDotenv } = await import('./dotenv.js');
+    loadDotenv(opts.cwd ?? process.cwd());
+  } catch { /* ignore */ }
   // Reuse the same provider resolution as legacy repl.ts — probes local
   // Ollama / LM Studio / vLLM when env is not fully set, so bare `klyro`
   // works with a local model just like `klyro chat` does.
@@ -90,6 +98,19 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   } catch {
     /* ignore — engine defaults stand */
   }
+  // Best-effort MCP tools: never fatal, never prompts. src/mcp/registry.ts
+  // lands from a sibling agent — the lazy import keeps runtime + builds green
+  // until then (import failure is caught below). Servers live for the process
+  // lifetime, so no close wiring here (unlike runOnce's finally).
+  try {
+    // @ts-ignore — sibling-owned module may not exist yet
+    const { loadAndRegisterMcp } = await import('../mcp/registry.js');
+    const mcp = await loadAndRegisterMcp({ cwd, registry, policy });
+    for (const e of mcp.errors) process.stderr.write(`klyro: mcp ${e.server}: ${e.message}\n`);
+    if (mcp.registered.length > 0) {
+      process.stderr.write(`klyro: mcp tools: ${mcp.registered.join(', ')}\n`);
+    }
+  } catch { /* ignore — MCP is optional */ }
   const providerKind = inferProviderFromBaseURL(baseUrl);
   // Local Ollama exposes OpenAI-compat but hostname could contain "anthropic"
   // via proxy — don't try anthropic adapter with empty key (would 401).
@@ -102,10 +123,28 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   let currentApiKey = apiKey;
   let currentMaxSteps = opts.maxSteps ?? 30;
   let effortLevel = 'medium';
+  // Retry wrapper lives inside the factory so the initial construction AND
+  // the /provider switch + /reload rebuilds (which re-call buildAdapter)
+  // all stay wrapped. REPL has no session id at adapter scope, so retry
+  // telemetry uses 'ephemeral'.
   const buildAdapter = (prov: 'openai' | 'anthropic', url: string, key: string) =>
-    prov === 'anthropic'
-      ? anthropicAdapter({ baseURL: url, apiKey: key, timeoutMs: 60_000 })
-      : httpChatAdapter({ baseURL: url, apiKey: key, timeoutMs: 60_000 });
+    retryingAdapter(
+      prov === 'anthropic'
+        ? anthropicAdapter({ baseURL: url, apiKey: key, timeoutMs: 60_000 })
+        : httpChatAdapter({ baseURL: url, apiKey: key, timeoutMs: 60_000 }),
+      {
+        onRetry: (info) => {
+          globalBus.emit({
+            type: 'provider.retry',
+            ts: Date.now(),
+            sessionId: 'ephemeral',
+            attempt: info.attempt,
+            status: info.status,
+            ...(info.retryAfterMs !== undefined ? { retryAfterMs: info.retryAfterMs } : {}),
+          });
+        },
+      },
+    );
   let adapter = buildAdapter(currentProvider, currentBaseUrl, currentApiKey);
   const ctxBlock = await buildLevel6Context({ cwd });
   let ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';

@@ -103,6 +103,26 @@ export interface RunOptions {
     store?: import('../persistence/store.js').SessionStore;
     sessionId?: string;
   };
+  /**
+   * Orchestration context (P0). Present for any agent that is itself managed
+   * by an AgentOrchestrator — so a child knows who its parent is, how deep the
+   * call stack is, which tools it may use, and which task/session it belongs to.
+   */
+  parentContext?: {
+    taskId?: string;
+    parentTaskId?: string;
+    sessionId: string;
+    depth: number;
+    maxDepth: number;
+    allowedTools?: ReadonlySet<string>;
+    model?: string;
+  };
+  /**
+   * Delegation bridge (P0). Present on the root run so the model can call
+   * spawn_agent / task_list / task_get. The tool layer reads it from the
+   * ToolContext.
+   */
+  agentBridge?: import('./orchestrator.js').AgentSpawnBridge;
 }
 
 /** A single plan step emitted by the agent. */
@@ -348,7 +368,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       if (c.dropped > 0) emitKlyro({ type: 'context.compacted', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', dropped: c.dropped } as unknown as import('../events/catalog.js').KlyroEvent);
     }
     const req = {
-      model: opts.model,
+      model: opts.parentContext?.model ?? opts.model,
       system: reqSystem,
       messages: reqMessages,
       tools: toolDefinitions(deps.registry),
@@ -659,6 +679,14 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       signal: opts.signal,
       nonInteractive: opts.nonInteractive,
       sessionId,
+      ...(opts.agentBridge ? { agentBridge: opts.agentBridge } : {}),
+      ...(opts.parentContext?.taskId
+        ? { parentTaskId: opts.parentContext.parentTaskId ?? opts.parentContext.taskId }
+        : {}),
+      agentDepth: opts.parentContext?.depth ?? 0,
+      agentMaxDepth: opts.parentContext?.maxDepth ?? 1,
+      ...(opts.parentContext?.allowedTools ? { agentAllowedTools: opts.parentContext.allowedTools } : {}),
+      ...(opts.parentContext?.model ?? opts.model ? { agentModel: opts.parentContext?.model ?? opts.model } : {}),
     };
     const allSafe = finalizedCalls.length > 1 && finalizedCalls.every((c) => deps.registry.get(c.name)?.isConcurrencySafe !== false);
     // Gate phase: policy decision + approval prompt for one call. Runs

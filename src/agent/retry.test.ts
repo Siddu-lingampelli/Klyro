@@ -154,4 +154,112 @@ describe('retryingAdapter', () => {
     await sleepAbortable(1, async () => { called = true; });
     expect(called).toBe(true);
   });
+
+  it('onRetry fires with attempt 1 then 2 and consumer never sees buffered errors', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'HTTP_429', message: 'slow down', retryable: true, status: '429' } as StreamEvent],
+      [{ kind: 'error', code: 'HTTP_503', message: 'flaky', retryable: true } as StreamEvent],
+      [
+        { kind: 'message_start' } as StreamEvent,
+        { kind: 'text_delta', text: 'ok' } as StreamEvent,
+        { kind: 'message_end', finishReason: 'stop' } as StreamEvent,
+      ],
+    ]);
+    const onRetry = vi.fn();
+    const out = retryingAdapter(inner, { sleep: async () => {}, onRetry });
+    const events: StreamEvent[] = [];
+    for await (const ev of out.stream({} as CallRequest)) events.push(ev);
+    expect(events.map((e) => e.kind)).toEqual(['message_start', 'text_delta', 'message_end']);
+    expect(inner.calls).toBe(3);
+    expect(onRetry).toHaveBeenCalledTimes(2);
+    expect(onRetry).toHaveBeenNthCalledWith(1, { attempt: 1, status: '429' });
+    expect(onRetry).toHaveBeenNthCalledWith(2, { attempt: 2, status: 'HTTP_503' });
+  });
+
+  it('fatal error yields immediately with no onRetry', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'BAD_REQUEST', message: 'no', retryable: false } as StreamEvent],
+    ]);
+    const onRetry = vi.fn();
+    const out = retryingAdapter(inner, { sleep: async () => {}, onRetry });
+    const events: StreamEvent[] = [];
+    for await (const ev of out.stream({} as CallRequest)) events.push(ev);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.kind).toBe('error');
+    expect(inner.calls).toBe(1);
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it('does not call onRetry for the terminal failure', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'NETWORK', message: 'a', retryable: true } as StreamEvent],
+      [{ kind: 'error', code: 'NETWORK', message: 'b', retryable: true } as StreamEvent],
+      [{ kind: 'error', code: 'NETWORK', message: 'c', retryable: true } as StreamEvent],
+    ]);
+    const onRetry = vi.fn();
+    const out = retryingAdapter(inner, { maxAttempts: 3, sleep: async () => {}, onRetry });
+    const events: StreamEvent[] = [];
+    for await (const ev of out.stream({} as CallRequest)) events.push(ev);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.kind).toBe('error');
+    expect(inner.calls).toBe(3);
+    expect(onRetry).toHaveBeenCalledTimes(2);
+    expect(onRetry).toHaveBeenNthCalledWith(1, { attempt: 1, status: 'NETWORK' });
+    expect(onRetry).toHaveBeenNthCalledWith(2, { attempt: 2, status: 'NETWORK' });
+  });
+
+  it("falls back to 'retryable' when status and code are absent", async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: '', message: 'x', retryable: true } as unknown as StreamEvent],
+      [{ kind: 'message_end', finishReason: 'stop' } as StreamEvent],
+    ]);
+    const onRetry = vi.fn();
+    const out = retryingAdapter(inner, { sleep: async () => {}, onRetry });
+    const events: StreamEvent[] = [];
+    for await (const ev of out.stream({} as CallRequest)) events.push(ev);
+    expect(events.map((e) => e.kind)).toEqual(['message_end']);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith({ attempt: 1, status: 'retryable' });
+  });
+
+  it('abort during backoff stops further attempts', async () => {
+    const ac = new AbortController();
+    const inner = scripted([
+      [{ kind: 'error', code: 'HTTP_503', message: 'flaky', retryable: true, retryAfterMs: 5000 } as StreamEvent],
+      [
+        { kind: 'message_start' } as StreamEvent,
+        { kind: 'message_end', finishReason: 'stop' } as StreamEvent,
+      ],
+    ]);
+    const onRetry = vi.fn();
+    const sleeps: number[] = [];
+    const sleep = async (ms: number): Promise<void> => {
+      sleeps.push(ms);
+      ac.abort();
+    };
+    const out = retryingAdapter(inner, { sleep, onRetry });
+    const events: StreamEvent[] = [];
+    for await (const ev of out.stream({ signal: ac.signal } as CallRequest)) events.push(ev);
+    expect(events).toHaveLength(0);
+    expect(inner.calls).toBe(1);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(sleeps).toEqual([5000]);
+  });
+
+  it('honors retryAfterMs from the error event as the backoff delay', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'HTTP_429', message: 'slow', retryable: true, status: '429', retryAfterMs: 2500 } as StreamEvent],
+      [{ kind: 'message_end', finishReason: 'stop' } as StreamEvent],
+    ]);
+    const onRetry = vi.fn();
+    const sleeps: number[] = [];
+    const out = retryingAdapter(inner, { sleep: async (ms: number) => { sleeps.push(ms); }, onRetry });
+    const events: StreamEvent[] = [];
+    for await (const ev of out.stream({} as CallRequest)) events.push(ev);
+    expect(events.map((e) => e.kind)).toEqual(['message_end']);
+    expect(inner.calls).toBe(2);
+    expect(sleeps).toEqual([2500]);
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith({ attempt: 1, status: '429', retryAfterMs: 2500 });
+  });
 });

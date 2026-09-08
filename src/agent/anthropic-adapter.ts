@@ -19,6 +19,7 @@
 import type { Message } from './message.js';
 import type { CallRequest, ProviderAdapter, StreamEvent, ToolDefinition } from './provider-adapter.js';
 import { assertSafeBaseURL } from '../chat.js';
+import { parseRetryAfterMs } from './provider-adapter.js';
 
 export interface AnthropicAdapterOptions {
   baseURL?: string;
@@ -154,11 +155,15 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
 
   if (!resp.ok || !resp.body) {
     const text = await resp.text().catch(() => '<unreadable>');
+    const retryable = resp.status >= 500 || resp.status === 429;
+    const retryAfterMs = retryable ? parseRetryAfterMs(resp.headers?.get('retry-after')) : undefined;
     yield {
       kind: 'error',
       code: `http_${resp.status}`,
       message: `Anthropic API returned ${resp.status}: ${text.slice(0, 500)}`,
-      retryable: resp.status >= 500 || resp.status === 429,
+      retryable,
+      status: String(resp.status),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
     };
     return;
   }

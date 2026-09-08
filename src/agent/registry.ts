@@ -196,6 +196,7 @@ export function buildProviderFromCli(args: {
   baseUrl?: string;
   apiKey?: string;
   timeoutMs?: number;
+  retry?: Partial<RetryOptions> | false;
 }): ProviderAdapter {
   const raw = args.provider?.toLowerCase().trim();
   const normalized = raw ? normalizeProviderName(raw) ?? (raw ? 'openai' as ProviderName : undefined) : undefined;
@@ -210,5 +211,6 @@ export function buildProviderFromCli(args: {
     baseURL: args.baseUrl,
     apiKey: args.apiKey,
     timeoutMs: args.timeoutMs,
+    ...(args.retry !== undefined ? { retry: args.retry } : {}),
   });
 }

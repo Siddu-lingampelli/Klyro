@@ -1,13 +1,13 @@
 /**
- * In-process worker spawner (MVP).
+ * In-process worker spawner.
  *
- * Per `docs/plan-fix.md` Step 2: workers run in-process for the MVP.
- * Real subprocess / child-process spawning belongs to a later level
- * (Level 7: sandboxed execution, Level 19: distributed workers).
+ * A "worker" here is just an async task tied to an AbortController. The
+ * spawner keeps the controllers so workers can actually be cancelled
+ * (user Ctrl+C, /abort, session shutdown, or a parent signalling a child).
  *
- * A "worker" here is just an async task with an AbortController. The
- * spawner keeps a registry so they can be cancelled together (e.g. on
- * user Ctrl+C, /abort, or session shutdown).
+ * Real subprocess / child-process spawning belongs to a later level;
+ * this module is the single-process cancellation primitive the agent
+ * orchestration layer builds on.
  */
 
 export interface WorkerHandle {
@@ -15,8 +15,10 @@ export interface WorkerHandle {
   readonly id: number;
   /** Human-readable label, used in logs. */
   readonly label: string;
-  /** AbortController tied to this worker's lifetime. */
+  /** AbortSignal delivered to the factory so it can observe cancellation. */
   readonly signal: AbortSignal;
+  /** The controller backing `signal` — retained so we can actually abort. */
+  readonly controller: AbortController;
   /** Resolves when the worker's main promise settles. */
   readonly done: Promise<void>;
 }
@@ -32,8 +34,9 @@ export class WorkerSpawner {
   private readonly handles = new Set<WorkerHandle>();
 
   /**
-   * Spawn a worker. The factory returns a promise; the spawner wires it
-   * up to an AbortController and tracks it.
+   * Spawn a worker. The factory receives an AbortSignal; when the worker is
+   * cancelled (via `cancel`, `cancelAll`, or the parent signal wiring) that
+   * signal fires and `done` settles.
    */
   spawn(factory: (signal: AbortSignal) => Promise<void>, opts: SpawnOptions = {}): WorkerHandle {
     const id = this.nextId++;
@@ -52,18 +55,18 @@ export class WorkerSpawner {
       id,
       label,
       signal: ac.signal,
+      controller: ac,
       done,
     };
     this.handles.add(handle);
 
     if (!autoStart) {
-      // Caller will invoke factory manually and pass the signal — for now
-      // we just resolve immediately so .done doesn't hang.
+      // Caller will invoke the factory manually and pass the signal.
       resolveDone();
       return handle;
     }
 
-    // Fire-and-forget; user awaits handle.done.
+    // Fire-and-forget; the caller awaits handle.done.
     factory(ac.signal).then(
       () => {
         this.handles.delete(handle);
@@ -78,19 +81,24 @@ export class WorkerSpawner {
     return handle;
   }
 
-  /** Abort every active worker. Their factories should observe signal. */
-  cancelAll(reason = 'cancelled'): void {
+  /** Cancel a single worker: fires its AbortSignal. */
+  cancel(handle: WorkerHandle, reason?: unknown): void {
+    try {
+      handle.controller.abort(reason);
+    } catch {
+      /* already aborted */
+    }
+  }
+
+  /** Cancel every active worker by firing their AbortSignals. */
+  cancelAll(reason?: unknown): void {
     for (const h of [...this.handles]) {
       try {
-        (h.signal as AbortSignal & { reason?: unknown }).reason = reason;
+        h.controller.abort(reason);
       } catch {
-        // AbortSignal.reason is read-only in some envs — fine.
+        /* already aborted */
       }
     }
-    // Real abort uses the controller stored on the handle's signal — we
-    // don't keep the controller here. In the MVP, callers can pass their
-    // own AbortController via factory; this method is a no-op stub for
-    // the contract. See `cancel(handle)` for the per-worker variant.
   }
 
   /** Count of currently-active workers. */

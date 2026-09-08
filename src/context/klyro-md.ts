@@ -18,6 +18,33 @@ function cap(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + `\n... [truncated ${s.length - n} chars]` : s;
 }
 
+export interface KlyroMdFile {
+  path: string;
+  content: string;
+}
+
+/** Per-file loader (used by the trust gate to approve/hash individual files). */
+export async function loadKlyroMdFiles(cwd: string): Promise<KlyroMdFile[]> {
+  const files: KlyroMdFile[] = [];
+  const home = os.homedir();
+  if (home) {
+    for (const p of [path.join(home, '.klyro', 'KLYRO.md'), path.join(home, '.klyro', 'KLYRO.local.md')]) {
+      try {
+        const t = await fs.readFile(p, 'utf-8');
+        files.push({ path: p, content: cap(t, MAX_FILE_CHARS) });
+      } catch { /* ignore */ }
+    }
+  }
+  for (const name of ['KLYRO.md', 'KLYRO.local.md', 'AGENTS.md', '.cursorrules']) {
+    const p = path.join(cwd, name);
+    try {
+      const t = await fs.readFile(p, 'utf-8');
+      files.push({ path: p, content: cap(await resolveImports(t, path.dirname(p), cwd), MAX_FILE_CHARS) });
+    } catch { /* ignore */ }
+  }
+  return files;
+}
+
 export async function loadKlyroMd(cwd: string): Promise<string> {
   const parts: string[] = [];
   let total = 0;
@@ -28,23 +55,8 @@ export async function loadKlyroMd(cwd: string): Promise<string> {
     parts.push(chunk);
     total += chunk.length;
   };
-  // Global
-  const home = os.homedir();
-  if (home) {
-    for (const p of [path.join(home, '.klyro', 'KLYRO.md'), path.join(home, '.klyro', 'KLYRO.local.md')]) {
-      try {
-        const t = await fs.readFile(p, 'utf-8');
-        push(`# ${p}\n${cap(t, MAX_FILE_CHARS)}`);
-      } catch { /* ignore */ }
-    }
-  }
-  // Root (imports resolved relative to each file, contained to cwd)
-  for (const name of ['KLYRO.md', 'KLYRO.local.md', 'AGENTS.md', '.cursorrules']) {
-    const p = path.join(cwd, name);
-    try {
-      const t = await fs.readFile(p, 'utf-8');
-      push(`# ${p}\n${cap(await resolveImports(t, path.dirname(p), cwd), MAX_FILE_CHARS)}`);
-    } catch { /* ignore */ }
+  for (const f of await loadKlyroMdFiles(cwd)) {
+    push(`# ${f.path}\n${f.content}`);
   }
   return parts.join('\n\n---\n\n');
 }

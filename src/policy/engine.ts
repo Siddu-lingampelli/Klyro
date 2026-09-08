@@ -206,8 +206,9 @@ function asString(v: unknown): string {
 }
 
 function matchesGlobRule(call: ToolCallLike, rule: string): boolean {
-  // Rule grammar: tool or tool(glob). e.g. "write_file", "write_file(.env)", "shell_exec(npm *)"
-  const m = /^([a-z_]+)(?:\((.*)\))?$/.exec(rule.trim());
+  // Rule grammar: tool or tool(glob). e.g. "write_file", "write_file(.env)", "shell_exec(npm *)".
+  // Digits are allowed so generated names (e.g. mcp__server__tool2) can be targeted.
+  const m = /^([a-z0-9_]+)(?:\((.*)\))?$/.exec(rule.trim());
   if (!m) return false;
   const tool = m[1]!;
   const glob = m[2];

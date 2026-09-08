@@ -30,9 +30,16 @@ export interface RetryOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Test hook: called once per attempt with 0-indexed attempt number. */
   onAttempt?: (attempt: number) => void;
+  /**
+   * Retry telemetry hook (operator-visible; the model stays blind).
+   * Called each time a retryable error is buffered and another attempt
+   * will follow (NOT on the terminal failure). `attempt` is the
+   * 1-indexed retry number (1 = first retry after the initial failure).
+   */
+  onRetry?: (info: { attempt: number; status: string; retryAfterMs?: number }) => void;
 }
 
-export const DEFAULT_RETRY: Required<Omit<RetryOptions, 'signal' | 'onAttempt'>> = {
+export const DEFAULT_RETRY: Required<Omit<RetryOptions, 'signal' | 'onAttempt' | 'onRetry'>> = {
   maxAttempts: 3,
   baseMs: 500,
   maxMs: 8_000,
@@ -154,7 +161,27 @@ export function retryingAdapter(inner: ProviderAdapter, opts: Partial<RetryOptio
           if (lastError) yield lastError;
           return;
         }
-        const delay = computeBackoff(attempt, cfg.baseMs, cfg.maxMs);
+        // Telemetry for the operator: a retryable error was buffered and
+        // another attempt will follow. The consumer stream never sees the
+        // buffered error, so the model stays blind.
+        const errRec = lastError as unknown as Record<string, unknown>;
+        const statusRaw = errRec?.['status'];
+        const codeRaw = errRec?.['code'];
+        const status =
+          typeof statusRaw === 'string' && statusRaw.length > 0
+            ? statusRaw
+            : typeof codeRaw === 'string' && codeRaw.length > 0
+              ? codeRaw
+              : 'retryable';
+        const retryAfterRaw = errRec?.['retryAfterMs'];
+        const retryAfterMs =
+          typeof retryAfterRaw === 'number' && Number.isFinite(retryAfterRaw) && retryAfterRaw >= 0
+            ? retryAfterRaw
+            : undefined;
+        opts.onRetry?.({ attempt: attempt + 1, status, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) });
+        // Honor a server-provided Retry-After delay when present; otherwise
+        // fall back to exponential backoff with jitter.
+        const delay = retryAfterMs ?? computeBackoff(attempt, cfg.baseMs, cfg.maxMs);
         // Abort-aware backoff: Ctrl+C during the sleep must stop promptly
         // instead of stalling up to maxMs before noticing.
         if (delay > 0) await sleepAbortable(delay, sleep, effectiveSignal);

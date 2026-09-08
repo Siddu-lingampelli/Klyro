@@ -36,6 +36,18 @@ export interface ToolContext {
   logger?: { debug: (msg: string, data?: unknown) => void; info: (msg: string, data?: unknown) => void };
   /** Emit KlyroEvent */
   emit?: (ev: import('../events/catalog.js').KlyroEvent) => void;
+  /** Delegation bridge (set when an orchestrator is active). Powers spawn_agent/task_* tools. */
+  agentBridge?: import('../agent/orchestrator.js').AgentSpawnBridge;
+  /** The task id this agent belongs to, when running under an orchestrator. */
+  parentTaskId?: string;
+  /** Depth of the current agent in the spawn tree (0 = root). Used to build ParentContextRef for spawn_agent. */
+  agentDepth?: number;
+  /** Max allowed spawn depth for this branch. */
+  agentMaxDepth?: number;
+  /** Effective tool allow-set of the current agent (null = all). Child can never exceed this. */
+  agentAllowedTools?: ReadonlySet<string> | null;
+  /** Model override active for the current agent. */
+  agentModel?: string;
 }
 
 /**
