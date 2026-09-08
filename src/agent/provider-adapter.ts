@@ -356,13 +356,16 @@ async function* streamChatCompletions(
               }
               if (tc.id) b.id = tc.id;
               if (tc.function?.name) b.name = tc.function.name;
-              if (tc.function?.arguments) b.argsJson += tc.function.arguments;
+              const newArgs = tc.function?.arguments;
+              if (newArgs) b.argsJson += newArgs;
               if (b.id && b.name && !b.started) {
+                // Identity arrived (possibly after earlier fragments). Emit
+                // start, then flush any accumulated args as one delta.
                 b.started = true;
                 yield { kind: 'tool_call_start', id: b.id, name: b.name };
                 if (b.argsJson) yield { kind: 'tool_call_delta', id: b.id, argsJson: b.argsJson };
-              } else if (b.started && b.id && tc.function?.arguments) {
-                yield { kind: 'tool_call_delta', id: b.id, argsJson: tc.function.arguments };
+              } else if (b.started && b.id && newArgs) {
+                yield { kind: 'tool_call_delta', id: b.id, argsJson: newArgs };
               }
             }
             if (choice.finish_reason) {
