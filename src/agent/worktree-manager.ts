@@ -179,8 +179,11 @@ export async function pruneStaleWorktrees(repoCwd: string, activeTaskIds: readon
     const r = await git(repoCwd, ['worktree', 'list', '--porcelain']);
     const active = new Set(activeTaskIds);
     for (const line of r.stdout.split('\n')) {
-      const wp = /^worktree (.+)$/.exec(line.trim())?.[1];
-      if (!wp) continue;
+      const raw = /^worktree (.+)$/.exec(line.trim())?.[1];
+      if (!raw) continue;
+      // git prints forward slashes even on win32 — normalize so returned
+      // paths textually match the path.join-built worktreePath.
+      const wp = path.normalize(raw);
       // Only manage our own namespace: <repo>/.klyro/worktrees/<taskId>.
       const parts = wp.split(/[\\/]/);
       const idx = parts.lastIndexOf('worktrees');
