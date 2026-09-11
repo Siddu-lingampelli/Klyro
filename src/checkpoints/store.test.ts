@@ -65,4 +65,46 @@ describe('checkpoints', () => {
     const ckpts = await listCheckpoints(tmp);
     expect(ckpts).not.toContain('last.diff');
   });
+
+  it('snapshot content survives on disk (fsync path)', async () => {
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'durable-content', 'utf-8');
+    const id = await snapshot(tmp, ['a.txt']);
+    const snap = await fs.readFile(path.join(tmp, '.klyro', 'checkpoints', id, 'a.txt'), 'utf-8');
+    expect(snap).toBe('durable-content');
+    const meta = JSON.parse(
+      await fs.readFile(path.join(tmp, '.klyro', 'checkpoints', id, '.meta.json'), 'utf-8'),
+    ) as { files: string[] };
+    expect(meta.files).toContain('a.txt');
+  });
+
+  it('writes a per-checkpoint <id>.diff file when git produces a diff, else skips', async () => {
+    const git = async (args: string[]): Promise<string> => {
+      const { spawn } = await import('node:child_process');
+      return new Promise((resolve, reject) => {
+        const child = spawn('git', args, { cwd: tmp, shell: false, windowsHide: true });
+        let out = '';
+        let err = '';
+        child.stdout.on('data', (b: Buffer) => { out += b.toString(); });
+        child.stderr.on('data', (b: Buffer) => { err += b.toString(); });
+        child.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(err || `git exit ${code}`))));
+        child.on('error', reject);
+      });
+    };
+    try {
+      await git(['init']);
+      await git(['config', 'user.email', 't@t.t']);
+      await git(['config', 'user.name', 't']);
+      await fs.writeFile(path.join(tmp, 'a.txt'), 'v1', 'utf-8');
+      await git(['add', 'a.txt']);
+      await git(['commit', '-m', 'init']);
+      await fs.writeFile(path.join(tmp, 'a.txt'), 'v2', 'utf-8');
+    } catch {
+      return; // git unavailable — skip
+    }
+    const id = await snapshot(tmp, ['a.txt']);
+    const diffPath = path.join(tmp, '.klyro', 'checkpoints', `${id}.diff`);
+    await expect(fs.stat(diffPath)).resolves.toBeDefined();
+    // diff artifacts are never undo targets
+    expect(await listCheckpoints(tmp)).not.toContain(`${id}.diff`);
+  });
 });

@@ -29,11 +29,51 @@ const SUPPORTED_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.
 
 const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.klyro', 'coverage', 'out']);
 
+interface RepoMapCacheEntry {
+  cwd: string;
+  maxFiles: number;
+  maxFileBytes: number;
+  files: RepoFile[];
+  stats: Map<string, { mtimeMs: number; size: number }>;
+  at: number;
+}
+
+const REPO_MAP_TTL_MS = 60_000;
+
+let repoMapCache: RepoMapCacheEntry | null = null;
+
+/** Invalidate the repo-map cache (tests + callers that mutate the tree). */
+export function clearRepoMapCache(): void {
+  repoMapCache = null;
+}
+
+/** Re-stat every file in the cached map; true when all stats still match. */
+async function repoMapStatsMatch(cwd: string, stats: Map<string, { mtimeMs: number; size: number }>): Promise<boolean> {
+  for (const [rel, prev] of stats) {
+    try {
+      const s = await fs.stat(path.join(cwd, rel));
+      if (s.mtimeMs !== prev.mtimeMs || s.size !== prev.size) return false;
+    } catch {
+      return false; // deleted (or unreadable) — rebuild
+    }
+  }
+  return true;
+}
+
 /** Heuristic: walk cwd, return at most `maxFiles` files with symbols. */
 export async function buildRepoMap(opts: { cwd: string; maxFiles?: number; maxFileBytes?: number }): Promise<RepoFile[]> {
   const maxFiles = opts.maxFiles ?? 500;
   const maxFileBytes = opts.maxFileBytes ?? 256 * 1024;
+  const cached = repoMapCache;
+  if (
+    cached && cached.cwd === opts.cwd && cached.maxFiles === maxFiles &&
+    cached.maxFileBytes === maxFileBytes && Date.now() - cached.at < REPO_MAP_TTL_MS &&
+    (await repoMapStatsMatch(opts.cwd, cached.stats))
+  ) {
+    return cached.files;
+  }
   const out: RepoFile[] = [];
+  const stats = new Map<string, { mtimeMs: number; size: number }>();
   await walk(opts.cwd, async (file) => {
     if (out.length >= maxFiles) return false;
     const ext = path.extname(file).toLowerCase();
@@ -43,9 +83,12 @@ export async function buildRepoMap(opts: { cwd: string; maxFiles?: number; maxFi
     if (stat.size > maxFileBytes) return true;
     let content: string;
     try { content = await fs.readFile(file, 'utf-8'); } catch { return true; }
-    out.push({ path: path.relative(opts.cwd, file), symbols: extractSymbols(content, ext) });
+    const rel = path.relative(opts.cwd, file);
+    stats.set(rel, { mtimeMs: stat.mtimeMs, size: stat.size });
+    out.push({ path: rel, symbols: extractSymbols(content, ext) });
     return true;
   });
+  repoMapCache = { cwd: opts.cwd, maxFiles, maxFileBytes, files: out, stats, at: Date.now() };
   return out;
 }
 

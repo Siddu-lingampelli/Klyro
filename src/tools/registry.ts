@@ -29,6 +29,9 @@ import { memoryWriteTool } from './memory-write.js';
 import { spawnAgentTool } from './agent/spawn-agent.js';
 import { taskListTool } from './agent/task-list.js';
 import { taskGetTool } from './agent/task-get.js';
+import { taskWaitTool } from './agent/task-wait.js';
+import { taskStopTool } from './agent/task-stop.js';
+import { taskApplyTool } from './agent/task-apply.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { zodToJsonSchema } from './schema.js';
 
@@ -123,5 +126,8 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(spawnAgentTool);
   r.register(taskListTool);
   r.register(taskGetTool);
+  r.register(taskWaitTool);
+  r.register(taskStopTool);
+  r.register(taskApplyTool);
   return r;
 };

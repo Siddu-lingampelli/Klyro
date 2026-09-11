@@ -19,7 +19,12 @@ export type StreamEvent =
   | { kind: 'text_delta'; text: string }
   | { kind: 'thinking_delta'; text: string }
   | { kind: 'message_start'; id?: string; model?: string }
-  | { kind: 'message_end'; finishReason?: string; usage?: { input: number; output: number } }
+  // Usage carries provider-reported token counts. cacheRead/cacheWrite are
+  // Anthropic prompt-caching counters (cache_read_input_tokens /
+  // cache_creation_input_tokens): informational only — cost computation uses
+  // input/output and intentionally ignores them (cached tokens bill at
+  // provider-specific discounted rates we don't model; see runtime.ts).
+  | { kind: 'message_end'; finishReason?: string; usage?: { input: number; output: number; cacheRead?: number; cacheWrite?: number } }
   | { kind: 'tool_call_start'; id: string; name: string }
   | { kind: 'tool_call_delta'; id: string; argsJson: string }
   | { kind: 'tool_call_end'; id: string }
@@ -34,6 +39,12 @@ export interface ToolDefinition {
 export interface CallRequest {
   model: string;
   system?: string;
+  /**
+   * Volatile prompt suffix (Level-7 runtime telemetry). Adapters keep it
+   * out of the cacheable prefix: Anthropic sends the array system form
+   * (breakpoint on the stable part), OpenAI appends it with a separator.
+   */
+  systemSuffix?: string;
   messages: Message[];
   tools: ToolDefinition[];
   maxTokens?: number;
@@ -177,7 +188,10 @@ interface ChatCompletionsChunk {
  */
 export function buildChatCompletionsBody(req: CallRequest): ChatCompletionsRequest {
   const messages: ChatCompletionsRequest['messages'] = [];
-  if (req.system) messages.push({ role: 'system', content: req.system });
+  // OpenAI has no system array form: the volatile suffix rides along as a
+  // plain concatenation (behavior-preserving when absent).
+  if (req.system) messages.push({ role: 'system', content: req.systemSuffix ? `${req.system}\n\n${req.systemSuffix}` : req.system });
+  else if (req.systemSuffix) messages.push({ role: 'system', content: req.systemSuffix });
   for (const m of req.messages) {
     if (m.role === 'assistant') {
       const text = m.content.filter((b) => b.kind === 'text').map((b) => (b as { text: string }).text).join('');
@@ -270,11 +284,16 @@ async function* streamChatCompletions(
     req.signal?.removeEventListener('abort', onAbort);
     const rawErr = await res.text().catch(() => '');
     const errText = redact(rawErr).slice(0, 500);
-    const retryable = res.status >= 500 || res.status === 429;
+    // Context overflow is a client-side budget problem, not a transient
+    // failure: surface a dedicated code (never retryable here — the runtime
+    // owns the compress-and-retry recovery) so callers can distinguish it
+    // from 429/5xx backoff cases.
+    const isOverflow = res.status === 413 || /request_too_large|too_large|prompt_too_long|context_length|maximum context length/i.test(rawErr);
+    const retryable = !isOverflow && (res.status >= 500 || res.status === 429);
     const retryAfterMs = retryable ? parseRetryAfterMs(res.headers?.get('retry-after')) : undefined;
     yield {
       kind: 'error',
-      code: `HTTP_${res.status}`,
+      code: isOverflow ? 'REQUEST_TOO_LARGE' : `HTTP_${res.status}`,
       message: `provider returned ${res.status}: ${errText}`,
       retryable,
       status: String(res.status),

@@ -7,7 +7,7 @@
  * failures and server errors surface as typed `McpError`s — never throws
  * raw across the boundary.
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import type { McpServerSpec } from './config.js';
 
 export interface McpToolDef {
@@ -30,9 +30,9 @@ export interface McpCallResult {
 }
 
 export interface McpClientLike {
-  listTools(): Promise<McpToolDef[]>;
+  listTools(signal?: AbortSignal): Promise<McpToolDef[]>;
   callTool(name: string, args: unknown, signal?: AbortSignal): Promise<McpCallResult>;
-  listResources(): Promise<McpResource[]>;
+  listResources(signal?: AbortSignal): Promise<McpResource[]>;
   close(): Promise<void>;
 }
 
@@ -58,6 +58,10 @@ interface Pending {
 const PROTOCOL_VERSION = '2024-11-05';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_STDERR_BYTES = 8192;
+/** Upper bound on spawn + initialize handshake; partial children are killed. */
+const CONNECT_TIMEOUT_MS = 15_000;
+/** Grace period between SIGTERM and SIGKILL in close(). */
+const CLOSE_SIGKILL_AFTER_MS = 2000;
 
 export class McpClient implements McpClientLike {
   private child: ChildProcess | null = null;
@@ -90,6 +94,12 @@ export class McpClient implements McpClientLike {
         return;
       }
       this.child = child;
+      // Swallow async stream errors (e.g. EPIPE on write-after-exit):
+      // request promises already surface failures via write callbacks and
+      // the exit handler, so these must never become uncaught exceptions.
+      child.stdin?.on('error', () => {});
+      child.stdout?.on('error', () => {});
+      child.stderr?.on('error', () => {});
       child.on('error', (err) => {
         this.failAll(new McpError(`mcp server "${this.name}" process error: ${err.message}`, 'SPAWN_FAILED'));
         if (!this.connected) reject(new McpError(`mcp server "${this.name}" spawn failed: ${err.message}`, 'SPAWN_FAILED'));
@@ -108,13 +118,27 @@ export class McpClient implements McpClientLike {
       resolve();
     });
     try {
-      await this.request('initialize', {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: 'klyro', version: '1.0.0' },
-      }, timeoutMs);
-      this.notify('notifications/initialized', {});
-      this.connected = true;
+      let connectTimer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          (async () => {
+            await this.request('initialize', {
+              protocolVersion: PROTOCOL_VERSION,
+              capabilities: {},
+              clientInfo: { name: 'klyro', version: '1.0.0' },
+            }, timeoutMs);
+            this.notify('notifications/initialized', {});
+            this.connected = true;
+          })(),
+          new Promise<never>((_resolve, reject) => {
+            connectTimer = setTimeout(() => {
+              reject(new McpError(`mcp server "${this.name}" connect timed out after ${CONNECT_TIMEOUT_MS}ms`, 'TIMEOUT'));
+            }, CONNECT_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (connectTimer) clearTimeout(connectTimer);
+      }
     } catch (err) {
       await this.close();
       throw err;
@@ -123,9 +147,9 @@ export class McpClient implements McpClientLike {
 
   private connected = false;
 
-  async listTools(): Promise<McpToolDef[]> {
+  async listTools(signal?: AbortSignal): Promise<McpToolDef[]> {
     this.assertLive();
-    const res = (await this.request('tools/list', {}, this.timeout())) as { tools?: McpToolDef[] };
+    const res = (await this.request('tools/list', {}, this.timeout(), signal)) as { tools?: McpToolDef[] };
     return Array.isArray(res.tools) ? res.tools : [];
   }
 
@@ -140,9 +164,9 @@ export class McpClient implements McpClientLike {
     return { text, isError: res.isError === true, raw: res };
   }
 
-  async listResources(): Promise<McpResource[]> {
+  async listResources(signal?: AbortSignal): Promise<McpResource[]> {
     this.assertLive();
-    const res = (await this.request('resources/list', {}, this.timeout())) as { resources?: McpResource[] };
+    const res = (await this.request('resources/list', {}, this.timeout(), signal)) as { resources?: McpResource[] };
     return Array.isArray(res.resources) ? res.resources : [];
   }
 
@@ -156,13 +180,37 @@ export class McpClient implements McpClientLike {
   }
 
   async close(): Promise<void> {
+    // Idempotent vs the exit handler: closed is set FIRST (the on('exit')
+    // callback checks it before failAll), and a second close() with no child
+    // left is a no-op.
+    if (this.closed && this.child === null) return;
     this.closed = true;
     this.failAll(new McpError(`mcp server "${this.name}" closed`, 'CLOSED'));
     const child = this.child;
     this.child = null;
-    if (child && !child.killed) {
+    if (!child) return;
+    // Already reaped — no escalation timer needed.
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    if (process.platform === 'win32') {
+      try {
+        if (child.pid !== undefined) {
+          execFileSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+        }
+      } catch { /* ignore — fall through to kill() */ }
       try { child.kill(); } catch { /* ignore */ }
+      return;
     }
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }, CLOSE_SIGKILL_AFTER_MS);
+    timer.unref?.();
+    child.once('exit', () => clearTimeout(timer));
+  }
+
+  /** Test hook: number of in-flight JSON-RPC requests. */
+  pendingCount(): number {
+    return this.pending.size;
   }
 
   /* ---------------- internals ---------------- */
@@ -194,7 +242,7 @@ export class McpClient implements McpClientLike {
       if (!pend) continue;
       this.pending.delete(msg.id);
       clearTimeout(pend.timer);
-      pend.signal?.removeEventListener('abort', pend.onAbort!);
+      if (pend.signal && pend.onAbort) pend.signal.removeEventListener('abort', pend.onAbort);
       if (msg.error) {
         pend.reject(new McpError(`mcp server "${this.name}" error: ${msg.error.message ?? 'unknown'}`, 'SERVER_ERROR', msg.error));
       } else {
@@ -221,6 +269,8 @@ export class McpClient implements McpClientLike {
       }
       const id = this.nextId++;
       const timer = setTimeout(() => {
+        const p = this.pending.get(id);
+        if (p?.signal && p.onAbort) p.signal.removeEventListener('abort', p.onAbort);
         this.pending.delete(id);
         reject(new McpError(`mcp call "${method}" timed out after ${timeoutMs}ms`, 'TIMEOUT'));
       }, timeoutMs);
@@ -241,12 +291,14 @@ export class McpClient implements McpClientLike {
           if (err) {
             this.pending.delete(id);
             clearTimeout(timer);
+            if (signal && pend.onAbort) signal.removeEventListener('abort', pend.onAbort);
             reject(new McpError(`mcp call "${method}" write failed: ${err.message}`, 'IO_ERROR'));
           }
         });
       } catch (err) {
         this.pending.delete(id);
         clearTimeout(timer);
+        if (signal && pend.onAbort) signal.removeEventListener('abort', pend.onAbort);
         reject(new McpError(`mcp call "${method}" write failed: ${err instanceof Error ? err.message : String(err)}`, 'IO_ERROR'));
       }
     });
@@ -257,6 +309,7 @@ export class McpClient implements McpClientLike {
     for (const [id, pend] of [...this.pending]) {
       this.pending.delete(id);
       clearTimeout(pend.timer);
+      if (pend.signal && pend.onAbort) pend.signal.removeEventListener('abort', pend.onAbort);
       pend.reject(err);
     }
   }

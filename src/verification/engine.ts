@@ -10,6 +10,7 @@
 
 import { spawn } from 'node:child_process';
 import { detect, summarize, type Failure, type FailureType } from './detect.js';
+import { filteredVerifyEnv } from './registry.js';
 import { redact } from '../policy/secret-redactor.js';
 
 export interface VerifyOptions {
@@ -78,7 +79,8 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
   }
   const timeout = opts.timeoutMs ?? 5 * 60 * 1000;
   return new Promise((resolve) => {
-    const child = spawn(opts.command, { cwd: opts.cwd, shell: true, env: process.env });
+    // S2: verify commands run with filtered env; servers needing keys must use explicit config.
+    const child = spawn(opts.command, { cwd: opts.cwd, shell: true, env: filteredVerifyEnv() });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
     let done = false;

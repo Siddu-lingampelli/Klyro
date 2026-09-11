@@ -113,7 +113,8 @@ export async function runLogout(provider?: string): Promise<number> {
     const creds = JSON.parse(raw) as Record<string, string>;
     if (provider) {
       delete creds[provider];
-      await fs.writeFile(credPath(), JSON.stringify(creds, null, 2), 'utf-8');
+      await fs.writeFile(credPath(), JSON.stringify(creds, null, 2), { mode: 0o600 });
+      try { await fs.chmod(credPath(), 0o600); } catch { /* ignore on Windows */ }
       process.stdout.write(`Removed ${provider} key\n`);
     } else {
       await fs.unlink(credPath());
@@ -129,6 +130,16 @@ export async function runLogout(provider?: string): Promise<number> {
 
 export function getStoredKey(provider: string): string | undefined {
   try {
+    // Warn (don't refuse) when the credentials file is group/other-readable.
+    // Refusing would lock out existing users with old umasks; warn instead.
+    if (process.platform !== 'win32') {
+      try {
+        const st = fsSync.statSync(credPath());
+        if ((st.mode & 0o077) !== 0) {
+          process.stderr.write(`warning: credentials file ${credPath()} is group/other-readable (mode ${(st.mode & 0o777).toString(8)}) — run chmod 600 on it\n`);
+        }
+      } catch { /* missing file → no warning */ }
+    }
     const raw = fsSync.readFileSync(credPath(), 'utf-8');
     const creds = JSON.parse(raw) as Record<string, string>;
     const v = creds[provider];

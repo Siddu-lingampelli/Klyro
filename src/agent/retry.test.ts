@@ -83,8 +83,8 @@ describe('retryingAdapter', () => {
     expect(onAttempt).toHaveBeenCalledTimes(3);
   });
 
-  it('uses default policy (3 attempts, 500ms base, 8s cap)', () => {
-    expect(DEFAULT_RETRY.maxAttempts).toBe(3);
+  it('uses default policy (5 attempts, 500ms base, 8s cap)', () => {
+    expect(DEFAULT_RETRY.maxAttempts).toBe(5);
     expect(DEFAULT_RETRY.baseMs).toBe(500);
     expect(DEFAULT_RETRY.maxMs).toBe(8000);
   });

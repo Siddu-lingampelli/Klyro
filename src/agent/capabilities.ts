@@ -30,6 +30,11 @@ export interface AgentCapabilities {
   model?: string;
   /** Recursion depth cap. Beyond this, spawn attempts are blocked. */
   maxDepth?: number;
+  /**
+   * Path allow-list for filesystem scope. `undefined` means unconstrained.
+   * A child's effective list is the intersection with its parent's.
+   */
+  allowedPaths?: string[];
 }
 
 export interface ResolveToolsInput {
@@ -123,10 +128,11 @@ export function resolveAgentTools(input: ResolveToolsInput): ResolveToolsResult 
     }
   }
 
-  // 4. readonly → strip write tools.
+  // 4. readonly → strip write tools (plus run_verify: verification can
+  // execute arbitrary commands, so it is not read-only).
   if (agent.readonly) {
     for (const name of [...allowed]) {
-      if (writeTools.has(name)) {
+      if (writeTools.has(name) || name === 'run_verify') {
         allowed.delete(name);
         dropped.push({ tool: name, reason: 'readonly' });
       }
@@ -182,6 +188,11 @@ export interface ResolvedCapabilities {
   maxDepth: number;
   readonly: boolean;
   canSpawn: boolean;
+  /**
+   * Effective filesystem scope: parent's `allowedPaths` intersected with the
+   * agent's own. `undefined` means unconstrained (neither side restricts).
+   */
+  allowedPaths?: string[];
 }
 
 /** Extra knobs consumed by `resolveCapabilities` on top of `ResolveToolsInput`. */
@@ -190,10 +201,55 @@ export interface ResolveCapabilitiesExtra {
   maxDepth: number;
   /** If true, the resolved `allowed` set may include tools that themselves spawn agents. */
   canSpawnOverride?: boolean;
+  /**
+   * The parent's filesystem allow-list (`undefined` = unconstrained parent —
+   * the agent's own list, if any, applies as-is).
+   */
+  parentAllowedPaths?: string[];
 }
 
 /** Combined input for the one-shot resolver used by the orchestrator. */
 export interface ResolveCapabilitiesInput extends ResolveToolsInput, ResolveCapabilitiesExtra {}
+
+/**
+ * Intersect two filesystem allow-lists. `undefined` on either side means
+ * "unconstrained" — the other side applies as-is; both `undefined` stays
+ * `undefined`. Entries survive when they are equal to, or nested inside, an
+ * entry of the other list (so a parent `/repo` and a child `/repo/sub`
+ * intersect to `/repo/sub`). Comparison is case-insensitive on Windows.
+ */
+export function intersectAllowedPaths(
+  parentPaths?: string[],
+  agentPaths?: string[],
+): string[] | undefined {
+  if (parentPaths === undefined) return agentPaths;
+  if (agentPaths === undefined) return [...parentPaths];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const within = (candidate: string, scope: string): boolean => {
+    const norm = (p: string): string => {
+      const n = p.replace(/\\/g, '/').replace(/\/+$/, '');
+      return process.platform === 'win32' ? n.toLowerCase() : n;
+    };
+    const c = norm(candidate);
+    const s = norm(scope);
+    return c === s || c.startsWith(s + '/');
+  };
+  for (const a of agentPaths) {
+    for (const p of parentPaths) {
+      // The overlap of two nested scopes is the narrower one.
+      const narrower = within(a, p) ? a : within(p, a) ? p : undefined;
+      if (narrower !== undefined) {
+        const key = process.platform === 'win32' ? narrower.toLowerCase() : narrower;
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push(narrower);
+        }
+      }
+    }
+  }
+  return out.sort();
+}
 
 /**
  * One-shot capability resolver: tool intersection + per-agent model/maxDepth.
@@ -209,7 +265,10 @@ export function resolveCapabilities(input: ResolveCapabilitiesInput): ResolvedCa
   const allowed = new Set(resolved.allowed);
   const model = input.agent.model;
   const maxDepth = input.agent.maxDepth ?? input.maxDepth;
-  const canSpawn = input.canSpawnOverride ?? input.agent.canSpawn ?? false;
+  // Default matches resolveAgentTools: the root agent (parentTools === null)
+  // may spawn; children strip spawn tools unless explicitly enabled.
+  const canSpawn = input.canSpawnOverride ?? input.agent.canSpawn ?? (input.parentTools === null);
+  const allowedPaths = intersectAllowedPaths(input.parentAllowedPaths, input.agent.allowedPaths);
   return {
     allowed,
     dropped: resolved.dropped,
@@ -217,6 +276,7 @@ export function resolveCapabilities(input: ResolveCapabilitiesInput): ResolvedCa
     maxDepth,
     readonly: input.agent.readonly ?? false,
     canSpawn,
+    ...(allowedPaths !== undefined ? { allowedPaths } : {}),
   };
 }
 
@@ -228,14 +288,12 @@ export const DEFAULT_WRITE_TOOLS: ReadonlySet<string> = new Set([
   'apply_patch',
   'shell_exec',
   'memory_write',
-  'background_shell',
   'todo_write',
 ]);
 
 /** Default spawn tools — removed from children by default. */
 export const DEFAULT_SPAWN_TOOLS: ReadonlySet<string> = new Set([
   'spawn_agent',
-  'subtask',
 ]);
 
 /** Default deny-list — these are NEVER allowed, even if explicitly requested. */

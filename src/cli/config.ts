@@ -331,11 +331,66 @@ export async function loadPermissionRules(cwd = process.cwd()): Promise<Permissi
 }
 
 /**
- * Persist an "always allow" pattern to the home settings file
- * (~/.klyro/settings.json, honors KLYRO_CONFIG). Returns whether it was
- * added (false when already present) and the file written.
+ * Strict allow-rule grammar: `tool` or `tool(glob)` where tool is
+ * lowercase alnum+underscore and glob contains no parens.
  */
-export async function persistAllowRule(rule: string): Promise<{ added: boolean; path: string }> {
+const ALLOW_RULE_RE = /^[a-z0-9_]+\([^()]*\)$|^[a-z0-9_]+$/;
+
+export function isValidAllowRule(rule: string): boolean {
+  return ALLOW_RULE_RE.test(rule.trim());
+}
+
+function isProjectDir(cwd: string): boolean {
+  try {
+    const st = fsSync.statSync(cwd);
+    if (!st.isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  return fsSync.existsSync(path.join(cwd, '.git')) || fsSync.existsSync(path.join(cwd, '.klyro'));
+}
+
+/**
+ * Persist an "always allow" pattern. Validates the rule against the strict
+ * grammar (throws `invalid rule` otherwise). When `cwd` is a project dir
+ * (exists + contains .git or .klyro), writes to <cwd>/.klyro/settings.json;
+ * otherwise writes to the home settings file. Returns whether it was
+ * added (false when already present) and the file written.
+ *
+ * NOTE for the repl integrator (sibling-owned repl.ts): pass the session
+ * cwd as the second arg to persist project-scoped allows.
+ */
+export async function persistAllowRule(rule: string, cwd?: string): Promise<{ added: boolean; path: string }> {
+  if (!isValidAllowRule(rule)) {
+    throw new Error(`invalid rule: ${rule}`);
+  }
+  // Project-scoped persist when cwd is a project dir.
+  if (cwd && isProjectDir(cwd)) {
+    const projPath = path.join(cwd, '.klyro', 'settings.json');
+    let cfg: Record<string, unknown> = {};
+    try {
+      const raw = await fs.readFile(projPath, 'utf-8');
+      cfg = validateConfig(parseJsonc(raw, projPath), projPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== 'ENOENT') throw err;
+    }
+    const allow = asStringArray(cfg.allow);
+    if (allow.includes(rule)) return { added: false, path: projPath };
+    cfg.allow = [...allow, rule];
+    await fs.mkdir(path.dirname(projPath), { recursive: true });
+    const tmp = `${projPath}.tmp-${process.pid}-${Date.now()}`;
+    const data = JSON.stringify(validateConfig(cfg, projPath), null, 2) + '\n';
+    await fs.writeFile(tmp, data, { mode: 0o600 });
+    try {
+      await fs.rename(tmp, projPath);
+    } catch (err) {
+      await fs.unlink(tmp).catch(() => undefined);
+      throw err;
+    }
+    try { await fs.chmod(projPath, 0o600); } catch { /* ignore on Windows */ }
+    return { added: true, path: projPath };
+  }
   const cfg = await loadConfig();
   const allow = asStringArray(cfg.allow);
   if (allow.includes(rule)) return { added: false, path: getConfigPath() };

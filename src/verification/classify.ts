@@ -5,10 +5,25 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { Failure, FailureType } from './detect.js';
+import { detect } from './detect.js';
 import type { BaselineResult } from './baseline.js';
 import type { VerifyResult } from './engine.js';
 
 export type FailureClass = 'introduced' | 'pre_existing' | 'flaky' | 'env';
+
+interface FailureSignature {
+  type: FailureType;
+  files: Set<string>;
+  exit: number;
+}
+
+function signatureOf(failure: Failure | undefined, fallbackExit: number): FailureSignature {
+  return {
+    type: failure?.type ?? 'unknown',
+    files: new Set((failure?.files ?? []).map((f) => f.path).filter(Boolean)),
+    exit: failure?.exitCode ?? fallbackExit,
+  };
+}
 
 export function classifyFailure(
   current: { failure?: Failure; stdout: string; stderr: string },
@@ -25,17 +40,21 @@ export function classifyFailure(
   }
   if (flakyRerunOk) return 'flaky';
   if (baseline && !baseline.ok) {
-    const baseRaw = (baseline.stderr + '\n' + baseline.stdout);
-    // if current failure files overlap baseline failure raw, treat as pre-existing
-    if (current.failure && baseline.stdout + baseline.stderr) {
-      const curPaths = new Set(current.failure.files.map((f) => f.path).filter(Boolean));
-      const baseContains = [...curPaths].some((p) => baseRaw.includes(p));
-      if (baseContains) return 'pre_existing';
-      // also if same exit code and type, likely pre-existing
-      if (baseRaw.includes(current.failure.files[0]?.message ?? '') && baseRaw.length > 0) return 'pre_existing';
+    // Structured signature compare (no substring matching): pre-existing
+    // iff same failure type AND file-set overlap is non-empty (or same
+    // exit + same type when both sides are fileless).
+    const curSig = signatureOf(current.failure, -1);
+    const baseFailure = detect(baseline.stdout, baseline.stderr, baseline.exitCode);
+    const baseSig = signatureOf(baseFailure, baseline.exitCode);
+    if (curSig.type !== 'unknown' && curSig.type === baseSig.type) {
+      if (curSig.files.size > 0 && baseSig.files.size > 0) {
+        for (const f of curSig.files) {
+          if (baseSig.files.has(f)) return 'pre_existing';
+        }
+      } else if (curSig.files.size === 0 && baseSig.files.size === 0 && curSig.exit === baseSig.exit) {
+        return 'pre_existing';
+      }
     }
-    // if baseline failed and current also fails with similar raw length, assume pre-existing
-    if (current.failure && baseline.stderr.length > 0 && combined.includes(baseline.stderr.slice(0, 200).toLowerCase())) return 'pre_existing';
   }
   return 'introduced';
 }

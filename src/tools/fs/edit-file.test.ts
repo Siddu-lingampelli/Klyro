@@ -116,4 +116,59 @@ describe('edit_file core (4.1)', () => {
     const r = await editFileTool.execute({ path: 'a.txt', find: '', replace: 'x' } as unknown as { path: string; find: string; replace: string }, { cwd: tmp, env: {} });
     expect(r.ok).toBe(false);
   });
+
+  it('repairGuard denies test-file edits', async () => {
+    await write('b.test.ts', 'hello world');
+    const r = await editFileTool.execute(
+      { path: 'b.test.ts', find: 'world', replace: 'there' },
+      { cwd: tmp, env: {}, repairGuard: { denyTestEdits: true } },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe('POLICY_DENIED');
+      expect(r.error.message).toMatch(/repair-guard/);
+    }
+  });
+
+  it('repairGuard ignores assertion-like content in non-test files', async () => {
+    await write('src.ts', 'const x = 1;');
+    const r = await editFileTool.execute(
+      { path: 'src.ts', find: 'const x = 1;', replace: 'describe.skip("x", () => {})' },
+      { cwd: tmp, env: {}, repairGuard: { denyTestEdits: true } },
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it('repairGuard allows latest.ts / attest.ts (not test-like)', async () => {
+    for (const p of ['latest.ts', 'attest.ts']) {
+      await write(p, 'hello world');
+      const r = await editFileTool.execute(
+        { path: p, find: 'world', replace: 'there' },
+        { cwd: tmp, env: {}, repairGuard: { denyTestEdits: true } },
+      );
+      expect(r.ok).toBe(true);
+    }
+  });
+
+  it('pre-write re-resolve accepts equivalent spellings (no false positive)', async () => {
+    await write('a.txt', 'hello world');
+    await fs.mkdir(path.join(tmp, 'sub'), { recursive: true });
+    const r = await editFileTool.execute({ path: 'sub/../a.txt', find: 'world', replace: 'there' }, { cwd: tmp, env: {} });
+    expect(r.ok).toBe(true);
+    expect(await fs.readFile(path.join(tmp, 'a.txt'), 'utf-8')).toBe('hello there');
+  });
+  it('agentAllowedPaths denies targets outside the set', async () => {
+    await write('sub/a.txt', 'hi');
+    const r = await editFileTool.execute(
+      { path: 'sub/a.txt', find: 'hi', replace: 'yo' },
+      { cwd: tmp, env: {}, agentAllowedPaths: [tmp] },
+    );
+    expect(r.ok).toBe(true);
+    const r2 = await editFileTool.execute(
+      { path: 'sub/a.txt', find: 'yo', replace: 'hi' },
+      { cwd: tmp, env: {}, agentAllowedPaths: ['/definitely/not/here'] },
+    );
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.error.code).toBe('POLICY_DENIED');
+  });
 });

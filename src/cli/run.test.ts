@@ -60,7 +60,7 @@ describe('runOnce', () => {
     expect(code).toBe(0);
   });
 
-  it('returns 3 when the agent hits max_steps', async () => {
+  it('returns 7 when the agent hits max_steps', async () => {
     // Always emits a tool call so the loop never converges.
     const adapter: ProviderAdapter = {
       id: 'mock',
@@ -80,16 +80,89 @@ describe('runOnce', () => {
       maxSteps: 2,
       abortOnSigint: false,
     });
-    expect(code).toBe(3);
+    expect(code).toBe(7);
   });
 
-  it('forwards the L7 telemetry block into the adapter on every step', async () => {
-    const seenSystems: (string | undefined)[] = [];
+  it('returns 5 when the provider errors with no final answer', async () => {
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream() {
+        yield { kind: 'error', code: 'BAD_REQUEST', message: 'nope', retryable: false };
+      },
+    };
+    const code = await runOnce({
+      task: 'boom',
+      cwd: process.cwd(),
+      model: 'mock',
+      adapter,
+      abortOnSigint: false,
+    });
+    expect(code).toBe(5);
+  });
+
+  it('returns 7 when the agent gets stuck in a repeated loop', async () => {
+    // Identical tool call ×3 twice → stuck abort.
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream() {
+        yield { kind: 'message_start' };
+        yield { kind: 'tool_call_start', id: 'c1', name: 'shell_exec' };
+        yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"command":"echo hi"}' };
+        yield { kind: 'tool_call_end', id: 'c1' };
+        yield { kind: 'message_end', finishReason: 'tool_calls' };
+      },
+    };
+    const code = await runOnce({
+      task: 'loop',
+      cwd: process.cwd(),
+      model: 'mock',
+      adapter,
+      maxSteps: 12,
+      abortOnSigint: false,
+    });
+    expect(code).toBe(7);
+  });
+
+  it('returns 8 when verification fails after repairs', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-verifyfail-'));
+    try {
+      const adapter = scriptedAdapter([
+        [
+          { kind: 'message_start' },
+          { kind: 'tool_call_start', id: 'c1', name: 'write_file' },
+          { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"x.txt","content":"hello"}' },
+          { kind: 'tool_call_end', id: 'c1' },
+          { kind: 'message_end', finishReason: 'tool_calls' },
+        ],
+        [
+          { kind: 'message_start' },
+          { kind: 'text_delta', text: 'done' },
+          { kind: 'message_end', finishReason: 'stop' },
+        ],
+      ]);
+      const code = await runOnce({
+        task: 'write it',
+        cwd: dir,
+        model: 'mock',
+        adapter,
+        verify: true,
+        verifyCommand: 'node -e "process.exit(1)"',
+        maxRepairAttempts: 1,
+        abortOnSigint: false,
+      });
+      expect(code).toBe(8);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards the L7 telemetry block as systemSuffix on every step', async () => {
+    const seen: Array<{ system: string | undefined; suffix: string | undefined }> = [];
     const adapter: ProviderAdapter = {
       id: 'mock',
       async *stream(req) {
-        seenSystems.push(req.system);
-        if (seenSystems.length === 1) {
+        seen.push({ system: req.system, suffix: req.systemSuffix });
+        if (seen.length === 1) {
           yield { kind: 'message_start' };
           yield { kind: 'tool_call_start', id: 'c1', name: 'shell_exec' };
           yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"command":"echo hi"}' };
@@ -109,11 +182,12 @@ describe('runOnce', () => {
       adapter,
       abortOnSigint: false,
     });
-    expect(seenSystems.length).toBeGreaterThanOrEqual(2);
-    // Step 1 placeholder; step 2 has the real telemetry line.
-    expect(seenSystems[0]).toMatch(/no telemetry yet/);
-    expect(seenSystems[1]).toMatch(/# Runtime telemetry/);
-    expect(seenSystems[1]).toMatch(/shell_exec echo hi/);
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    // Step 1 placeholder; step 2 has the real telemetry line — both as suffix.
+    expect(seen[0]?.suffix).toMatch(/no telemetry yet/);
+    expect(seen[1]?.suffix).toMatch(/# Runtime telemetry/);
+    expect(seen[1]?.suffix).toMatch(/shell_exec echo hi/);
+    expect(seen[1]?.system).not.toMatch(/# Runtime telemetry/);
   });
 
   describe('--output json', () => {

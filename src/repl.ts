@@ -11,8 +11,9 @@ import * as readline from 'node:readline/promises';
 import { stdin, exit } from 'node:process';
 import { streamToStdout, readBoundedText } from './chat.js';
 import { resolveProvider, providerHelp } from './providers.js';
+import { estimateTokens } from './context/tokenizer.js';
 
-interface Turn {
+export interface Turn {
   role: 'user' | 'assistant';
   content: string;
 }
@@ -34,6 +35,8 @@ export async function repl(system: string): Promise<void> {
     exit(2);
   }
   const { baseURL, apiKey, model, source } = provider;
+  // Legacy REPL — prefer `klyro tui`; history truncation is approximate.
+  process.stderr.write('klyro: legacy REPL — prefer `klyro tui`; history truncation is approximate.\n');
 
   const history: Turn[] = [];
   // Adapt readline to the environment. On a TTY we let readline manage the
@@ -93,7 +96,7 @@ export async function repl(system: string): Promise<void> {
 }
 
 /** Drop oldest turns to stay under the size cap. Keep user/assistant pairs together. */
-function trimHistory(history: Turn[]): void {
+export function trimHistory(history: Turn[]): void {
   // Keep even number of turns (pairs) when trimming for turn count
   while (history.length > MAX_HISTORY_TURNS) {
     // Drop oldest 2 (user+assistant) to preserve adjacency
@@ -104,19 +107,20 @@ function trimHistory(history: Turn[]): void {
       history.shift();
     }
   }
-  let total = 0;
-  for (const t of history) total += t.content.length;
-  while (total > MAX_HISTORY_CHARS && history.length > 2) {
+  // Token-budgeted trim (approximate): estimate over the joined history
+  // instead of raw chars so long-token text (CJK, code) trims correctly.
+  const budgetTokens = Math.ceil(MAX_HISTORY_CHARS / 4);
+  if (estimateTokens(history.map((t) => t.content).join('\n')) <= budgetTokens) return;
+  while (history.length > 2) {
     // Drop oldest pair to avoid orphaning tool context
     const first = history[0];
     const second = history[1];
     if (!first) break;
-    total -= first.content.length;
     history.shift();
     if (second) {
-      total -= second.content.length;
       history.shift();
     }
+    if (estimateTokens(history.map((t) => t.content).join('\n')) <= budgetTokens) break;
   }
 }
 

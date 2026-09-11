@@ -22,6 +22,7 @@ import React, { useEffect, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import type { ApprovalChoice, ApprovalRequest } from '../policy/approval.js';
 import type { ApprovalPrompt } from '../policy/approval.js';
+import { approvalChoiceForKey, sanitizeForPrompt } from '../policy/approval.js';
 
 interface PendingPrompt {
   req: ApprovalRequest;
@@ -84,29 +85,39 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
   }, [bridge]);
 
   const [explain, setExplain] = useState(false);
+  const [full, setFull] = useState(false);
   useInput((inputStr, key) => {
     if (!pending) return;
-    const c = inputStr.toLowerCase();
-    if (c === 'y') { bridge.resolve('allow'); return; }
-    if (c === 'a') { bridge.resolve('always'); return; }
-    if (c === 'A') { bridge.resolve('always-persist'); return; }
-    if (c === 'd' || c === 'n') { bridge.resolve('deny'); return; }
-    if (c === 'e') {
-      // Edit: for MVP, treat as deny with edit hint — model will be told to re-read and retry
+    if (key.return) {
       bridge.resolve('deny');
       return;
     }
-    if (c === '?') {
+    // Case-sensitive mapping lives in approvalChoiceForKey: 'A' persists,
+    // 'a' is session-only (the old inline toLowerCase-first code collapsed
+    // them, silently downgrading persistence).
+    const action = approvalChoiceForKey(inputStr);
+    if (action === 'expand') {
+      setFull((v) => !v);
+      return;
+    }
+    if (action === 'explain') {
       setExplain((v) => !v);
       return;
     }
-    if (key.return) {
-      bridge.resolve('deny');
+    if (action === 'allow' || action === 'always' || action === 'always-persist' || action === 'deny') {
+      bridge.resolve(action);
       return;
     }
   });
 
   if (!pending) return null;
+  // Sanitized display (ANSI/control-strip + 500-char cap inside
+  // sanitizeForPrompt), then the 300-char TUI truncation on top. [f] toggles
+  // the full sanitized text.
+  const trunc = (s: string, n = 300): string => {
+    const clean = sanitizeForPrompt(s);
+    return !full && clean.length > n ? clean.slice(0, n) + '…' : clean;
+  };
   return (
     <Box
       flexDirection="column"
@@ -116,9 +127,9 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
       marginY={1}
     >
       <Text color="yellow" bold>⚠ approval needed — {pending.toolName}</Text>
-      <Text color="gray">  reason: {pending.reason}</Text>
-      {pending.summary ? <Text>  {pending.summary}</Text> : null}
-      {explain ? <Text color="cyan">  Explain: This tool will {pending.toolName} with the shown args. [y] once, [a] session, [A] always→settings, [n] deny, [e] edit, [?] toggle help.</Text> : null}
+      <Text color="gray">  reason: &quot;{trunc(pending.reason)}&quot;</Text>
+      {pending.summary ? <Text>  &quot;{trunc(pending.summary)}&quot;</Text> : null}
+      {explain ? <Text color="cyan">  Explain: This tool will {pending.toolName} with the shown args. [y] once, [a] session, [A] always→settings, [n] deny, [e] edit, [f] full text, [?] toggle help.</Text> : null}
       <Box marginTop={1}>
         <Text color="green">[y] once</Text>
         <Text color="gray">  </Text>
@@ -129,6 +140,8 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
         <Text color="red">[n] deny</Text>
         <Text color="gray">  </Text>
         <Text color="yellow">[e] edit</Text>
+        <Text color="gray">  </Text>
+        <Text color="cyan">[f] full</Text>
         <Text color="gray">  </Text>
         <Text color="cyan">[?] explain</Text>
         <Text color="gray">  (Enter = deny)</Text>

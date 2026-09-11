@@ -12,6 +12,38 @@ import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
 import { wasRead } from './read-history.js';
 
+// Extension-anchored: matches test.ts, foo.test.ts, foo-test.ts, foo.spec.js,
+// __tests__ segments — but NOT latest.ts / attest.ts / contest-data.
+const TEST_BASENAME_RE = /(^|[._-])(test|spec)\.[^.]+$|\.test\.[^.]+$|\.spec\.[^.]+$|__(tests|snapshots)__/i;
+
+function checkRepairGuard(targetPath: string, _content: string, deny?: boolean): { ok: false; error: { code: string; message: string } } | null {
+  if (!deny) return null;
+  const base = targetPath.split(/[\\/]/).pop() ?? targetPath;
+  // Basename alone decides. File CONTENT is never consulted for non-test
+  // paths (the old assert-skip regex over-blocked ordinary sources
+  // containing e.g. `it(` or `test(`), and stays unconsulted for test-like
+  // paths too since the basename already denies.
+  if (!TEST_BASENAME_RE.test(base)) return null;
+  return { ok: false, error: { code: 'POLICY_DENIED', message: 'repair-guard: test edits denied (denyTestEdits)' } };
+}
+
+async function checkAllowedPaths(cwd: string, resolved: string, allowed?: readonly string[]): Promise<{ ok: false; error: { code: string; message: string } } | null> {
+  if (!allowed) return null;
+  // Canonicalize both sides (realpath) so lexical-vs-canonical spellings
+  // of the same directory (e.g. Windows 8.3 short names) compare equal.
+  const canon = async (p: string): Promise<string> => {
+    try { return await fs.realpath(p); } catch { return path.resolve(p); }
+  };
+  const canonTarget = await canon(resolved);
+  for (const base of allowed) {
+    const absBase = path.isAbsolute(base) ? path.resolve(base) : path.resolve(cwd, base);
+    const canonBase = await canon(absBase);
+    const rel = path.relative(canonBase, canonTarget);
+    if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return null;
+  }
+  return { ok: false, error: { code: 'POLICY_DENIED', message: `agent path not allowed: ${resolved}` } };
+}
+
 const InputSchema = z.object({
   path: z.string().min(1),
   find: z.string().min(1).describe('Exact substring to match. Not a regex.'),
@@ -47,7 +79,11 @@ export const editFileTool = defineTool<z.infer<typeof InputSchema>, EditFileOutp
   renderResult: (output) => `${output.path} ${output.replacements} replacement(s)`,
   execute: async (input, ctx) => {
     return safe(async () => {
+      const guard = checkRepairGuard(input.path, `${input.find}\n${input.replace}`, ctx.repairGuard?.denyTestEdits);
+      if (guard) return guard as unknown as EditFileOutput;
       const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const allowed = await checkAllowedPaths(ctx.cwd, resolved, ctx.agentAllowedPaths);
+      if (allowed) return allowed as unknown as EditFileOutput;
       // 4.1: staleness check via mtime+hash
       const stat = await fs.stat(resolved);
       const raw = await fs.readFile(resolved, 'utf-8');
@@ -132,6 +168,18 @@ export const editFileTool = defineTool<z.infer<typeof InputSchema>, EditFileOutp
       else if (!hasTrailingNewline && next.endsWith(eol)) next = next.slice(0, -eol.length);
       // Preserve BOM
       if (hasBOM) next = '\uFEFF' + next;
+      // TOCTOU shrink (mirrors write_file): re-resolve symlinks immediately
+      // before the write and refuse if the target moved. Compares
+      // canonicalized forms (not raw strings) to avoid false positives from
+      // lexical-vs-canonical spellings (e.g. `sub/../a.txt`, short names).
+      const { resolved: reResolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const canon = async (p: string): Promise<string> => {
+        try { return await fs.realpath(p); } catch { /* missing file → try parent */ }
+        try { return path.join(await fs.realpath(path.dirname(p)), path.basename(p)); } catch { return p; }
+      };
+      if ((await canon(reResolved)) !== (await canon(resolved))) {
+        throw Object.assign(new Error(`Path target changed between check and write: ${input.path} (POLICY_DENIED)`), { code: 'POLICY_DENIED' });
+      }
       const tmp = `${resolved}.klyro-edit-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.tmp`;
       await fs.writeFile(tmp, next, 'utf-8');
       // Ensure fsync before rename (like write_file)

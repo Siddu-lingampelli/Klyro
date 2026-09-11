@@ -23,6 +23,31 @@ describe('redact', () => {
   it('passes through clean text', () => {
     expect(redact('hello world')).toBe('hello world');
   });
+
+  it('redacts discord tokens (classic and mfa)', () => {
+    const classic = 'M' + 'A'.repeat(23) + '.' + 'B'.repeat(6) + '.' + 'C'.repeat(27);
+    expect(redact(`discord ${classic}`)).toContain('[REDACTED]:discord-token');
+    const mfa = 'mfa.' + 'x'.repeat(84);
+    expect(redact(`discord ${mfa}`)).toContain('[REDACTED]:discord-token');
+  });
+
+  it('redacts npm tokens', () => {
+    expect(redact('npm_' + 'a'.repeat(36))).toContain('[REDACTED]:npm-token');
+  });
+
+  it('redacts sendgrid keys', () => {
+    const sg = 'SG.' + 'A'.repeat(22) + '.' + 'B'.repeat(43);
+    expect(redact(`sendgrid ${sg}`)).toContain('[REDACTED]:sendgrid-key');
+  });
+
+  it('redacts pypi tokens', () => {
+    expect(redact('pypi-' + 'aB1_-'.repeat(8))).toContain('[REDACTED]:pypi-token');
+  });
+
+  it('leaves hex SHAs untouched', () => {
+    const sha = 'da39a3ee5e6b4b0d3255bfef95601890afd80709';
+    expect(redact(`commit ${sha}`)).toBe(`commit ${sha}`);
+  });
 });
 
 describe('createRedactor', () => {

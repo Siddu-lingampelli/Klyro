@@ -26,6 +26,10 @@ const PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: 'api-key', re: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]?[A-Za-z0-9_\-]{16,}['"]?/gi },
   { name: 'password', re: /(?:password|passwd|pwd)\s*[:=]\s*['"]?[^\s'"]{4,}['"]?/gi },
   { name: 'secret-generic', re: /(?:secret|token)\s*[:=]\s*['"]?[A-Za-z0-9_\-+/=]{16,}['"]?/gi },
+  { name: 'discord-token', re: /mfa\.[\w-]{84}|[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}/g },
+  { name: 'npm-token', re: /\bnpm_[A-Za-z0-9]{24,}/g },
+  { name: 'sendgrid-key', re: /\bSG\.[\w-]{22}\.[\w-]{43}/g },
+  { name: 'pypi-token', re: /\bpypi-[A-Za-z0-9_-]{30,}/g },
 ];
 
 const REPLACEMENT = '[REDACTED]';

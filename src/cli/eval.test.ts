@@ -156,6 +156,59 @@ describe('runScenario', () => {
     expect(r.passed).toBe(true);
     expect(r.toolCalls).toBe(1);
   });
+
+  it('passes verify.mode=advisory through: failing verify reports but still completes', async () => {
+    // Advisory only runs when the agent edited files, so the script writes
+    // one probe file into the harness cwd and the test removes it after.
+    const probe = `eval-advisory-probe-${process.pid}.txt`;
+    const probePath = path.join(process.cwd(), probe);
+    try {
+      const sc: EvalScenario = {
+        name: 'advisory-verify',
+        task: 'write probe',
+        maxSteps: 4,
+        verify: { mode: 'advisory', command: 'node -e "process.exit(1)"' },
+        scripted_events: [
+          [
+            ['message_start'],
+            ['tool_call_start', 'c1', 'write_file'],
+            ['tool_call_delta', 'c1', JSON.stringify({ path: probe, content: 'probe' })],
+            ['tool_call_end', 'c1'],
+            ['message_end', 'tool_calls'],
+          ],
+          [
+            ['message_start'],
+            ['text_delta', 'done'],
+            ['message_end', 'stop'],
+          ],
+        ],
+        expect: { status: 'complete', toolCallsAtLeast: 1 },
+      };
+      const r = await runScenario(sc);
+      // Strict (the default) would end verify_failed here; advisory completes.
+      expect(r.status).toBe('complete');
+      expect(r.passed).toBe(true);
+      expect(r.toolCalls).toBe(1);
+    } finally {
+      try { fs.rmSync(probePath, { force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  it('omits verify opts by default (strict pipeline unchanged)', async () => {
+    const sc: EvalScenario = {
+      name: 'no-verify',
+      task: 'say hi',
+      scripted_events: [[
+        ['message_start'],
+        ['text_delta', 'Hello'],
+        ['message_end', 'stop'],
+      ]],
+      expect: { status: 'complete' },
+    };
+    expect(sc.verify).toBeUndefined();
+    const r = await runScenario(sc);
+    expect(r.passed).toBe(true);
+  });
 });
 
 describe('runEval', () => {

@@ -35,7 +35,10 @@ export async function loadKlyroMdFiles(cwd: string): Promise<KlyroMdFile[]> {
       } catch { /* ignore */ }
     }
   }
-  for (const name of ['KLYRO.md', 'KLYRO.local.md', 'AGENTS.md', '.cursorrules']) {
+  // Klyro's own instruction file is KLYRO.md. The rest are read-only
+  // fallbacks for imported repos that follow other conventions — Klyro
+  // never writes them. KLYRO.md wins by load order.
+  for (const name of ['KLYRO.md', 'KLYRO.local.md', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '.cursorrules']) {
     const p = path.join(cwd, name);
     try {
       const t = await fs.readFile(p, 'utf-8');

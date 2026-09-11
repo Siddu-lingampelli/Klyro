@@ -42,16 +42,25 @@ export interface RegisterMcpOpts {
 const MAX_NAME_LEN = 64;
 /** Server part is capped here; the tool part takes whatever remains. */
 const MAX_SERVER_PART = 20;
+/** Success values are redacted FIRST, then truncated to this many chars. */
+export const MCP_SUCCESS_MAX_CHARS = 12_000;
 
 function sanitizePart(s: string): string {
   return s.replace(/[^A-Za-z0-9_]/g, '_');
 }
 
-/** `mcp__<server>__<tool>`, sanitized, server part ≤20 chars, total ≤64. */
+/**
+ * `mcp__<server>__<tool>`, sanitized, server part ≤20 chars, total ≤64.
+ *
+ * No `'server'`/`'tool'` fallbacks: an empty raw part (or one that
+ * sanitizes to empty) yields an empty segment, and registration skips that
+ * tool with an `empty-name` error instead of masking a misconfiguration
+ * behind a plausible-looking name.
+ */
 export function sanitizeMcpName(server: string, tool: string): string {
-  const srv = sanitizePart(server).slice(0, MAX_SERVER_PART) || 'server';
+  const srv = sanitizePart(server).slice(0, MAX_SERVER_PART);
   const maxTool = Math.max(1, MAX_NAME_LEN - 'mcp__'.length - srv.length - '__'.length);
-  const tl = sanitizePart(tool).slice(0, maxTool) || 'tool';
+  const tl = sanitizePart(tool).slice(0, maxTool);
   return `mcp__${srv}__${tl}`;
 }
 
@@ -91,8 +100,18 @@ async function executeMcpTool(
     if (res.isError) {
       return { ok: false, error: { code: 'TOOL_ERROR', message: redact(res.text).slice(0, 2000) } };
     }
-    // (5) Success — redact BEFORE the value reaches the model/trace.
-    return { ok: true, value: redact(res.text) };
+    // (5) Success — redact BEFORE the value reaches the model/trace, then
+    // truncate to a bounded size with a marker.
+    const redacted = redact(res.text);
+    if (redacted.length > MCP_SUCCESS_MAX_CHARS) {
+      return {
+        ok: true,
+        value:
+          redacted.slice(0, MCP_SUCCESS_MAX_CHARS) +
+          `\n... [truncated ${redacted.length - MCP_SUCCESS_MAX_CHARS} chars]`,
+      };
+    }
+    return { ok: true, value: redacted };
   } catch (err) {
     // Tool contract: never throw — always return a ToolResult.
     return { ok: false, error: { code: 'TOOL_ERROR', message: redact(errMessage(err)) } };
@@ -109,6 +128,9 @@ export async function registerMcpServers(
   const errors: { server: string; message: string }[] = [];
   const skipped: { name: string; reason: string }[] = [];
   const clients: McpClientLike[] = [];
+  // Sanitized name → first raw (server, tool) that claimed it, used to tell
+  // sanitization-collisions apart from exact-duplicates (see below).
+  const claimed = new Map<string, { server: string; tool: string }>();
 
   for (const [server, spec] of Object.entries(cfg.servers)) {
     try {
@@ -144,11 +166,35 @@ export async function registerMcpServers(
       clients.push(client);
 
       for (const toolDef of tools) {
+        // Empty raw names (or names that sanitize to empty) are a
+        // misconfiguration — skip as an error, never with a fallback name.
+        if (!server || !toolDef.name || sanitizePart(server) === '' || sanitizePart(toolDef.name) === '') {
+          errors.push({ server, message: `empty-name: server "${server}" tool "${toolDef.name}" sanitizes to an empty name part (skipped)` });
+          continue;
+        }
         const name = sanitizeMcpName(server, toolDef.name);
+        const prior = claimed.get(name);
+        if (prior) {
+          if (prior.server === server && prior.tool === toolDef.name) {
+            skipped.push({ name, reason: 'name-collision' });
+            continue;
+          }
+          // Sanitization-collision: two DIFFERENT raw names map to the same
+          // sanitized name. This is an error (not a silent skip) and names
+          // both raw identities so the conflict is actionable.
+          errors.push({
+            server,
+            message: `name collision: "${prior.server}/${prior.tool}" and "${server}/${toolDef.name}" both sanitize to "${name}" (skipped)`,
+          });
+          continue;
+        }
         if (registry.get(name)) {
+          // Exact-duplicate: the literal name already exists (e.g. a
+          // builtin) — skip quietly, first registration wins.
           skipped.push({ name, reason: 'name-collision' });
           continue;
         }
+        claimed.set(name, { server, tool: toolDef.name });
         // Capture per-tool bindings for the closure.
         const boundSpec = spec;
         const boundDef = toolDef;
@@ -190,10 +236,46 @@ export async function loadAndRegisterMcp(opts: {
   registry: ToolRegistry;
   policy?: PolicyEngine;
   clientFactory?: (name: string, spec: McpServerSpec) => McpClientLike;
+  /**
+   * Consent gate for project-sourced (`.mcp.json`) servers, which can
+   * auto-spawn processes. Global-source servers connect as before; a project
+   * server connects ONLY when this callback returns true. When the callback
+   * is ABSENT, project servers are never auto-connected — each surfaces as
+   * an error (`project server requires approval (skipped)`) so the skip is
+   * visible. Callers may compose this with `McpTrust` (see `./trust.js`) to
+   * remember approvals per spec hash.
+   */
+  approveProjectServer?: (info: { name: string; source: 'global' | 'project' }) => Promise<boolean>;
 }): Promise<McpRegisterResult> {
   try {
     const cfg = loadMcpServers(opts.cwd);
-    return await registerMcpServers(cfg, opts);
+    const filtered: Record<string, McpServerSpec> = {};
+    const gateErrors: { server: string; message: string }[] = [];
+    for (const [name, spec] of Object.entries(cfg.servers)) {
+      if (cfg.sources[name] !== 'project') {
+        filtered[name] = spec;
+        continue;
+      }
+      if (!opts.approveProjectServer) {
+        gateErrors.push({ server: name, message: 'project server requires approval (skipped)' });
+        continue;
+      }
+      let ok = false;
+      try {
+        ok = await opts.approveProjectServer({ name, source: 'project' });
+      } catch (err) {
+        gateErrors.push({ server: name, message: `project server approval error (skipped): ${errMessage(err)}` });
+        continue;
+      }
+      if (!ok) {
+        gateErrors.push({ server: name, message: 'project server not approved (skipped)' });
+        continue;
+      }
+      filtered[name] = spec;
+    }
+    const res = await registerMcpServers({ servers: filtered }, opts);
+    res.errors.unshift(...gateErrors);
+    return res;
   } catch (err) {
     // Never throws — surface load failures as error entries.
     return {

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { buildProjectMap, formatProjectMap, IGNORED_DIRS } from './project-map.js';
+import { buildProjectMap, buildProjectMapCached, formatProjectMap, dirtyMtime, IGNORED_DIRS } from './project-map.js';
 
 let cwd: string;
 
@@ -150,5 +150,36 @@ describe('formatProjectMap', () => {
 describe('IGNORED_DIRS', () => {
   it('includes .klyro', () => {
     expect(IGNORED_DIRS.has('.klyro')).toBe(true);
+  });
+});
+
+describe('dirtyMtime cache fingerprint', () => {
+  it('bumps when the tree changes', async () => {
+    await fs.writeFile(path.join(cwd, 'a.ts'), 'export const a = 1;\n');
+    const before = await dirtyMtime(cwd);
+    // Deterministic bump: push the file's mtime into the future.
+    const future = new Date(Date.now() + 60_000);
+    await fs.utimes(path.join(cwd, 'a.ts'), future, future);
+    const after = await dirtyMtime(cwd);
+    expect(after).toBeGreaterThan(before);
+  });
+
+  it('cached map busts when the dirty tree changes', async () => {
+    const first = await buildProjectMapCached(cwd);
+    expect(first.language).toEqual([]);
+    await fs.mkdir(path.join(cwd, 'src'));
+    await fs.writeFile(path.join(cwd, 'src', 'main.py'), 'x = 1\n');
+    // Deterministic: force a newer mtime so the cache key must change.
+    const future = new Date(Date.now() + 60_000);
+    await fs.utimes(path.join(cwd, 'src', 'main.py'), future, future);
+    const second = await buildProjectMapCached(cwd);
+    expect(second.language).toContain('Python');
+  });
+
+  it('cached map hits when nothing changed', async () => {
+    await fs.writeFile(path.join(cwd, 'package.json'), JSON.stringify({ name: 'demo' }));
+    const first = await buildProjectMapCached(cwd);
+    const second = await buildProjectMapCached(cwd);
+    expect(second.generatedAt).toBe(first.generatedAt);
   });
 });

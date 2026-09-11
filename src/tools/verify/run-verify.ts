@@ -11,6 +11,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
+import { filteredVerifyEnv } from '../../verification/registry.js';
 
 const InputSchema = z.object({
   command: z.string().min(1).describe('Verification command, e.g. "npm test" or "tsc --noEmit"'),
@@ -42,7 +43,8 @@ export const runVerifyTool = defineTool({
     return safe(async () => {
       const cwd = input.cwd ?? ctx.cwd;
       const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-      const env = process.env;
+      // S2: verify commands run with filtered env; servers needing keys must use explicit config.
+      const env = filteredVerifyEnv();
       const start = Date.now();
 
       const child = spawn(input.command, {

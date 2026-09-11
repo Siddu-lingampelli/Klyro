@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { httpChatAdapter } from './provider-adapter.js';
+import { httpChatAdapter, buildChatCompletionsBody } from './provider-adapter.js';
 import type { CallRequest } from './provider-adapter.js';
 
 function sseFetch(body: string): typeof fetch {
@@ -218,5 +218,51 @@ describe('httpChatAdapter tool assembly (P0.1)', () => {
       .map((e) => (e as { argsJson: string }).argsJson)
       .join('');
     expect(joined).toBe('{"a":1}');
+  });
+});
+
+describe('buildChatCompletionsBody systemSuffix', () => {
+  it('leaves the system message untouched when no suffix is present', () => {
+    const body = buildChatCompletionsBody({ ...baseReq, system: 'stable' });
+    expect(body.messages).toContainEqual({ role: 'system', content: 'stable' });
+  });
+
+  it('appends the volatile suffix with a separator (behavior-preserving)', () => {
+    const body = buildChatCompletionsBody({ ...baseReq, system: 'stable', systemSuffix: 'telemetry' });
+    expect(body.messages).toContainEqual({ role: 'system', content: 'stable\n\ntelemetry' });
+  });
+
+  it('sends a suffix-only system message when no stable system exists', () => {
+    const body = buildChatCompletionsBody({ ...baseReq, systemSuffix: 'telemetry' });
+    expect(body.messages).toContainEqual({ role: 'system', content: 'telemetry' });
+  });
+});
+
+describe('httpChatAdapter overflow (REQUEST_TOO_LARGE)', () => {
+  async function collectErr(status: number, bodyText: string) {
+    const fetchImpl = (async () =>
+      new Response(bodyText, { status, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+    const adapter = httpChatAdapter({ baseURL: 'https://x.example', apiKey: '', fetchImpl });
+    const evs = [];
+    for await (const ev of adapter.stream(baseReq)) evs.push(ev);
+    return evs;
+  }
+
+  it('marks 413 responses as REQUEST_TOO_LARGE (not retryable)', async () => {
+    const evs = await collectErr(413, 'request_too_large: context length exceeded');
+    expect(evs).toHaveLength(1);
+    expect(evs[0]).toMatchObject({ kind: 'error', code: 'REQUEST_TOO_LARGE', retryable: false, status: '413' });
+  });
+
+  it('marks request_too_large bodies as REQUEST_TOO_LARGE even on other 4xx', async () => {
+    const evs = await collectErr(400, JSON.stringify({ error: { message: 'request_too_large: prompt is too long', type: 'invalid_request_error' } }));
+    expect(evs).toHaveLength(1);
+    expect(evs[0]).toMatchObject({ kind: 'error', code: 'REQUEST_TOO_LARGE', retryable: false });
+  });
+
+  it('keeps plain 400s as HTTP_400 without the overflow code', async () => {
+    const evs = await collectErr(400, 'bad request: malformed json');
+    expect(evs).toHaveLength(1);
+    expect(evs[0]).toMatchObject({ kind: 'error', code: 'HTTP_400', retryable: false });
   });
 });

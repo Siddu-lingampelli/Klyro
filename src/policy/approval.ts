@@ -34,15 +34,52 @@ export interface ApprovalPrompt {
   ask(req: ApprovalRequest): Promise<ApprovalChoice>;
 }
 
+/**
+ * Sanitize untrusted tool text before showing it in an approval prompt.
+ * Strips ANSI escapes (CSI `ESC[...letter` and OSC `ESC]...BEL`), control
+ * chars except `\n`/`\t`, and truncates to 500 chars with a hidden-count
+ * marker so prompt-injection / terminal-escape payloads can't ride along.
+ */
+export function sanitizeForPrompt(s: string): string {
+  const noAnsi = s
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+    .replace(/\x1b\][^\x07]*\x07/g, '');
+  const clean = noAnsi.replace(/[\x00-\x08\x0b-\x0d\x0e-\x1f\x7f]/g, '');
+  const LIMIT = 500;
+  if (clean.length > LIMIT) {
+    return clean.slice(0, LIMIT) + `…[+${clean.length - LIMIT} hidden]`;
+  }
+  return clean;
+}
+
+/**
+ * Single-key approval mapping shared by the TUI modal (and documented here
+ * so stdin stays consistent): lowercase `a` = session-only, UPPERCASE `A` =
+ * persist to settings. Case MUST be checked before lowercasing — the old TUI
+ * code lowercased first, so `A` silently became session-only `always`.
+ */
+export function approvalChoiceForKey(inputStr: string): ApprovalChoice | 'expand' | 'explain' | null {
+  if (inputStr === 'A') return 'always-persist';
+  const c = inputStr.toLowerCase();
+  if (c === 'y') return 'allow';
+  if (c === 'a') return 'always';
+  if (c === 'd' || c === 'n' || c === 'e') return 'deny';
+  if (c === 'f') return 'expand';
+  if (c === '?') return 'explain';
+  return null;
+}
+
 /** Default prompt backed by readline on stdin/stdout. */
 export class StdinApprovalPrompt implements ApprovalPrompt {
   async ask(req: ApprovalRequest): Promise<ApprovalChoice> {
     if (!input.isTTY) return 'deny';
     const rl = readline.createInterface({ input, output });
     try {
-      process.stdout.write(`\n[approval needed] ${req.toolName}: ${req.summary}\n  reason: ${req.reason}\n  allow? [y/n/a(llow)] `);
-      const ans = (await rl.question('')).trim().toLowerCase();
+      process.stdout.write(`\n[approval needed] ${req.toolName}: ${sanitizeForPrompt(req.summary)}\n  reason: ${sanitizeForPrompt(req.reason)}\n  allow? [y/n/a/A(llow always → settings)] (y=once, n=deny, a=session, A=persist) `);
+      const raw = (await rl.question('')).trim();
+      const ans = raw.toLowerCase();
       if (ans === 'y' || ans === 'yes') return 'allow';
+      if (raw === 'A') return 'always-persist';
       if (ans === 'a' || ans === 'allow') return 'always';
       return 'deny';
     } finally {

@@ -24,6 +24,7 @@ import { runCompletion } from './cli/completion.js';
 import { runUpdate } from './cli/update.js';
 import { runLogin, runLogout } from './cli/auth.js';
 import { readVersion } from './version.js';
+import { verifyAuditChain } from './persistence/audit.js';
 
 const VERSION = readVersion();
 
@@ -69,8 +70,22 @@ async function main(): Promise<void> {
     .option('--no-stream', 'Disable streaming (buffer full response)')
     .option('--show-thinking', 'Show thinking blocks');
 
+  // Unknown commands / unknown options are usage errors (exit 2 per PRD).
+  // Help and version still exit 0; anything else rethrows to the last-resort
+  // handler (exit 1).
+  program.exitOverride((err) => {
+    if (err.code === 'commander.unknownCommand' || err.code === 'commander.unknownOption') {
+      process.stderr.write(`klyro: ${err.message}\n`);
+      process.exit(2);
+    }
+    if (err.code === 'commander.helpDisplayed' || err.code === 'commander.version') {
+      process.exit(0);
+    }
+    throw err;
+  });
+
   // Handle global flags before any command runs
-  program.hook('preAction', (thisCommand) => {
+  program.hook('preAction', async (thisCommand) => {
     const opts = thisCommand.optsWithGlobals<{ cwd?: string; config?: string; debug?: boolean; verbose?: boolean; quiet?: boolean; json?: boolean; yes?: boolean; color?: boolean }>();
     if (opts.cwd) {
       try {
@@ -80,6 +95,12 @@ async function main(): Promise<void> {
         process.exit(2);
       }
     }
+    // Load <cwd>/.env globally (after chdir) so KLYRO_* vars resolve for
+    // every command. Never throws; explicit env wins (no-clobber).
+    try {
+      const { loadDotenv } = await import('./cli/dotenv.js');
+      loadDotenv(process.cwd());
+    } catch { /* ignore */ }
     if (opts.config) process.env.KLYRO_CONFIG = opts.config;
     if (opts.debug) process.env.KLYRO_LOG_LEVEL = 'debug';
     if (opts.verbose) process.env.KLYRO_LOG_LEVEL = 'debug';
@@ -272,6 +293,7 @@ async function main(): Promise<void> {
     .option('--resume-session <id>', 'Resume from a persisted session (Level 9) by id prefix')
     .option('--verify', 'Enable verification after edits (Level 8, default: enabled)')
     .option('--verify-command <cmd>', 'Custom verification command (default: auto-detected)')
+    .option('--verify-mode <mode>', 'Verification mode: strict (default), advisory, off')
     .option('--max-repairs <n>', 'Max autonomous repair attempts (default 3)', (v) => parsePositiveInt('--max-repairs', v))
     .option('--persist', 'Enable session persistence (Level 9, default: enabled)')
     .option('--require-verify', 'Fail with exit 8 if no verification passed after edits (6.5)')
@@ -281,7 +303,7 @@ async function main(): Promise<void> {
       model?: string; maxSteps?: number; maxTokens?: number; temperature?: number;
       timeout?: number; baseUrl?: string; apiKey?: string;
       output?: string; dryRun?: boolean; provider?: string; resume?: string;
-      resumeSession?: string; verify?: boolean; verifyCommand?: string; maxRepairs?: number; persist?: boolean; requireVerify?: boolean;
+      resumeSession?: string; verify?: boolean; verifyCommand?: string; verifyMode?: string; maxRepairs?: number; persist?: boolean; requireVerify?: boolean;
       agent?: string; maxDepth?: number;
     }) => {
       const model = opts.model ?? process.env.KLYRO_MODEL;
@@ -292,6 +314,11 @@ async function main(): Promise<void> {
       const output = (opts.output ?? 'human') as 'human' | 'json' | 'silent';
       if (output !== 'human' && output !== 'json' && output !== 'silent') {
         process.stderr.write(`klyro: invalid --output: ${output} (expected human|json|silent)\n`);
+        process.exit(2);
+      }
+      const verifyMode = opts.verifyMode ?? 'strict';
+      if (verifyMode !== 'strict' && verifyMode !== 'advisory' && verifyMode !== 'off') {
+        process.stderr.write(`klyro: invalid --verify-mode: ${opts.verifyMode} (expected strict|advisory|off)\n`);
         process.exit(2);
       }
       // Provider validation is handled inside runOnce (single source of truth)
@@ -313,6 +340,7 @@ async function main(): Promise<void> {
           sessionId: opts.resumeSession,
           verify: opts.verify,
           verifyCommand: opts.verifyCommand,
+          verifyMode: verifyMode as import('./agent/runtime.js').VerifyMode,
           maxRepairAttempts: opts.maxRepairs,
           persist: opts.persist,
           requireVerify: !!opts.requireVerify,
@@ -550,17 +578,72 @@ async function main(): Promise<void> {
 
   // 10.1 — MCP
   const mcp = program.command('mcp').description('MCP client/server (10.1)');
-  mcp.command('list').description('List MCP servers').action(async () => { process.stdout.write('mcp servers: (stub) github filesystem — use .mcp.json\n'); });
+  mcp.command('list').description('List MCP servers').action(async () => {
+    const { loadMcpServers } = await import('./mcp/config.js');
+    const cfg = loadMcpServers(process.cwd());
+    const names = Object.keys(cfg.servers);
+    if (names.length === 0) {
+      process.stdout.write('mcp servers: none configured (use .mcp.json)\n');
+      return;
+    }
+    for (const name of names) {
+      const spec = cfg.servers[name];
+      const source = cfg.sources[name] ?? 'unknown';
+      process.stdout.write(`${name} source=${source}${spec?.disabled ? ' disabled' : ''}\n`);
+    }
+  });
   mcp.command('add <name> <url>').description('Add MCP server').action(async (name: string) => { process.stdout.write(`added mcp ${name} (stub)\n`); });
   mcp.command('serve').description('Serve as MCP server').action(async () => { process.stdout.write('klyro mcp serve — exposing tools (stub)\n'); });
 
   // 10.2 — Hooks / agents
   program.command('hooks').description('List hooks (10.2)').action(async () => { process.stdout.write('hooks: SessionStart UserPromptSubmit PreToolUse PostToolUse (stub)\n'); });
-  program.command('agents').description('List agents (10.2)').action(async () => { process.stdout.write('agents: explorer implementer tester reviewer (stub)\n'); });
+  program.command('agents [name]').description('List agents (10.2) or show one agent definition').action(async (name?: string) => {
+    const { BUILTIN_AGENTS } = await import('./agent/orchestrator.js');
+    if (!name) {
+      for (const a of BUILTIN_AGENTS) process.stdout.write(`${a.id} — ${a.description}\n`);
+      return;
+    }
+    const def = BUILTIN_AGENTS.find((a) => a.id === name);
+    if (!def) {
+      process.stderr.write(`klyro: unknown agent: ${name} (known: ${BUILTIN_AGENTS.map((a) => a.id).join(', ')})\n`);
+      process.exit(2);
+    }
+    const tools = def.allowedTools ?? ['<inherited: all parent tools>'];
+    const lines = [
+      `agent: ${def.id}`,
+      `description: ${def.description}`,
+      `tools (${tools.length}): ${tools.join(', ')}`,
+      `readonly: ${def.readonly ?? false}`,
+      `canSpawn: ${def.canSpawn ?? false}`,
+      `model: ${def.model ?? '<session default>'}`,
+      `maxSteps: ${def.maxSteps ?? '<default>'}`,
+      `maxTokens: ${def.maxTokens ?? '<default>'}`,
+    ];
+    process.stdout.write(lines.join('\n') + '\n');
+  });
 
   // 10.3 — Web / git workflows / SDK
   program.command('commit').description('Create commit (10.3)').action(async () => { process.stdout.write('commit — conventional message (stub, use /commit)\n'); });
-  program.command('audit').description('Audit log (13.4)').action(async () => { process.stdout.write('audit — hash-chained JSONL (stub)\n'); });
+  program.command('audit [session]').description('Verify audit chain (13.4)').action(async (session?: string) => {
+    if (!session) {
+      process.stderr.write('klyro: audit requires a session id (usage: klyro audit <session>)\n');
+      process.exit(2);
+    }
+    try {
+      const { getDefaultSessionsDir } = await import('./persistence/session.js');
+      const res = await verifyAuditChain(getDefaultSessionsDir(), session);
+      if (res.ok) {
+        process.stdout.write(`audit ok: ${res.events} events verified\n`);
+        process.exit(0);
+      }
+      process.stderr.write(`klyro: audit failed: ${res.error ?? 'chain broken'}\n`);
+      process.exit(1);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`klyro: audit failed: ${msg}\n`);
+      process.exit(1);
+    }
+  });
 
   // 10.4 — Benchmark parity (10.5)
   program.command('benchmark').description('Run benchmark (10.5)').action(async () => {

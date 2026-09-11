@@ -108,6 +108,39 @@ export function primaryVerifyCommand(cwd: string): string | null {
   return v[0]?.command ?? null;
 }
 
+// S2 — filtered env for ALL spawned verify commands.
+//
+// Sibling `tools/shell/shell-exec.ts` owns an equivalent `filteredEnv` but
+// does not export it, so this mirrors that filter (allowlisted prefixes +
+// exact keys, secret-ish names stripped, preload vectors deleted) instead of
+// importing sibling internals.
+const VERIFY_ENV_PREFIXES = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'NODE_', 'NPM_', 'PNPM_', 'YARN_'];
+// Exact keys: sibling's PWD/TMPDIR/TEMP plus the Windows OS vars a spawned
+// shell needs to start (COMSPEC/SystemRoot/PATHEXT/...) — none carry secrets.
+const VERIFY_ENV_EXACT = new Set([
+  'PWD', 'TMPDIR', 'TEMP', 'TMP',
+  'SystemRoot', 'windir', 'COMSPEC', 'PATHEXT', 'OS',
+  'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA',
+]);
+const VERIFY_ENV_SECRET_RE = /SECRET|TOKEN|KEY/i;
+
+/** Filtered env for verify children: allowlist + secret strip + preload-vector delete. */
+export function filteredVerifyEnv(): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined) continue;
+    if (VERIFY_ENV_SECRET_RE.test(k)) continue;
+    if (VERIFY_ENV_PREFIXES.some((p) => k.startsWith(p)) || VERIFY_ENV_EXACT.has(k)) {
+      out[k] = v;
+    }
+  }
+  delete out.NODE_OPTIONS;
+  delete out.LD_PRELOAD;
+  delete out.LD_LIBRARY_PATH;
+  out.PATH = process.env.PATH;
+  return out;
+}
+
 export interface VerifySettings {
   commands?: string[];
   onEdit?: boolean;

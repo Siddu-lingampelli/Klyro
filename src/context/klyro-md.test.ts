@@ -15,6 +15,20 @@ describe('klyro-md', () => {
     expect(md).toContain('hello');
   });
 
+  it('loads CLAUDE.md as an alias', async () => {
+    await fs.writeFile(path.join(tmp, 'CLAUDE.md'), '# migrated', 'utf-8');
+    const md = await loadKlyroMd(tmp);
+    expect(md).toContain('migrated');
+  });
+
+  it('prefers KLYRO.md over CLAUDE.md when both exist', async () => {
+    await fs.writeFile(path.join(tmp, 'KLYRO.md'), '# klyro wins', 'utf-8');
+    await fs.writeFile(path.join(tmp, 'CLAUDE.md'), '# lose', 'utf-8');
+    const md = await loadKlyroMd(tmp);
+    expect(md).toContain('klyro wins');
+    expect(md).toContain('lose'); // both loaded (no single-file rejection)
+  });
+
   it('handles @import', async () => {
     await fs.writeFile(path.join(tmp, 'KLYRO.md'), '@import other.md', 'utf-8');
     await fs.writeFile(path.join(tmp, 'other.md'), 'imported', 'utf-8');

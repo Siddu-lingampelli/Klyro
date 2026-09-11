@@ -3,6 +3,9 @@
  * ToolRegistry + PolicyEngine. No subprocesses, no network.
  */
 import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { z } from 'zod';
 import { ToolRegistry } from '../tools/registry.js';
 import { defineTool, type ToolContext } from '../tools/types.js';
@@ -57,8 +60,8 @@ describe('sanitizeMcpName', () => {
     expect(name).toBe(`mcp__${'a'.repeat(20)}__${'b'.repeat(37)}`);
   });
 
-  it('falls back on empty parts', () => {
-    expect(sanitizeMcpName('', '')).toBe('mcp__server__tool');
+  it('has no fallbacks for empty parts (registration skips those as errors)', () => {
+    expect(sanitizeMcpName('', '')).toBe('mcp____');
   });
 });
 
@@ -261,6 +264,152 @@ describe('loadAndRegisterMcp', () => {
     expect(Array.isArray(res.errors)).toBe(true);
     expect(Array.isArray(res.skipped)).toBe(true);
     expect(typeof res.closeAll).toBe('function');
+    await res.closeAll();
+  });
+});
+
+function mkProjectDir(servers: Record<string, unknown>): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-mcp-test-'));
+  fs.writeFileSync(path.join(dir, '.mcp.json'), JSON.stringify({ mcpServers: servers }), 'utf-8');
+  return dir;
+}
+
+describe('sanitization collisions and empty names', () => {
+  it('two different raw names mapping to one sanitized name is an error naming both', async () => {
+    const registry = new ToolRegistry();
+    const res = await registerMcpServers(
+      {
+        servers: {
+          'a-b': spec({ allowTools: ['x'] }),
+          'a_b': spec({ allowTools: ['x'] }),
+        },
+      },
+      {
+        registry,
+        clientFactory: () => new FakeClient([{ name: 'x' }]),
+      },
+    );
+    // First raw name wins; the second is an error, never a silent skip.
+    expect(res.registered).toEqual(['mcp__a_b__x']);
+    expect(res.skipped).toEqual([]);
+    expect(res.errors).toHaveLength(1);
+    expect(res.errors[0]?.server).toBe('a_b');
+    expect(res.errors[0]?.message).toContain('a-b/x');
+    expect(res.errors[0]?.message).toContain('a_b/x');
+    expect(res.errors[0]?.message).toContain('mcp__a_b__x');
+    await res.closeAll();
+  });
+
+  it('empty tool names are skipped as empty-name errors, not fallback names', async () => {
+    const registry = new ToolRegistry();
+    const res = await registerMcpServers(
+      { servers: { srv: spec({ allowTools: [''] }) } },
+      {
+        registry,
+        clientFactory: () => new FakeClient([{ name: '' }]),
+      },
+    );
+    expect(res.registered).toEqual([]);
+    expect(res.errors).toHaveLength(1);
+    expect(res.errors[0]?.server).toBe('srv');
+    expect(res.errors[0]?.message).toContain('empty-name');
+    await res.closeAll();
+  });
+});
+
+describe('success truncation', () => {
+  it('redacts first, then caps at 12000 chars with a truncated marker', async () => {
+    const secret = 'sk-proj-QQQQQQQQQQQQQQQQQQQQQQQQ';
+    const fake = new FakeClient([{ name: 'big' }], {
+      handler: () => ({ text: `prefix ${secret} ${'z'.repeat(13000)}`, isError: false, raw: {} }),
+    });
+    const registry = new ToolRegistry();
+    await registerMcpServers(
+      { servers: { srv: spec({ allowTools: ['big'] }) } },
+      { registry, clientFactory: () => fake },
+    );
+    const out = await registry.execute('mcp__srv__big', {}, ctx);
+    expect(out.ok).toBe(true);
+    if (out.ok) {
+      const value = String(out.value);
+      expect(value).not.toContain(secret);
+      expect(value).toContain('[REDACTED]');
+      expect(value).toContain('[truncated ');
+      expect(value.slice(0, 12000)).not.toContain('[truncated ');
+      expect(value.length).toBeLessThanOrEqual(12000 + 64);
+    }
+  });
+
+  it('short values pass through unmarked', async () => {
+    const fake = new FakeClient([{ name: 'small' }], {
+      handler: () => ({ text: 'tiny', isError: false, raw: {} }),
+    });
+    const registry = new ToolRegistry();
+    await registerMcpServers(
+      { servers: { srv: spec({ allowTools: ['small'] }) } },
+      { registry, clientFactory: () => fake },
+    );
+    const out = await registry.execute('mcp__srv__small', {}, ctx);
+    expect(out).toEqual({ ok: true, value: 'tiny' });
+  });
+});
+
+describe('loadAndRegisterMcp project consent', () => {
+  const projSpec = { command: 'fake-cmd', policy: { allowTools: ['t'] } };
+
+  it('skips project servers when no approval callback is given (never auto-connects)', async () => {
+    const dir = mkProjectDir({ proj1: projSpec });
+    const registry = new ToolRegistry();
+    const seen: string[] = [];
+    const res = await loadAndRegisterMcp({
+      cwd: dir,
+      registry,
+      clientFactory: (name) => {
+        seen.push(name);
+        return new FakeClient([{ name: 't' }]);
+      },
+    });
+    expect(seen).not.toContain('proj1');
+    expect(res.registered).not.toContain('mcp__proj1__t');
+    expect(res.errors).toContainEqual({ server: 'proj1', message: 'project server requires approval (skipped)' });
+    await res.closeAll();
+  });
+
+  it('connects project servers approved by the callback', async () => {
+    const dir = mkProjectDir({ proj1: projSpec });
+    const registry = new ToolRegistry();
+    const approvals: Array<{ name: string; source: 'global' | 'project' }> = [];
+    const res = await loadAndRegisterMcp({
+      cwd: dir,
+      registry,
+      clientFactory: () => new FakeClient([{ name: 't' }]),
+      approveProjectServer: async (info) => {
+        approvals.push(info);
+        return true;
+      },
+    });
+    expect(approvals).toEqual([{ name: 'proj1', source: 'project' }]);
+    expect(res.registered).toContain('mcp__proj1__t');
+    expect(res.errors.filter((e) => e.server === 'proj1')).toEqual([]);
+    await res.closeAll();
+  });
+
+  it('skips project servers declined by the callback', async () => {
+    const dir = mkProjectDir({ proj1: projSpec });
+    const registry = new ToolRegistry();
+    const seen: string[] = [];
+    const res = await loadAndRegisterMcp({
+      cwd: dir,
+      registry,
+      clientFactory: (name) => {
+        seen.push(name);
+        return new FakeClient([{ name: 't' }]);
+      },
+      approveProjectServer: async () => false,
+    });
+    expect(seen).not.toContain('proj1');
+    expect(res.registered).not.toContain('mcp__proj1__t');
+    expect(res.errors).toContainEqual({ server: 'proj1', message: 'project server not approved (skipped)' });
     await res.closeAll();
   });
 });

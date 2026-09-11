@@ -1,13 +1,19 @@
 /**
  * 7.3 — Import graph (cached) — powers L6 scoped tests + imports_of / importers_of
  * Parses TS/JS/Py/Go imports via regex, builds adjacency, caches by mtime.
+ *
+ * Freshness: the cached graph stores per-file {mtimeMs, size} alongside it.
+ * On a cache hit every file in the graph is re-statted (stat-only, bounded
+ * to files already in the graph) — any mtime/size mismatch rebuilds.
  */
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
 export interface ImportGraph { nodes: Set<string>; edges: Map<string, Set<string>>; mtime: number; }
 
-let cache: { cwd: string; graph: ImportGraph } | null = null;
+interface FileStat { mtimeMs: number; size: number; }
+
+let cache: { cwd: string; graph: ImportGraph; stats: Map<string, FileStat> } | null = null;
 
 async function parseImports(file: string, content: string): Promise<string[]> {
   const ext = path.extname(file);
@@ -23,9 +29,31 @@ async function parseImports(file: string, content: string): Promise<string[]> {
   return out;
 }
 
+/** Re-stat every file in the cached graph; true when all stats still match. */
+async function statsStillMatch(cwd: string, stats: Map<string, FileStat>): Promise<boolean> {
+  for (const [rel, prev] of stats) {
+    try {
+      const s = await fs.stat(path.join(cwd, rel));
+      if (s.mtimeMs !== prev.mtimeMs || s.size !== prev.size) return false;
+    } catch {
+      return false; // deleted (or unreadable) — rebuild
+    }
+  }
+  return true;
+}
+
+/** Invalidate the import-graph cache (tests + callers that mutate the tree). */
+export function clearImportGraphCache(): void {
+  cache = null;
+}
+
 export async function buildImportGraph(cwd: string): Promise<ImportGraph> {
-  if (cache && cache.cwd === cwd && Date.now() - cache.graph.mtime < 60_000) return cache.graph;
+  if (cache && cache.cwd === cwd && Date.now() - cache.graph.mtime < 60_000) {
+    if (await statsStillMatch(cwd, cache.stats)) return cache.graph;
+    cache = null;
+  }
   const graph: ImportGraph = { nodes: new Set(), edges: new Map(), mtime: Date.now() };
+  const stats = new Map<string, FileStat>();
   async function walk(dir: string, depth = 0) {
     if (depth > 6) return;
     let entries: import('node:fs').Dirent[];
@@ -38,6 +66,8 @@ export async function buildImportGraph(cwd: string): Promise<ImportGraph> {
         const rel = path.relative(cwd, full).replace(/\\/g,'/');
         graph.nodes.add(rel);
         try {
+          const st = await fs.stat(full);
+          stats.set(rel, { mtimeMs: st.mtimeMs, size: st.size });
           const txt = await fs.readFile(full, 'utf-8');
           const imps = await parseImports(rel, txt);
           for (const imp of imps) {
@@ -50,7 +80,7 @@ export async function buildImportGraph(cwd: string): Promise<ImportGraph> {
     }
   }
   await walk(cwd);
-  cache = { cwd, graph };
+  cache = { cwd, graph, stats };
   return graph;
 }
 

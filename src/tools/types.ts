@@ -48,6 +48,10 @@ export interface ToolContext {
   agentAllowedTools?: ReadonlySet<string> | null;
   /** Model override active for the current agent. */
   agentModel?: string;
+  /** Repair-guard: when denyTestEdits is true, tools must refuse test-file edits. */
+  repairGuard?: { denyTestEdits: boolean };
+  /** Allowed target paths for this agent. When present, file tools deny targets outside it. */
+  agentAllowedPaths?: readonly string[];
 }
 
 /**

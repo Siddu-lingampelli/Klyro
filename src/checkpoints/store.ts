@@ -10,6 +10,14 @@ function ckptDir(cwd: string): string {
   return path.join(cwd, '.klyro', 'checkpoints');
 }
 
+/** Best-effort fsync of a just-written file (crash safety). */
+async function fsyncFile(p: string): Promise<void> {
+  try {
+    const fh = await fs.open(p, 'r+');
+    try { await fh.sync(); } finally { await fh.close(); }
+  } catch { /* ignore on Windows */ }
+}
+
 /**
  * Resolve a checkpoint file list entry inside cwd. Returns null for anything
  * escaping the project (no arbitrary read/write outside cwd, via either the
@@ -40,17 +48,21 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
       if (!out) continue;
       await fs.mkdir(path.dirname(out), { recursive: true });
       await fs.writeFile(out, data);
+      await fsyncFile(out);
       kept.push(rel);
     } catch (e: unknown) {
       // Record deletions so undo() can restore the deleted state.
       if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') missing.push(f);
     }
   }
-  // Save meta
+  // Save meta (fsync before the checkpoint is visible — mirrors the
+  // SessionStore.writeIndex atomic pattern).
+  const metaPath = path.join(dest, '.meta.json');
   await fs.writeFile(
-    path.join(dest, '.meta.json'),
+    metaPath,
     JSON.stringify({ id, files: kept, missing, ts: Date.now() }, null, 2),
   );
+  await fsyncFile(metaPath);
   // Best-effort last.diff for the repair guard (guardRepair reads it).
   try {
     const { spawn } = await import('node:child_process');
@@ -82,7 +94,14 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
         resolve('');
       });
     });
-    if (diffText) await fs.writeFile(path.join(dir, 'last.diff'), diffText, 'utf-8');
+    if (diffText) {
+      await fs.writeFile(path.join(dir, 'last.diff'), diffText, 'utf-8');
+      // Per-checkpoint diff file (best-effort); the repair guard keeps
+      // reading last.diff, so its behavior is unchanged.
+      try {
+        await fs.writeFile(path.join(dir, `${id}.diff`), diffText, 'utf-8');
+      } catch { /* best-effort only */ }
+    }
   } catch { /* best-effort only */ }
   return id;
 }
@@ -91,8 +110,9 @@ export async function listCheckpoints(cwd: string): Promise<string[]> {
   const dir = ckptDir(cwd);
   try {
     const entries = await fs.readdir(dir);
-    // last.diff is a guard artifact, not a checkpoint (must never be an undo target).
-    return entries.filter((e) => !e.startsWith('.') && e !== 'last.diff').sort();
+    // last.diff is a guard artifact and <id>.diff files are per-checkpoint
+    // diffs — neither is a checkpoint (must never be an undo target).
+    return entries.filter((e) => !e.startsWith('.') && e !== 'last.diff' && !e.endsWith('.diff')).sort();
   } catch { return []; }
 }
 

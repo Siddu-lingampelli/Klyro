@@ -12,9 +12,11 @@
 import { spawn, spawnSync } from 'node:child_process';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as fsp from 'node:fs/promises';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { resolveWithinCwd } from '../../policy/path-guard.js';
+import { sandboxCommand, detectSandbox } from './sandbox.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
 
 const InputSchema = z.object({
@@ -43,7 +45,7 @@ export function resetPersistentCwd(): void {
 
 // Filtered env — only safe vars, secrets stripped
 const ALLOWED_ENV_PREFIXES = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'NODE_', 'NPM_', 'PNPM_', 'YARN_'];
-function filteredEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
+export function filteredEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (k.startsWith('KLYRO_') && k.includes('API_KEY')) continue;
@@ -98,7 +100,31 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /;\s*rm\s+-rf/, reason: 'chained rm -rf' },
   { pattern: /&&\s*rm\s+-rf/, reason: 'chained rm -rf' },
   { pattern: /\|\|\s*rm\s+-rf/, reason: 'chained rm -rf' },
+  // Exfiltration denylist (mirrors policy engine shellDenyRule).
+  { pattern: /\bcurl\b.*(?:\s-d\b|\s--data(?:-binary|-urlencode)?\b|\s--upload-file\b)/i, reason: 'exfiltration: curl with --data/-d/--upload-file denied' },
+  { pattern: /\bwget\b.*--post-(data|file)\b/i, reason: 'exfiltration: wget --post-data/--post-file denied' },
+  { pattern: /\b(powershell|pwsh)\b.*-e(nc|ncodedcommand)\b/i, reason: 'exfiltration: powershell -enc denied' },
+  { pattern: /\bInvoke-Expression\b/i, reason: 'exfiltration: Invoke-Expression denied' },
+  { pattern: /\biex\s*\(/i, reason: 'exfiltration: iex( denied' },
+  { pattern: /\bcertutil\b.*-urlcache\b/i, reason: 'exfiltration: certutil -urlcache denied' },
+  { pattern: /\bbitsadmin\b.*\/transfer\b/i, reason: 'exfiltration: bitsadmin /transfer denied' },
+  // .env writes via tee / PowerShell (mirrors policy engine .env guard).
+  { pattern: /\|\s*tee\b[^\n]*\.env/i, reason: 'write to .env via tee denied' },
+  { pattern: /\b(Set-Content|Out-File)\b[^\n]*\.env/i, reason: 'write to .env via Set-Content/Out-File denied' },
+  // Upload-form exfiltration (mirrors policy engine shellDenyRule).
+  { pattern: /\bcurl\b.*(?:\s-F\b|\s--form\b)/i, reason: 'exfiltration: curl -F/--form denied' },
+  { pattern: /\bwget\b.*(?:\s--method=POST\b|\s--body-data\b)/i, reason: 'exfiltration: wget --method=POST/--body-data denied' },
+  { pattern: /\bInvoke-RestMethod\b/i, reason: 'exfiltration: Invoke-RestMethod denied' },
+  { pattern: /\bStart-BitsTransfer\b/i, reason: 'exfiltration: Start-BitsTransfer denied' },
 ];
+
+/**
+ * Repair-guard mirror: heredoc/redirect writes to test paths, or test-path
+ * rewrites via sed/python/perl/ruby/node/git (e.g. `> x.test.ts`,
+ * `<<EOF > x.test.ts`, `sed -i`, `git apply`). Only enforced when
+ * `ctx.repairGuard?.denyTestEdits` is set.
+ */
+const REPAIR_GUARD_SHELL_RE = />+\s*['"]?[^'"\s]*test[^'"\s]*|\b(sed|python|perl|ruby|node|git)\b[^\n]*test[^'"\s]*/i;
 
 /**
  * Shared dangerous-command check (also used by background shells).
@@ -111,6 +137,15 @@ export function findBlockedReason(command: string): string | null {
     if (pattern.test(command)) return reason;
   }
   return null;
+}
+
+/** Resolve symlinks on both base and target, then enforce containment. */
+async function realContainedCwd(ctxCwd: string, resolved: string): Promise<string> {
+  const realBase = await fsp.realpath(ctxCwd).catch(() => path.resolve(ctxCwd));
+  const realTarget = await fsp.realpath(resolved).catch(() => resolved);
+  const rel = path.relative(realBase, realTarget);
+  if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return realTarget;
+  throw Object.assign(new Error(`Path escapes cwd via symlink: ${resolved}`), { code: TOOL_ERROR_CODES.PATH_ESCAPE });
 }
 
 export interface ShellOutput {
@@ -135,6 +170,10 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
   renderResult: (output) => `exit ${output.exitCode} (${output.durationMs}ms${output.timedOut ? ' timedOut' : ''})`,
   execute: async (input, ctx) => {
     return safe(async () => {
+      // Repair-guard mirror (denyTestEdits): refuse shell writes to test paths.
+      if (ctx.repairGuard?.denyTestEdits && REPAIR_GUARD_SHELL_RE.test(input.command)) {
+        throw Object.assign(new Error('repair-guard: test edits via shell denied (denyTestEdits)'), { code: 'POLICY_DENIED' });
+      }
       // Interactive detection
       for (const pat of INTERACTIVE_PATTERNS) {
         if (pat.test(input.command)) {
@@ -149,6 +188,9 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
       let cwd = persistentCwd ?? ctx.cwd;
       if (input.cwd) {
         cwd = resolveWithinCwd(ctx.cwd, input.cwd).resolved;
+        // Resolve symlinks for the effective cwd before the containment
+        // check, so a symlinked subdir can't escape the workspace.
+        cwd = await realContainedCwd(ctx.cwd, cwd);
         persistentCwd = cwd;
       } else if (input.command.trim().startsWith('cd ')) {
         const m = /^\s*cd\s+(.+?)\s*(?:&&|;|$)/.exec(input.command);
@@ -156,8 +198,16 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
           try {
             const target = m[1].replace(/^["']|["']$/g, '');
             const resolved = resolveWithinCwd(cwd, target).resolved;
-            persistentCwd = resolved;
+            persistentCwd = await realContainedCwd(ctx.cwd, resolved);
           } catch { /* ignore */ }
+        }
+      } else {
+        // Even without an explicit cwd, normalize symlinks on the
+        // effective cwd so containment holds when ctx.cwd is symlinked.
+        try {
+          cwd = await realContainedCwd(ctx.cwd, cwd);
+        } catch {
+          throw Object.assign(new Error(`Working directory escapes workspace (POLICY_DENIED)`), { code: TOOL_ERROR_CODES.PATH_ESCAPE });
         }
       }
       const timeoutMs = Math.min(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
@@ -166,15 +216,36 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
 
       // Detached on POSIX so timeout kills the whole process GROUP
       // (child.kill alone orphans grandchildren holding the pipes).
-      const child = spawn(input.command, {
-        cwd,
-        env: env as NodeJS.ProcessEnv,
-        shell: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-        signal: ctx.signal,
-        detached: process.platform !== 'win32',
-      });
+      // G1-2 — sandbox is ON BY DEFAULT whenever a backend is available
+      // (bwrap, Linux). Explicit opt-out with KLYRO_SANDBOX=0. Sandboxed calls
+      // are OFFLINE by default; KLYRO_SANDBOX_NET=1 re-enables the network.
+      const sandboxBackend = detectSandbox();
+      const useSandbox = sandboxBackend.active && process.env.KLYRO_SANDBOX !== '0';
+      const sandboxWrap = useSandbox
+        ? sandboxCommand('/bin/sh', ['-c', input.command], {
+            cwd,
+            allowNetwork: process.env.KLYRO_SANDBOX_NET === '1',
+          })
+        : undefined;
+      const child = sandboxWrap
+        ? spawn(sandboxWrap.cmd, sandboxWrap.args, {
+            cwd,
+            env: env as NodeJS.ProcessEnv,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+            signal: ctx.signal,
+            detached: process.platform !== 'win32',
+            shell: false,
+          })
+        : spawn(input.command, {
+            cwd,
+            env: env as NodeJS.ProcessEnv,
+            shell: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+            signal: ctx.signal,
+            detached: process.platform !== 'win32',
+          });
 
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];

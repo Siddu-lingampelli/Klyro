@@ -12,15 +12,18 @@ import * as path from 'node:path';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout, stderr } from 'node:process';
 import { httpChatAdapter } from '../agent/provider-adapter.js';
+import type { VerifyMode } from '../agent/runtime.js';
 import { anthropicAdapter } from '../agent/anthropic-adapter.js';
 import { retryingAdapter } from '../agent/retry.js';
 import { globalBus } from '../events/bus.js';
 import { run } from '../agent/runtime.js';
+import type { SystemPromptFn } from '../agent/runtime.js';
 import type { Message } from '../agent/message.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, clonePolicyConfig, PolicyEngine } from '../policy/engine.js';
 import { DenyAllApprovalPrompt } from '../policy/approval.js';
 import { buildLevel6Context } from '../context/level6.js';
+import { memoryBlock } from '../context/memory.js';
 import { getDefaultSessionStore, resolveSessionId } from '../persistence/session.js';
 import * as fs from 'node:fs';
 
@@ -31,7 +34,7 @@ export interface RunCliOptions {
   maxSteps?: number;
   maxTokens?: number;
   temperature?: number;
-  systemPrompt?: (ctx: { cwd: string; telemetry?: string }) => string;
+  systemPrompt?: SystemPromptFn;
   baseUrl?: string;
   apiKey?: string;
   timeoutMs?: number;
@@ -73,6 +76,9 @@ export interface RunCliOptions {
   maxRepairAttempts?: number;
   verifyTimeoutMs?: number;
   requireVerify?: boolean;
+  /** Verification mode: strict (default) runs the full repair pipeline;
+   * advisory reports once without repairs; off skips verification. */
+  verifyMode?: VerifyMode;
   /** Level 9 — persistence */
   persist?: boolean;
   sessionId?: string;
@@ -161,15 +167,28 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   } catch {
     /* ignore — engine defaults stand */
   }
-  // Best-effort MCP tools: never fatal, never prompts. src/mcp/registry.ts
-  // lands from a sibling agent — the lazy import keeps runtime + builds green
-  // until then (import failure is caught below). @ts-ignore is used instead
-  // of @ts-expect-error so it stays inert after the sibling file lands.
+  // Best-effort MCP tools: never fatal, never prompts (headless cannot
+  // approve). Project-sourced servers auto-connect ONLY when their exact
+  // spec hash is already in the McpTrust store (e.g. approved in a prior
+  // REPL session); unknown specs are skipped with a warning.
   let closeMcp: (() => Promise<void>) | undefined;
   try {
-    // @ts-ignore — sibling-owned module may not exist yet
     const { loadAndRegisterMcp } = await import('../mcp/registry.js');
-    const mcp = await loadAndRegisterMcp({ cwd: opts.cwd, registry, policy });
+    const { McpTrust, hashSpec } = await import('../mcp/trust.js');
+    const { loadMcpServers } = await import('../mcp/config.js');
+    const mcpTrust = new McpTrust();
+    const mcpSpecs = loadMcpServers(opts.cwd).servers;
+    const mcp = await loadAndRegisterMcp({
+      cwd: opts.cwd,
+      registry,
+      policy,
+      approveProjectServer: async ({ name }: { name: string }) => {
+        const spec = mcpSpecs[name];
+        if (spec && mcpTrust.isTrusted(name, hashSpec(spec))) return true;
+        stderr.write(`klyro: mcp project server "${name}" not in trust store (skipped — headless cannot prompt)\n`);
+        return false;
+      },
+    });
     for (const e of mcp.errors) stderr.write(`klyro: mcp ${e.server}: ${e.message}\n`);
     if (mcp.registered.length > 0 && output === 'human') {
       stderr.write(`klyro: mcp tools: ${mcp.registered.join(', ')}\n`);
@@ -240,6 +259,7 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
         maxRepairAttempts: opts.maxRepairAttempts ?? 3,
         timeoutMs: opts.verifyTimeoutMs,
         requireVerify: opts.requireVerify,
+        ...(opts.verifyMode ? { mode: opts.verifyMode } : {}),
       };
 
   let result: Awaited<ReturnType<typeof run>>;
@@ -347,6 +367,7 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     const statusMap: Record<string, import('../persistence/store.js').SessionStatus> = {
       complete: 'complete',
       max_steps: 'max_steps',
+      limit: 'max_steps',
       aborted: 'aborted',
       no_final: 'aborted',
       verify_failed: 'verify_failed',
@@ -366,19 +387,29 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   if (result.status === 'max_steps') {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: result.status, steps: result.steps }) + '\n');
     else stderr.write(`klyro: hit max steps (${result.steps}); consider raising --max-steps\n`);
-    return 3;
+    return 7;
+  }
+  if (result.status === 'limit') {
+    if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: result.status, steps: result.steps, text: result.finalText }) + '\n');
+    else stderr.write(`klyro: stopped early: ${result.finalText || result.status} (after ${result.steps} steps)\n`);
+    return 7;
+  }
+  if (result.status === 'stuck') {
+    if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: result.status, steps: result.steps }) + '\n');
+    else stderr.write(`klyro: stuck — repeated the same action with no progress; aborting after ${result.steps} steps\n`);
+    return 7;
   }
   if (result.status === 'aborted') {
     return 130;
   }
   if (result.status === 'no_final') {
     if (output !== 'json') stderr.write('klyro: provider error — no final answer\n');
-    return 4;
+    return 5;
   }
   if (result.status === 'verify_failed') {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'verify_failed', failureType: result.verification?.failureType }) + '\n');
     else stderr.write(`klyro: verification failed after ${result.verification?.attempts ?? 3} repairs — see output above\n`);
-    return 5;
+    return 8;
   }
   // 6.5 — --require-verify: if edits were made but verification never passed, exit 8
   if (opts.requireVerify && result.verification && !result.verification.ok) {
@@ -414,7 +445,9 @@ async function dryRunReport(opts: RunCliOptions): Promise<number> {
   // Assemble the REAL prompt (Level-6 context + KLYRO.md), not the bare base —
   // otherwise dry-run shows a different prompt than production runs use.
   const systemPromptFn = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt);
-  const systemPrompt = systemPromptFn({ cwd: opts.cwd });
+  const { resolveSystemPrompt } = await import('../agent/runtime.js');
+  const { system, suffix } = resolveSystemPrompt(systemPromptFn, { cwd: opts.cwd });
+  const systemPrompt = suffix ? `${system}\n\n${suffix}` : system;
   const registry = builtinRegistry();
   const rules = builtinRules();
   const report: DryRunReport = {
@@ -434,43 +467,61 @@ async function dryRunReport(opts: RunCliOptions): Promise<number> {
   return 0;
 }
 
-function defaultRunSystemPrompt(_ctx: { cwd: string; telemetry?: string }): string {
+function defaultRunSystemPrompt(_ctx: { cwd: string; telemetry?: string }): { system: string; suffix?: string } {
   const base = [
     'You are Klyro running in one-shot mode. The user has given you a single task.',
     'Solve it by calling tools as needed. When done, produce a short final text answer.',
     'Do not invent file paths. Do not call tools outside the working directory.',
   ].join(' ');
-  return _ctx.telemetry ? base + '\n\n' + _ctx.telemetry : base;
+  return _ctx.telemetry ? { system: base, suffix: _ctx.telemetry } : { system: base };
 }
 
 /** Wrap a system-prompt fn to inject Level-6 context (project map etc.) + KLYRO.md (4.4). */
 export async function makeRunSystemPrompt(
   cwd: string,
-  base: (ctx: { cwd: string; telemetry?: string }) => string,
-): Promise<(ctx: { cwd: string; telemetry?: string }) => string> {
+  base: SystemPromptFn,
+): Promise<SystemPromptFn> {
   const ctxBlock = await buildLevel6Context({ cwd });
   const prefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
+  // Session memory: .klyro/memory/session-notes.md injected so memory_write
+  // actually takes effect (redacted at write time — see context/memory.ts).
+  const memBlock = memoryBlock(cwd);
   let klyroBlock = '';
   try {
-    // P0.3 trust gate: unapproved context files are excluded in headless
-    // mode (secure default-deny) and each exclusion is bus-visible.
+    // P0.3 trust gate with headless approve-if-store-known: approve(file) is
+    // trust.isTrusted(file), so REPL-persisted approvals are honored with no
+    // prompting; unknown/changed files stay excluded and each exclusion is
+    // bus-visible.
     const { loadKlyroMdFiles } = await import('../context/klyro-md.js');
     const { ContextTrust } = await import('../context/trust.js');
     const { globalBus } = await import('../events/bus.js');
+    const trust = new ContextTrust();
+    // Headless approve-if-store-known (no prompts): approve(file) is
+    // trust.isTrusted(file), so REPL-persisted approvals are honored;
+    // unknown/changed files stay excluded.
+    const approve = (file: import('../context/klyro-md.js').KlyroMdFile): boolean => trust.isTrusted(file);
     const files = await loadKlyroMdFiles(cwd);
-    const { trusted, untrusted } = new ContextTrust().check(files);
+    const { trusted, untrusted } = trust.check(files);
     for (const { file, reason } of untrusted) {
       globalBus.emit({ type: 'context.trust_prompt', ts: Date.now(), sessionId: 'ephemeral', path: file.path, reason, trusted: false });
     }
     if (untrusted.length > 0) {
       stderr.write(`klyro: trust gate excluded ${untrusted.length} unapproved context file(s): ${untrusted.map((u) => u.file.path).join(', ')}\n`);
     }
-    const kept = trusted.map((f) => `# ${f.path}\n${f.content}`).join('\n\n---\n\n');
+    const keptFiles = trusted.filter(approve);
+    const kept = keptFiles.map((f) => `# ${f.path}\n${f.content}`).join('\n\n---\n\n');
     if (kept) klyroBlock = `\n\n<KLYRO.md>\n${kept.slice(0, 4000)}\n</KLYRO.md>`;
   } catch { /* ignore */ }
   return (ctx) => {
-    const t = ctx.telemetry ? '\n\n' + ctx.telemetry : '';
-    return base(ctx) + prefix + klyroBlock + t;
+    const r = base(ctx);
+    if (typeof r === 'string') {
+      // Legacy string fn: keep the exact legacy concatenation behavior.
+      const t = ctx.telemetry ? '\n\n' + ctx.telemetry : '';
+      return r + prefix + klyroBlock + memBlock + t;
+    }
+    // Split shape: Level-6/KLYRO.md join the stable prefix; telemetry stays
+    // the volatile suffix for cache-friendly adapters.
+    return { system: r.system + prefix + klyroBlock + memBlock, ...(r.suffix !== undefined ? { suffix: r.suffix } : {}) };
   };
 }
 

@@ -217,7 +217,7 @@ function useChatScroll(opts: {
 
   const resolved = resolveTopRow(state, ctx);
   const maxTop = maxTopFor(ctx);
-  const pinned = state.anchor.mode === 'pinned' && !resolved.atBottom;
+  const pinned = state.anchor.mode === 'pinned' && (!resolved.atBottom || maxTop === 0);
   return {
     topRow: resolved.topRow,
     atBottom: resolved.atBottom,

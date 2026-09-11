@@ -34,10 +34,17 @@ export interface AnthropicAdapterOptions {
   authHeader?: 'x-api-key' | 'Authorization';
   /** Beta features (e.g. ['prompt-caching-2024-07-31', 'tools-2024-04-04']). */
   betas?: string[];
+  /**
+   * Prompt caching: put a `cache_control: {type:'ephemeral'}` breakpoint on
+   * the stable system block and send the `prompt-caching-2024-07-31` beta
+   * (merged with user betas). Default true.
+   */
+  promptCache?: boolean;
 }
 
 const DEFAULT_VERSION = '2023-06-01';
 const DEFAULT_TIMEOUT_MS = 120_000;
+export const PROMPT_CACHING_BETA = 'prompt-caching-2024-07-31';
 
 interface AnthropicMessage {
   role: 'user' | 'assistant';
@@ -50,7 +57,7 @@ interface AnthropicMessage {
 
 interface AnthropicRequest {
   model: string;
-  system?: string;
+  system?: string | Array<{ type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }>;
   messages: AnthropicMessage[];
   tools?: Array<{ name: string; description: string; input_schema: unknown }>;
   max_tokens: number;
@@ -82,7 +89,9 @@ export function anthropicAdapter(opts: AnthropicAdapterOptions): ProviderAdapter
   const baseURL = rawBase.replace(/\/+$/, '');
   const version = opts.anthropicVersion ?? DEFAULT_VERSION;
   const authHeader = opts.authHeader ?? 'x-api-key';
-  const betas = opts.betas ?? [];
+  const promptCache = opts.promptCache ?? true;
+  const betas = [...(opts.betas ?? [])];
+  if (promptCache && !betas.includes(PROMPT_CACHING_BETA)) betas.push(PROMPT_CACHING_BETA);
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
   if (!fetchImpl) {
     throw new Error('anthropicAdapter: no fetch available — pass opts.fetchImpl or run on Node 18+');
@@ -93,7 +102,7 @@ export function anthropicAdapter(opts: AnthropicAdapterOptions): ProviderAdapter
     stream(req: CallRequest): AsyncIterable<StreamEvent> {
       return streamAnthropic(req, {
         baseURL, apiKey: opts.apiKey, timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        fetchImpl, version, authHeader, betas,
+        fetchImpl, version, authHeader, betas, promptCache,
       });
     },
   };
@@ -107,12 +116,37 @@ interface InternalOpts {
   version: string;
   authHeader: 'x-api-key' | 'Authorization';
   betas: string[];
+  promptCache: boolean;
+}
+
+/**
+ * Build the Anthropic `system` field. The stable system text gets the
+ * cache breakpoint; the volatile telemetry suffix (when present) rides as
+ * a second, uncached block so it never poisons the prefix cache.
+ * Exported via _internal for testing.
+ */
+export function buildAnthropicSystem(
+  system: string | undefined,
+  suffix: string | undefined,
+  promptCache: boolean,
+): AnthropicRequest['system'] {
+  const hasSuffix = suffix !== undefined && suffix !== '';
+  const breakpoint = promptCache ? { cache_control: { type: 'ephemeral' as const } } : {};
+  if (hasSuffix) {
+    if (!system) return promptCache ? [{ type: 'text' as const, text: suffix, ...breakpoint }] : suffix;
+    return [
+      { type: 'text' as const, text: system, ...breakpoint },
+      { type: 'text' as const, text: suffix },
+    ];
+  }
+  if (!system) return undefined;
+  return promptCache ? [{ type: 'text' as const, text: system, ...breakpoint }] : system;
 }
 
 async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIterable<StreamEvent> {
   const body: AnthropicRequest = {
     model: req.model,
-    system: req.system,
+    system: buildAnthropicSystem(req.system, req.systemSuffix, opts.promptCache),
     messages: toAnthropicMessages(req.messages),
     tools: req.tools.length > 0 ? req.tools.map(toAnthropicTool) : undefined,
     max_tokens: req.maxTokens ?? 4096,
@@ -155,11 +189,15 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
 
   if (!resp.ok || !resp.body) {
     const text = await resp.text().catch(() => '<unreadable>');
-    const retryable = resp.status >= 500 || resp.status === 429;
+    // 413 / request_too_large (or a too-long-prompt message) is context
+    // overflow, not transient: dedicated code, never retryable here — the
+    // runtime owns compress-and-retry.
+    const isOverflow = resp.status === 413 || /request_too_large|too_large|prompt_too_long|context_length|maximum context length|prompt is too long/i.test(text);
+    const retryable = !isOverflow && (resp.status >= 500 || resp.status === 429);
     const retryAfterMs = retryable ? parseRetryAfterMs(resp.headers?.get('retry-after')) : undefined;
     yield {
       kind: 'error',
-      code: `http_${resp.status}`,
+      code: isOverflow ? 'REQUEST_TOO_LARGE' : `http_${resp.status}`,
       message: `Anthropic API returned ${resp.status}: ${text.slice(0, 500)}`,
       retryable,
       status: String(resp.status),
@@ -186,7 +224,6 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
   };
   // message_stop already yields message_end — don't emit a second one at EOF.
   let sawMessageEnd = false;
-
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -259,9 +296,37 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
       kind: 'message_end',
       finishReason: 'stop',
       ...(state.usage.input !== undefined || state.usage.output !== undefined
-        ? { usage: { input: state.usage.input ?? 0, output: state.usage.output ?? 0 } }
+        ? { usage: withCache(state.usage) }
         : {}),
     };
+  }
+}
+
+/** Copy input/output plus any cache counters into a message_end usage payload. */
+function withCache(u: AnthropicStreamState['usage']): { input: number; output: number; cacheRead?: number; cacheWrite?: number } {
+  return {
+    input: u.input ?? 0,
+    output: u.output ?? 0,
+    ...(u.cacheRead !== undefined ? { cacheRead: u.cacheRead } : {}),
+    ...(u.cacheWrite !== undefined ? { cacheWrite: u.cacheWrite } : {}),
+  };
+}
+
+/** Fold an Anthropic `usage` object (message_start or message_delta) into stream state. */
+function recordAnthropicUsage(state: AnthropicStreamState, u: unknown): void {
+  const rec = u as {
+    input_tokens?: number; output_tokens?: number;
+    cache_creation_input_tokens?: number; cache_read_input_tokens?: number;
+  } | undefined;
+  if (typeof rec?.input_tokens === 'number') state.usage.input = rec.input_tokens;
+  if (typeof rec?.output_tokens === 'number') {
+    state.usage.output = (state.usage.output ?? 0) + rec.output_tokens;
+  }
+  if (typeof rec?.cache_creation_input_tokens === 'number') {
+    state.usage.cacheWrite = (state.usage.cacheWrite ?? 0) + rec.cache_creation_input_tokens;
+  }
+  if (typeof rec?.cache_read_input_tokens === 'number') {
+    state.usage.cacheRead = (state.usage.cacheRead ?? 0) + rec.cache_read_input_tokens;
   }
 }
 
@@ -275,22 +340,19 @@ interface AnthropicStreamState {
   /** Fragments for an index with no open block yet (flushed on block start). */
   orphans: Map<number, string>;
   thinkingIdx: number | null;
-  usage: { input?: number; output?: number };
+  usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 }
 
 function translateSse(event: string, parsed: AnthropicSseEvent, state: AnthropicStreamState): StreamEvent[] {
   const out: StreamEvent[] = [];
   switch (event) {
     case 'message_start': {
-      const usage = (parsed.message as { usage?: { input_tokens?: number } } | undefined)?.usage;
-      if (typeof usage?.input_tokens === 'number') state.usage.input = usage.input_tokens;
+      const usage = (parsed.message as { usage?: unknown } | undefined)?.usage;
+      recordAnthropicUsage(state, usage);
       return out;
     }
     case 'message_delta': {
-      const usage = parsed.usage as { output_tokens?: number } | undefined;
-      if (typeof usage?.output_tokens === 'number') {
-        state.usage.output = (state.usage.output ?? 0) + usage.output_tokens;
-      }
+      recordAnthropicUsage(state, parsed.usage);
       return out;
     }
     case 'content_block_start': {
@@ -353,17 +415,20 @@ function translateSse(event: string, parsed: AnthropicSseEvent, state: Anthropic
         kind: 'message_end',
         finishReason: 'stop',
         ...(state.usage.input !== undefined || state.usage.output !== undefined
-          ? { usage: { input: state.usage.input ?? 0, output: state.usage.output ?? 0 } }
+          ? { usage: withCache(state.usage) }
           : {}),
       });
       return out;
     }
     case 'error': {
       const err = parsed.error as { type?: string; message?: string } | undefined;
+      const rawType = err?.type ?? 'anthropic_error';
+      const rawMsg = err?.message ?? 'unknown Anthropic error';
+      const isOverflow = /too_large|too_long|context_length|prompt_too_long|prompt is too long/i.test(`${rawType} ${rawMsg}`);
       out.push({
         kind: 'error',
-        code: err?.type ?? 'anthropic_error',
-        message: err?.message ?? 'unknown Anthropic error',
+        code: isOverflow ? 'REQUEST_TOO_LARGE' : rawType,
+        message: rawMsg,
         retryable: false,
       });
       return out;
@@ -433,4 +498,4 @@ function toAnthropicTool(t: ToolDefinition): { name: string; description: string
 }
 
 // Re-export for testability.
-export const _internal = { toAnthropicMessages, toAnthropicTool, translateSse };
+export const _internal = { toAnthropicMessages, toAnthropicTool, translateSse, buildAnthropicSystem };

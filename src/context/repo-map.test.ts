@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest';
-import { extractSymbols, formatRepoMap } from './repo-map.js';
+import { describe, it, expect, beforeEach } from 'vitest';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { extractSymbols, formatRepoMap, buildRepoMap, clearRepoMapCache } from './repo-map.js';
 import type { RepoFile } from './repo-map.js';
 
 describe('extractSymbols', () => {
@@ -47,5 +50,30 @@ describe('formatRepoMap', () => {
     const out = formatRepoMap(files);
     expect(out).toContain('# full.ts');
     expect(out).not.toContain('empty.ts');
+  });
+});
+
+describe('buildRepoMap cache', () => {
+  let cwd: string;
+  beforeEach(async () => {
+    cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'klyro-rmap-'));
+    clearRepoMapCache();
+  });
+
+  it('serves the cache when nothing changed', async () => {
+    await fs.writeFile(path.join(cwd, 'a.ts'), 'export function foo() {}\n');
+    const first = await buildRepoMap({ cwd });
+    const second = await buildRepoMap({ cwd });
+    expect(second).toBe(first);
+  });
+
+  it('rebuilds when a tracked file changes', async () => {
+    await fs.writeFile(path.join(cwd, 'a.ts'), 'export function foo() {}\n');
+    const first = await buildRepoMap({ cwd });
+    expect(first[0]?.symbols.map((s) => s.name)).toContain('foo');
+    await fs.writeFile(path.join(cwd, 'a.ts'), 'export function foo() {}\nexport function bar() {}\n');
+    const second = await buildRepoMap({ cwd });
+    expect(second).not.toBe(first);
+    expect(second[0]?.symbols.map((s) => s.name)).toContain('bar');
   });
 });

@@ -43,7 +43,7 @@
 import * as fs from 'node:fs';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout, stderr } from 'node:process';
-import { run, type RunResult } from '../agent/runtime.js';
+import { run, type RunResult, type VerifyMode } from '../agent/runtime.js';
 import type { ProviderAdapter, StreamEvent } from '../agent/provider-adapter.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, DEFAULT_POLICY_CONFIG, PolicyEngine } from '../policy/engine.js';
@@ -55,6 +55,8 @@ export interface EvalScenario {
   model?: string;
   maxSteps?: number;
   maxTokens?: number;
+  /** Verification passthrough (default unchanged: strict pipeline when omitted). */
+  verify?: { mode?: VerifyMode; command?: string };
   /** Adapter events to script, as [eventKind, ...args] tuples. */
   scripted_events?: Array<Array<unknown[]>>;
   expect?: {
@@ -265,6 +267,15 @@ export async function runScenario(sc: EvalScenario): Promise<EvalResult> {
       maxSteps: sc.maxSteps,
       maxTokens: sc.maxTokens,
       nonInteractive: true,
+      ...(sc.verify
+        ? {
+            verify: {
+              enabled: true as const,
+              ...(sc.verify.command !== undefined ? { command: sc.verify.command } : {}),
+              ...(sc.verify.mode !== undefined ? { mode: sc.verify.mode } : {}),
+            },
+          }
+        : {}),
     },
     {
       adapter,

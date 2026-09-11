@@ -4,7 +4,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
-import { findBlockedReason } from './shell-exec.js';
+import { findBlockedReason, filteredEnv } from './shell-exec.js';
 
 interface Job {
   id: string;
@@ -38,7 +38,9 @@ export function startBackground(command: string, cwd: string): string {
   const blocked = findBlockedReason(command);
   if (blocked) throw new Error(`Command blocked: ${blocked}`);
   const id = `job-${++counter}-${Date.now().toString(36)}`;
-  const proc = spawn(command, { cwd, shell: true, windowsHide: true });
+  // Filtered env, same call shape as shell_exec — background children must
+  // not inherit secrets from the parent process.
+  const proc = spawn(command, { cwd, shell: true, windowsHide: true, env: filteredEnv() });
   const job: Job = { id, command, cwd, proc, output: '', start: Date.now() };
   jobs.set(id, job);
   proc.stdout?.on('data', (b: Buffer) => { job.output += b.toString(); if (job.output.length > 1_000_000) job.output = job.output.slice(-1_000_000); });
@@ -58,7 +60,8 @@ export function startBackgroundArgv(argv: string[], cwd: string): string {
   if (jobs.size >= MAX_JOBS) throw new Error(`Too many background jobs (max ${MAX_JOBS}) — kill one with /jobs`);
   if (argv.length === 0) throw new Error('startBackgroundArgv requires argv');
   const id = `job-${++counter}-${Date.now().toString(36)}`;
-  const proc = spawn(argv[0]!, argv.slice(1), { cwd, shell: false, windowsHide: true });
+  // Filtered env, same call shape as shell_exec (see startBackground).
+  const proc = spawn(argv[0]!, argv.slice(1), { cwd, shell: false, windowsHide: true, env: filteredEnv() });
   const job: Job = { id, command: argv.join(' '), cwd, proc, output: '', start: Date.now() };
   jobs.set(id, job);
   proc.stdout?.on('data', (b: Buffer) => { job.output += b.toString(); if (job.output.length > 1_000_000) job.output = job.output.slice(-1_000_000); });

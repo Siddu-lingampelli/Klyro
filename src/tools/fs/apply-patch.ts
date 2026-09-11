@@ -25,6 +25,36 @@ import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
 import { wasRead } from './read-history.js';
 
+// Extension-anchored: matches test.ts, foo.test.ts, foo-test.ts, foo.spec.js,
+// __tests__ segments — but NOT latest.ts / attest.ts / contest-data.
+const TEST_BASENAME_RE = /(^|[._-])(test|spec)\.[^.]+$|\.test\.[^.]+$|\.spec\.[^.]+$|__(tests|snapshots)__/i;
+
+function repairGuardHit(targetPath: string, _content: string): boolean {
+  const base = targetPath.split(/[\\/]/).pop() ?? targetPath;
+  // Basename alone decides. Patch CONTENT is never consulted for non-test
+  // paths (the old assert-skip regex over-blocked ordinary sources
+  // containing e.g. `it(` or `test(`), and stays unconsulted for test-like
+  // paths too since the basename already denies.
+  return TEST_BASENAME_RE.test(base);
+}
+
+async function allowedHit(cwd: string, resolved: string, allowed?: readonly string[]): Promise<boolean> {
+  if (!allowed) return false;
+  // Canonicalize both sides (realpath) so lexical-vs-canonical spellings
+  // of the same directory (e.g. Windows 8.3 short names) compare equal.
+  const canon = async (p: string): Promise<string> => {
+    try { return await fs.realpath(p); } catch { return path.resolve(p); }
+  };
+  const canonTarget = await canon(resolved);
+  for (const base of allowed) {
+    const absBase = path.isAbsolute(base) ? path.resolve(base) : path.resolve(cwd, base);
+    const canonBase = await canon(absBase);
+    const rel = path.relative(canonBase, canonTarget);
+    if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return false;
+  }
+  return true;
+}
+
 const InputSchema = z.object({
   patch: z.string().min(1).describe('Unified diff patch text'),
 });
@@ -123,6 +153,21 @@ async function guardWrite(cwd: string, relPath: string, resolved: string): Promi
   }
 }
 
+// TOCTOU shrink (mirrors write_file): re-resolve symlinks immediately
+// before the write and refuse if the target moved. Compares canonicalized
+// forms (not raw strings) to avoid false positives from
+// lexical-vs-canonical spellings (e.g. `sub/../a.txt`, short names).
+async function assertSameTarget(cwd: string, relPath: string, resolved: string): Promise<void> {
+  const { resolved: reResolved } = await resolveAndFollowSymlinks(cwd, relPath);
+  const canon = async (p: string): Promise<string> => {
+    try { return await fs.realpath(p); } catch { /* missing file → try parent */ }
+    try { return path.join(await fs.realpath(path.dirname(p)), path.basename(p)); } catch { return p; }
+  };
+  if ((await canon(reResolved)) !== (await canon(resolved))) {
+    throw Object.assign(new Error(`Path target changed between check and write: ${relPath} (POLICY_DENIED)`), { code: 'POLICY_DENIED' });
+  }
+}
+
 export const applyPatchTool = defineTool({
   name: 'apply_patch',
   description: 'Apply a unified diff patch (Codex-style). Real hunk application with context matching; mismatches fail loudly.',
@@ -141,6 +186,13 @@ export const applyPatchTool = defineTool({
       let cur: FileSection | null = null;
       for (const line of lines) {
         if (line.startsWith('*** Begin Patch') || line.startsWith('*** End Patch')) continue;
+        // Delete sections are NOT supported — reject loudly rather than
+        // mis-parsing the section as a write.
+        if (line.startsWith('*** Delete File:')) {
+          throw Object.assign(new Error(`Delete sections not supported: ${line.trim()} (INVALID_PATCH)`), {
+            code: 'INVALID_PATCH',
+          });
+        }
         if (line.startsWith('*** Update File:')) {
           cur = { op: 'update', path: line.replace('*** Update File:', '').trim(), body: [] };
           sections.push(cur);
@@ -159,7 +211,13 @@ export const applyPatchTool = defineTool({
       const patchedFiles: string[] = [];
       for (const sec of sections) {
         if (!sec.path) throw Object.assign(new Error('Patch section missing file path'), { code: 'INVALID_PATCH' });
+        if (ctx.repairGuard?.denyTestEdits && repairGuardHit(sec.path, sec.body.join('\n'))) {
+          throw Object.assign(new Error('repair-guard: test edits denied (denyTestEdits)'), { code: 'POLICY_DENIED' });
+        }
         const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, sec.path);
+        if (await allowedHit(ctx.cwd, resolved, ctx.agentAllowedPaths)) {
+          throw Object.assign(new Error(`agent path not allowed: ${resolved} (POLICY_DENIED)`), { code: 'POLICY_DENIED' });
+        }
         const hunks = parseHunks(sec.body);
         if (sec.op === 'add' || hunks.length === 0) {
           // Creation path: content from + lines (legacy tolerant format).
@@ -182,6 +240,7 @@ export const applyPatchTool = defineTool({
             .map((l) => l.slice(1))
             .join('\n');
           await guardWrite(ctx.cwd, sec.path, resolved);
+          await assertSameTarget(ctx.cwd, sec.path, resolved);
           await fs.mkdir(path.dirname(resolved), { recursive: true });
           await fs.writeFile(resolved, content ? content + '\n' : '', 'utf-8');
           patchedFiles.push(sec.path);
@@ -201,6 +260,7 @@ export const applyPatchTool = defineTool({
         const fileLines = current.split('\n');
         if (hasTrailingNewline && fileLines[fileLines.length - 1] === '') fileLines.pop();
         const next = applyHunks(sec.path, fileLines, hunks);
+        await assertSameTarget(ctx.cwd, sec.path, resolved);
         await fs.mkdir(path.dirname(resolved), { recursive: true });
         await fs.writeFile(resolved, next.join('\n') + (hasTrailingNewline ? '\n' : ''), 'utf-8');
         patchedFiles.push(sec.path);

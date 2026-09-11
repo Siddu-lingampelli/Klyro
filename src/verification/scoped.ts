@@ -6,6 +6,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
+import { filteredVerifyEnv } from './registry.js';
 
 export function findRelatedTests(cwd: string, editedFiles: string[]): string[] {
   if (editedFiles.length === 0) return [];
@@ -41,15 +42,30 @@ export function findRelatedTests(cwd: string, editedFiles: string[]): string[] {
   return [...related];
 }
 
+const UNSAFE_SCOPED_RE = /["$`;&|()]/;
+
+function isSafeScopedPath(cwd: string, f: string): boolean {
+  if (UNSAFE_SCOPED_RE.test(f)) return false;
+  if (f.includes('\n') || f.includes('\r') || f.includes('\0')) return false;
+  const rel = path.relative(path.resolve(cwd), path.resolve(cwd, f));
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  return true;
+}
+
 export function buildScopedCommand(cwd: string, baseCommand: string, relatedTests: string[]): string | null {
   if (relatedTests.length === 0) return null;
   if (relatedTests.length > 10) return null; // too many → full suite
+  // Validate every test path: must stay within cwd and contain no shell
+  // metacharacters. Drop offenders; if none survive, return null (caller
+  // falls back to the full suite — never interpolate untrusted paths).
+  const safe = relatedTests.filter((f) => isSafeScopedPath(cwd, f));
+  if (safe.length === 0) return null;
   // npm test heuristic: npm test -- <files> or vitest/jest file list
   if (baseCommand.includes('npm test') || baseCommand.includes('pnpm test') || baseCommand.includes('yarn test') || baseCommand.includes('bun test')) {
-    return `${baseCommand} -- ${relatedTests.map((f) => `"${f}"`).join(' ')}`;
+    return `${baseCommand} -- ${safe.map((f) => `"${f}"`).join(' ')}`;
   }
   if (baseCommand.includes('pytest')) {
-    return `pytest ${relatedTests.map((f) => `"${f}"`).join(' ')}`;
+    return `pytest ${safe.map((f) => `"${f}"`).join(' ')}`;
   }
   if (baseCommand.includes('go test')) {
     // go test ./... with file filter — fallback to full
@@ -65,7 +81,8 @@ export function buildScopedCommand(cwd: string, baseCommand: string, relatedTest
 const MAX_SCOPED_BYTES = 256 * 1024;
 export async function runScopedVerify(cwd: string, command: string, timeoutMs = 45_000): Promise<{ ok: boolean; exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd, shell: true, env: process.env });
+    // S2: verify commands run with filtered env; servers needing keys must use explicit config.
+    const child = spawn(command, { cwd, shell: true, env: filteredVerifyEnv() });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
     let done = false;
@@ -110,7 +127,8 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
       // For now, use tsc --noEmit --skipLibCheck on single file quickly
       if (ext === '.ts') {
         const ok = await new Promise<boolean>((resolve) => {
-          const child = spawn('npx', ['tsc', '--noEmit', '--skipLibCheck', full], { cwd, shell: false, env: process.env });
+          // S2: verify commands run with filtered env; servers needing keys must use explicit config.
+          const child = spawn('npx', ['tsc', '--noEmit', '--skipLibCheck', full], { cwd, shell: false, env: filteredVerifyEnv() });
           let done = false;
           const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 10_000);
           child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
@@ -120,7 +138,8 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
         return { ok: true };
       }
       const ok2 = await new Promise<boolean>((resolve) => {
-        const child = spawn(process.execPath, ['--check', full], { cwd, shell: false, env: process.env });
+        // S2: verify commands run with filtered env; servers needing keys must use explicit config.
+        const child = spawn(process.execPath, ['--check', full], { cwd, shell: false, env: filteredVerifyEnv() });
         let done = false;
         const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 5000);
         child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
@@ -134,7 +153,8 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
   }
   if (ext === '.py') {
     const ok = await new Promise<boolean>((resolve) => {
-      const child = spawn('python', ['-m', 'py_compile', full], { cwd, shell: false, env: process.env });
+      // S2: verify commands run with filtered env; servers needing keys must use explicit config.
+      const child = spawn('python', ['-m', 'py_compile', full], { cwd, shell: false, env: filteredVerifyEnv() });
       let done = false;
       const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 5000);
       child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });

@@ -372,15 +372,50 @@ function lockfileHash(root: string): string {
 async function getCachedProjectMap(root: string): Promise<ProjectMap | null> {
   const head = await gitHead(root);
   const hash = lockfileHash(root);
-  const p = path.join(root, '.klyro', 'cache', `project-map-${head.slice(0, 8)}-${hash}.json`);
+  const dirty = await dirtyMtime(root);
+  const p = path.join(root, '.klyro', 'cache', `project-map-${head.slice(0, 8)}-${hash}-${dirty.toString(36)}.json`);
   try { const raw = await fs.readFile(p, 'utf-8'); const j = JSON.parse(raw) as ProjectMap; if (Date.now() - new Date(j.generatedAt).getTime() < 24*3600*1000) return j; } catch { /* miss */ }
   return null;
 }
 async function setCachedProjectMap(root: string, m: ProjectMap): Promise<void> {
   const head = await gitHead(root);
   const hash = lockfileHash(root);
-  const p = path.join(root, '.klyro', 'cache', `project-map-${head.slice(0, 8)}-${hash}.json`);
+  const dirty = await dirtyMtime(root);
+  const p = path.join(root, '.klyro', 'cache', `project-map-${head.slice(0, 8)}-${hash}-${dirty.toString(36)}.json`);
   try { await fs.mkdir(path.dirname(p), { recursive: true }); await fs.writeFile(p, JSON.stringify(m, null, 2), 'utf-8'); } catch { /* ignore */ }
+}
+/**
+ * Dirty-tree fingerprint: max mtimeMs over a bounded walk (≤200 files,
+ * depth ≤4, ignored dirs skipped). Cheap enough to run on every cache
+ * lookup; any edit under the tree changes the key and busts the cache.
+ */
+export async function dirtyMtime(root: string): Promise<number> {
+  let max = 0;
+  let seen = 0;
+  let stop = false;
+  async function walk(dir: string, depth: number): Promise<void> {
+    if (stop || depth > 4) return;
+    let entries;
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      if (stop) return;
+      if (IGNORED_DIRS.has(e.name)) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        await walk(full, depth + 1);
+      } else if (e.isFile()) {
+        seen++;
+        try {
+          const s = await fs.stat(full);
+          if (s.mtimeMs > max) max = s.mtimeMs;
+        } catch { /* race */ }
+        if (seen >= 200) { stop = true; return; }
+      }
+    }
+  }
+  await walk(root, 0);
+  return Math.floor(max);
 }
 function detectMonorepo(root: string, rootFiles: Set<string>, rootDirs: string[]): boolean {
   if (rootFiles.has('pnpm-workspace.yaml') || rootFiles.has('lerna.json') || rootFiles.has('nx.json')) return true;

@@ -1,10 +1,10 @@
 /**
  * P1.1 — spawn_agent tool (6-10fix.md §5).
  *
- * Delegates to `AgentSpawnBridge.spawnAgent`, which runs the child to
- * completion (P0/P1 scope: blocking) and returns a compact ChildSummary —
- * never the child transcript. True background `task_wait` / `task_stop`
- * arrives in P2.
+ * Async: starts the child worker and returns IMMEDIATELY with
+ * `{ taskId, status: 'running', ... }` — never the child transcript.
+ * Await completion with `task_wait`, poll with `task_get` / `task_list`,
+ * merge the child's worktree with `task_apply`, or abort with `task_stop`.
  */
 import { z } from 'zod';
 import { defineTool } from '../types.js';
@@ -22,7 +22,7 @@ const InputSchema = z.object({
 export const spawnAgentTool = defineTool({
   name: 'spawn_agent',
   description:
-    'Spawn a child agent and return its compact summary { taskId, status, ... }. Child transcript stays separate; use task_get for status.',
+    'Spawn a child agent asynchronously; returns immediately with { taskId, status: "running", ... }. Child transcript stays separate — await it with task_wait, poll with task_get, merge with task_apply, abort with task_stop.',
   inputSchema: InputSchema,
   permission: 'admin',
   isConcurrencySafe: false,

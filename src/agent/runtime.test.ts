@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
-import { run, defaultSystemPrompt } from './runtime.js';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { run, defaultSystemPrompt, estimateCost } from './runtime.js';
 import { ToolRegistry } from '../tools/registry.js';
+import * as fs from 'node:fs';
 import { readFileTool } from '../tools/fs/read-file.js';
 import { writeFileTool } from '../tools/fs/write-file.js';
 import { shellExecTool } from '../tools/shell/shell-exec.js';
@@ -333,16 +334,236 @@ describe('runtime', () => {
   });
 });
 
-describe('runtime: level-7 telemetry', () => {
-  it('injects the telemetry block into the system prompt on step 2 (after a tool call)', async () => {
+describe('runtime: repair ledger, verify modes, overflow, drain', () => {
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const d of tmpDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  });
+  function freshDir(): string {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-rt2-'));
+    tmpDirs.push(d);
+    return d;
+  }
+  function stdDeps(adapter: ProviderAdapter) {
     const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
     const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
-    const seenSystems: (string | undefined)[] = [];
+    return { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt };
+  }
+  function countingAdapter(batches: StreamEvent[][], counter: { calls: number }): ProviderAdapter {
+    let i = 0;
+    return {
+      id: 'mock',
+      async *stream() {
+        counter.calls++;
+        const batch = batches[i++];
+        if (batch) for (const ev of batch) yield ev;
+      },
+    };
+  }
+  /** Verify command that exits 1 (printing plain 'boom') for the first
+   * `fails` invocations, then exits 0. Plain output keeps detect() at
+   * 'unknown' so classify() yields 'introduced' (not pre-existing). */
+  function failThenPassCommand(dir: string, fails: number): string {
+    const counter = path.join(dir, 'count.txt').replace(/\\/g, '/');
+    fs.writeFileSync(counter, '0');
+    return `${JSON.stringify(process.execPath)} -e "var fs=require('fs');var n=parseInt(fs.readFileSync('${counter}','utf8'),10);fs.writeFileSync('${counter}',String(n+1));if(n<${fails}){console.error('boom');process.exit(1)}"`;
+  }
+  function writeThenDone(): StreamEvent[][] {
+    return [
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'write_file' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"x.txt","content":"hello"}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'done' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ];
+  }
+
+  it('attributes repairTokens on a fail-then-pass strict run', async () => {
+    const dir = freshDir();
+    // Invocations before the repair turn: baseline(1) + verify#1(1) +
+    // flaky-rerun(1) = 3 failures; the post-repair verify then passes.
+    const command = failThenPassCommand(dir, 3);
+    const counter = { calls: 0 };
+    const adapter = countingAdapter([...writeThenDone(), [
+      { kind: 'message_start' },
+      { kind: 'text_delta', text: 'fixed' },
+      { kind: 'message_end', finishReason: 'stop' },
+    ]], counter);
+    const r = await run(
+      { task: 'write it', cwd: dir, model: 'mock', maxSteps: 6, nonInteractive: true, verify: { enabled: true, command, maxRepairAttempts: 3 } },
+      stdDeps(adapter),
+    );
+    expect(r.status).toBe('complete');
+    expect(r.verification?.ok).toBe(true);
+    expect(r.verification?.attempts).toBe(1);
+    expect(r.verification?.repairTokens).toBeDefined();
+    expect(r.verification!.repairTokens!.input + r.verification!.repairTokens!.output).toBeGreaterThan(0);
+    expect(counter.calls).toBe(3);
+  });
+
+  it("verify off skips the pipeline (verification undefined, no repair)", async () => {
+    const dir = freshDir();
+    const counter = { calls: 0 };
+    const adapter = countingAdapter(writeThenDone(), counter);
+    const kinds: string[] = [];
+    const r = await run(
+      {
+        task: 'write it', cwd: dir, model: 'mock', maxSteps: 4, nonInteractive: true,
+        verify: { enabled: true, command: failThenPassCommand(dir, 999), mode: 'off' },
+        onEvent: (ev) => { kinds.push(ev.kind); },
+      },
+      stdDeps(adapter),
+    );
+    expect(r.status).toBe('complete');
+    expect(r.verification).toBeUndefined();
+    expect(counter.calls).toBe(2);
+    expect(kinds).not.toContain('verification_started');
+  });
+
+  it('verify advisory reports failure once and completes without repair turns', async () => {
+    const dir = freshDir();
+    const counter = { calls: 0 };
+    const adapter = countingAdapter(writeThenDone(), counter);
+    const kinds: string[] = [];
+    const r = await run(
+      {
+        task: 'write it', cwd: dir, model: 'mock', maxSteps: 4, nonInteractive: true,
+        verify: { enabled: true, command: failThenPassCommand(dir, 999), mode: 'advisory' },
+        onEvent: (ev) => { kinds.push(ev.kind); },
+      },
+      stdDeps(adapter),
+    );
+    expect(r.status).toBe('complete');
+    expect(r.verification?.ok).toBe(false);
+    expect(counter.calls).toBe(2);
+    expect(kinds).not.toContain('repair_started');
+  });
+
+  it('verify advisory success completes ok', async () => {
+    const dir = freshDir();
+    const counter = { calls: 0 };
+    const adapter = countingAdapter(writeThenDone(), counter);
+    const r = await run(
+      {
+        task: 'write it', cwd: dir, model: 'mock', maxSteps: 4, nonInteractive: true,
+        verify: { enabled: true, command: failThenPassCommand(dir, 0), mode: 'advisory' },
+      },
+      stdDeps(adapter),
+    );
+    expect(r.status).toBe('complete');
+    expect(r.verification?.ok).toBe(true);
+    expect(counter.calls).toBe(2);
+  });
+
+  it('verify strict exhausts repairs into verify_failed', async () => {
+    const dir = freshDir();
+    const counter = { calls: 0 };
+    const adapter = countingAdapter(writeThenDone(), counter);
+    const r = await run(
+      {
+        task: 'write it', cwd: dir, model: 'mock', maxSteps: 4, nonInteractive: true,
+        verify: { enabled: true, command: failThenPassCommand(dir, 999), maxRepairAttempts: 1 },
+      },
+      stdDeps(adapter),
+    );
+    expect(r.status).toBe('verify_failed');
+    expect(r.verification?.ok).toBe(false);
+    expect(r.verification?.attempts).toBe(1);
+  });
+
+  it('retries the request once after REQUEST_TOO_LARGE then completes', async () => {
+    let calls = 0;
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream() {
+        calls++;
+        if (calls === 1) {
+          yield { kind: 'error', code: 'REQUEST_TOO_LARGE', message: 'context too big', retryable: false };
+          return;
+        }
+        yield { kind: 'message_start' };
+        yield { kind: 'text_delta', text: 'recovered' };
+        yield { kind: 'message_end', finishReason: 'stop' };
+      },
+    };
+    const r = await run(
+      { task: 'x', cwd, model: 'mock', maxSteps: 3, nonInteractive: true },
+      stdDeps(adapter),
+    );
+    expect(r.status).toBe('complete');
+    expect(r.finalText).toBe('recovered');
+    expect(calls).toBe(2);
+  });
+
+  it('fails normally on a second REQUEST_TOO_LARGE', async () => {
+    let calls = 0;
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream() {
+        calls++;
+        yield { kind: 'error', code: 'REQUEST_TOO_LARGE', message: 'still too big', retryable: false };
+      },
+    };
+    const r = await run(
+      { task: 'x', cwd, model: 'mock', maxSteps: 3, nonInteractive: true },
+      stdDeps(adapter),
+    );
+    expect(r.status).toBe('no_final');
+    expect(calls).toBe(2);
+  });
+
+  it('injects drained subtask completions as user messages', async () => {
+    const dir = freshDir();
+    const bridge = {
+      drainCompletions: () => [{
+        taskId: 't-1',
+        agentName: 'explorer',
+        status: 'succeeded',
+        durationMs: 12,
+        finalText: 'mapped the repo',
+        changedFiles: ['a.ts'],
+      }],
+    } as unknown as import('./orchestrator.js').AgentSpawnBridge;
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'write_file' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"y.txt","content":"hi"}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'done' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const r = await run(
+      { task: 'probe', cwd: dir, model: 'mock', maxSteps: 3, nonInteractive: true, agentBridge: bridge },
+      stdDeps(adapter),
+    );
+    expect(r.status).toBe('complete');
+    expect(JSON.stringify(r.transcript)).toContain('Subtask t-1 (explorer) succeeded: mapped the repo');
+  });
+});
+
+describe('runtime: level-7 telemetry', () => {
+  it('injects the telemetry block as systemSuffix on step 2 (stable system stays clean)', async () => {
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const seen: Array<{ system: string | undefined; suffix: string | undefined }> = [];
     const adapter: ProviderAdapter = {
       id: 'mock',
       async *stream(req) {
-        seenSystems.push(req.system);
-        if (seenSystems.length === 1) {
+        seen.push({ system: req.system, suffix: req.systemSuffix });
+        if (seen.length === 1) {
           // Step 1: emit a tool call, then end.
           yield { kind: 'message_start' };
           yield { kind: 'tool_call_start', id: 'c1', name: 'write_file' };
@@ -362,26 +583,29 @@ describe('runtime: level-7 telemetry', () => {
       { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
     );
     expect(r.status).toBe('complete');
-    expect(seenSystems).toHaveLength(2);
-    // Step 1 has the "no telemetry yet" placeholder.
-    expect(seenSystems[0]).toMatch(/no telemetry yet/);
-    // Step 2 must include the prior tool call in its telemetry.
-    expect(seenSystems[1]).toMatch(/# Runtime telemetry/);
-    expect(seenSystems[1]).toMatch(/Step 2/);
-    expect(seenSystems[1]).toMatch(/tool calls: 1/);
-    expect(seenSystems[1]).toMatch(/write_file x\.txt/);
-    expect(seenSystems[1]).toMatch(/tokens: 100 in \/ 20 out/);
+    expect(seen).toHaveLength(2);
+    // Step 1 has the "no telemetry yet" placeholder as the suffix.
+    expect(seen[0]?.suffix).toMatch(/no telemetry yet/);
+    // Step 2 must include the prior tool call in its telemetry suffix.
+    expect(seen[1]?.suffix).toMatch(/# Runtime telemetry/);
+    expect(seen[1]?.suffix).toMatch(/Step 2/);
+    expect(seen[1]?.suffix).toMatch(/tool calls: 1/);
+    expect(seen[1]?.suffix).toMatch(/write_file x\.txt/);
+    expect(seen[1]?.suffix).toMatch(/tokens: 100 in \/ 20 out/);
+    // The stable system prefix stays telemetry-free (cache-friendly split).
+    expect(seen[1]?.system).not.toMatch(/# Runtime telemetry/);
+    expect(seen[1]?.system).toMatch(/autonomous coding harness/);
   });
 
-  it('records policy denials into the telemetry visible to subsequent steps', async () => {
+  it('records policy denials into the telemetry suffix visible to subsequent steps', async () => {
     const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
     const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
-    const seenSystems: (string | undefined)[] = [];
+    const seen: Array<{ system: string | undefined; suffix: string | undefined }> = [];
     const adapter: ProviderAdapter = {
       id: 'mock',
       async *stream(req) {
-        seenSystems.push(req.system);
-        if (seenSystems.length === 1) {
+        seen.push({ system: req.system, suffix: req.systemSuffix });
+        if (seen.length === 1) {
           yield { kind: 'message_start' };
           yield { kind: 'tool_call_start', id: 'c1', name: 'write_file' };
           yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"../escape.txt","content":"x"}' };
@@ -398,11 +622,12 @@ describe('runtime: level-7 telemetry', () => {
       { task: 'telemetry-deny', cwd, model: 'mock', maxSteps: 4, nonInteractive: true },
       { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
     );
-    expect(seenSystems).toHaveLength(2);
+    expect(seen).toHaveLength(2);
     // Step 2 telemetry must reflect that the previous call was denied.
-    expect(seenSystems[1]).toMatch(/write_file \.\.\/escape\.txt/);
-    expect(seenSystems[1]).toMatch(/ERR/);
-    expect(seenSystems[1]).toMatch(/Last error: policy_denied: write_file/);
+    expect(seen[1]?.suffix).toMatch(/write_file \.\.\/escape\.txt/);
+    expect(seen[1]?.suffix).toMatch(/ERR/);
+    expect(seen[1]?.suffix).toMatch(/Last error: policy_denied: write_file/);
+    expect(seen[1]?.system).not.toMatch(/Last error/);
   });
 
   it('records user-deny (ask→deny) into the telemetry visible to subsequent steps', async () => {
@@ -411,12 +636,12 @@ describe('runtime: level-7 telemetry', () => {
     // interactive mode. We run nonInteractive: false so the policy returns
     // 'ask', and use DenyAllApprovalPrompt so the user denies.
     const policy = new PolicyEngine(builtinRules(), { ...DEFAULT_POLICY_CONFIG, shellAllow: [] });
-    const seenSystems: (string | undefined)[] = [];
+    const seen: Array<{ system: string | undefined; suffix: string | undefined }> = [];
     const adapter: ProviderAdapter = {
       id: 'mock',
       async *stream(req) {
-        seenSystems.push(req.system);
-        if (seenSystems.length === 1) {
+        seen.push({ system: req.system, suffix: req.systemSuffix });
+        if (seen.length === 1) {
           yield { kind: 'message_start' };
           yield { kind: 'tool_call_start', id: 'c1', name: 'shell_exec' };
           yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"command":"echo hi"}' };
@@ -433,10 +658,10 @@ describe('runtime: level-7 telemetry', () => {
       { task: 'telemetry-ask-deny', cwd, model: 'mock', maxSteps: 4, nonInteractive: false },
       { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
     );
-    expect(seenSystems).toHaveLength(2);
+    expect(seen).toHaveLength(2);
     // The ask→deny branch records both the call (as error) and the user_denied kind.
-    expect(seenSystems[1]).toMatch(/shell_exec echo hi/);
-    expect(seenSystems[1]).toMatch(/Last error: user_denied: shell_exec/);
+    expect(seen[1]?.suffix).toMatch(/shell_exec echo hi/);
+    expect(seen[1]?.suffix).toMatch(/Last error: user_denied: shell_exec/);
   });
 
   it('never executes malformed tool calls — structured MALFORMED_TOOL_CALL instead', async () => {
@@ -545,16 +770,16 @@ describe('runtime: level-7 telemetry', () => {
     expect(r.usage.estimated).toBeUndefined();
   });
 
-  it('records tool execution errors (UNSUPPORTED tool) into the telemetry', async () => {
+  it('records tool execution errors (UNSUPPORTED tool) into the telemetry suffix', async () => {
     // Register only write_file but the model calls read_file → tool error.
     const reg = new ToolRegistry().register(writeFileTool);
     const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
-    const seenSystems: (string | undefined)[] = [];
+    const seen: Array<{ system: string | undefined; suffix: string | undefined }> = [];
     const adapter: ProviderAdapter = {
       id: 'mock',
       async *stream(req) {
-        seenSystems.push(req.system);
-        if (seenSystems.length === 1) {
+        seen.push({ system: req.system, suffix: req.systemSuffix });
+        if (seen.length === 1) {
           yield { kind: 'message_start' };
           yield { kind: 'tool_call_start', id: 'c1', name: 'read_file' };
           yield { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"x.txt"}' };
@@ -571,9 +796,59 @@ describe('runtime: level-7 telemetry', () => {
       { task: 'telemetry-tool-err', cwd, model: 'mock', maxSteps: 4, nonInteractive: true },
       { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
     );
-    expect(seenSystems).toHaveLength(2);
-    expect(seenSystems[1]).toMatch(/read_file x\.txt/);
-    expect(seenSystems[1]).toMatch(/Last error: UNKNOWN_TOOL: read_file|UNKNOWN_TOOL/);
-    expect(seenSystems[1]).toMatch(/errors: 1/);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]?.suffix).toMatch(/read_file x\.txt/);
+    expect(seen[1]?.suffix).toMatch(/Last error: UNKNOWN_TOOL: read_file|UNKNOWN_TOOL/);
+    expect(seen[1]?.suffix).toMatch(/errors: 1/);
+  });
+
+  it('sums cacheRead/cacheWrite across turns and keeps cost on input/output', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'hi' },
+        { kind: 'message_end', finishReason: 'stop', usage: { input: 100, output: 20, cacheRead: 50, cacheWrite: 30 } },
+      ],
+    ]);
+    const usageEvents: Array<{ input: number; output: number; cacheRead?: number; cacheWrite?: number }> = [];
+    const r = await run(
+      {
+        task: 'cached', cwd, model: 'mock', maxSteps: 2, nonInteractive: true,
+        onEvent: (ev) => { if (ev.kind === 'usage') usageEvents.push({ input: ev.input, output: ev.output, ...(ev.cacheRead !== undefined ? { cacheRead: ev.cacheRead } : {}), ...(ev.cacheWrite !== undefined ? { cacheWrite: ev.cacheWrite } : {}) }); },
+      },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('complete');
+    expect(r.usage).toMatchObject({ input: 100, output: 20, cacheRead: 50, cacheWrite: 30 });
+    expect(usageEvents[0]).toMatchObject({ cacheRead: 50, cacheWrite: 30 });
+    // Cost ignores cache counters (discounted billing, unmodeled).
+    expect(estimateCost('mock', r.usage)).toBe(estimateCost('mock', { input: 100, output: 20 }));
+  });
+
+  it('accepts a legacy string systemPrompt fn (backward compat)', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    let received: { system?: string; suffix?: string } | undefined;
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream(req) {
+        received = { system: req.system, suffix: req.systemSuffix };
+        yield { kind: 'message_start' };
+        yield { kind: 'text_delta', text: 'ok' };
+        yield { kind: 'message_end', finishReason: 'stop' };
+      },
+    };
+    const r = await run(
+      { task: 'legacy', cwd, model: 'mock', maxSteps: 1, nonInteractive: true },
+      {
+        adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(),
+        systemPrompt: ({ cwd: c }: { cwd: string; telemetry?: string }) => `legacy prompt cwd=${c}`,
+      },
+    );
+    expect(r.status).toBe('complete');
+    expect(received?.system).toBe(`legacy prompt cwd=${cwd}`);
+    expect(received?.suffix).toBeUndefined();
   });
 });

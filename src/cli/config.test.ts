@@ -50,4 +50,35 @@ describe('persisted allow rules', () => {
     const onDisk = JSON.parse(fs.readFileSync(process.env.KLYRO_CONFIG!, 'utf-8')) as { allow: string[] };
     expect(onDisk.allow).toEqual(['shell_exec(npm *)']);
   });
+
+  it('persistAllowRule throws on invalid rules', async () => {
+    await expect(persistAllowRule('not a rule!!!')).rejects.toThrow(/invalid rule/);
+    await expect(persistAllowRule('shell_exec((bad))')).rejects.toThrow(/invalid rule/);
+    await expect(persistAllowRule('')).rejects.toThrow(/invalid rule/);
+  });
+
+  it('persistAllowRule writes to project dir when cwd is a project', async () => {
+    const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-proj-'));
+    try {
+      fs.mkdirSync(path.join(proj, '.klyro'), { recursive: true });
+      const r = await persistAllowRule('shell_exec(npm *)', proj);
+      expect(r.added).toBe(true);
+      expect(r.path).toBe(path.join(proj, '.klyro', 'settings.json'));
+      const onDisk = JSON.parse(fs.readFileSync(r.path, 'utf-8')) as { allow: string[] };
+      expect(onDisk.allow).toContain('shell_exec(npm *)');
+    } finally {
+      fs.rmSync(proj, { recursive: true, force: true });
+    }
+  });
+
+  it('persistAllowRule falls back to home when cwd is not a project', async () => {
+    const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-plain-'));
+    try {
+      const r = await persistAllowRule('shell_exec(git *)', plain);
+      expect(r.added).toBe(true);
+      expect(r.path).toBe(process.env.KLYRO_CONFIG);
+    } finally {
+      fs.rmSync(plain, { recursive: true, force: true });
+    }
+  });
 });

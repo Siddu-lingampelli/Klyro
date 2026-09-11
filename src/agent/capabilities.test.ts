@@ -75,9 +75,9 @@ describe('resolveAgentTools', () => {
     const r = resolveAgentTools(
       baseInput({ agent: { readonly: true } }),
     );
-    expect(r.allowed.sort()).toEqual(['glob', 'grep', 'read_file', 'run_verify']);
+    expect(r.allowed.sort()).toEqual(['glob', 'grep', 'read_file']);
     const droppedReadonly = r.dropped.filter((d) => d.reason === 'readonly').map((d) => d.tool).sort();
-    expect(droppedReadonly).toEqual(['edit_file', 'shell_exec', 'write_file']);
+    expect(droppedReadonly).toEqual(['edit_file', 'run_verify', 'shell_exec', 'write_file']);
   });
 
   it('canSpawn=false strips spawn tools (default for children)', () => {
@@ -123,8 +123,9 @@ describe('resolveAgentTools', () => {
     const r = resolveAgentTools(
       baseInput({ agent: { readonly: true, canSpawn: false } }),
     );
-    expect(r.allowed.sort()).toEqual(['glob', 'grep', 'read_file', 'run_verify']);
+    expect(r.allowed.sort()).toEqual(['glob', 'grep', 'read_file']);
     expect(r.allowed).not.toContain('write_file');
+    expect(r.allowed).not.toContain('run_verify');
     expect(r.allowed).not.toContain('spawn_agent');
   });
 
@@ -152,8 +153,15 @@ describe('resolveCapabilities', () => {
     expect([...r.allowed].sort()).toEqual([...REGISTRY].sort());
     expect(r.dropped).toEqual([]);
     expect(r.readonly).toBe(false);
-    expect(r.canSpawn).toBe(false);
+    // Root default (parentTools === null) may spawn — matches resolveAgentTools.
+    expect(r.canSpawn).toBe(true);
     expect(r.maxDepth).toBe(3);
+  });
+
+  it('child default (parentTools set) strips spawn unless enabled', () => {
+    const r = resolveCapabilities(baseCap());
+    expect(r.canSpawn).toBe(false);
+    expect(r.allowed.has('spawn_agent')).toBe(false);
   });
 
   it('propagates agent.model when set', () => {
@@ -187,5 +195,34 @@ describe('resolveCapabilities', () => {
     const r = resolveCapabilities(baseCap({ readonly: true }));
     expect(r.readonly).toBe(true);
     expect(r.allowed.has('write_file')).toBe(false);
+  });
+
+  it('unconstrained parent inherits the agent allowedPaths as-is', () => {
+    const r = resolveCapabilities({
+      ...baseCap({ allowedPaths: ['/repo/docs'] }),
+      parentTools: null,
+    });
+    expect(r.allowedPaths).toEqual(['/repo/docs']);
+  });
+
+  it('no constraints on either side leaves allowedPaths undefined', () => {
+    const r = resolveCapabilities(baseCap());
+    expect(r.allowedPaths).toBeUndefined();
+  });
+
+  it('intersects parent and agent allowedPaths to the narrower scope', () => {
+    const r = resolveCapabilities({
+      ...baseCap({ allowedPaths: ['/repo/sub'] }),
+      parentAllowedPaths: ['/repo'],
+    });
+    expect(r.allowedPaths).toEqual(['/repo/sub']);
+  });
+
+  it('disjoint allowedPaths intersect to empty', () => {
+    const r = resolveCapabilities({
+      ...baseCap({ allowedPaths: ['/other'] }),
+      parentAllowedPaths: ['/repo'],
+    });
+    expect(r.allowedPaths).toEqual([]);
   });
 });

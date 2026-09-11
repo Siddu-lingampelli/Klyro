@@ -129,15 +129,31 @@ export class PolicyEngine {
     const globDecision = this.evaluateGlobRules(call);
     if (globDecision) return globDecision;
 
-    // 3.4 — .env guard: deny writes to .env files unless explicitly allowed
-    if ((call.name === 'write_file' || call.name === 'edit_file') && typeof call.input.path === 'string') {
-      const p = String(call.input.path);
-      if (/(^|\/)\.env(\.|$)/.test(p) || p.endsWith('.env')) {
-        // Check if explicitly allowed via allow list
-        const allowed = (ctx.config.allow ?? []).some((r) => r.includes('.env'));
-        if (!allowed) {
+    // Centralized .env guard: any tool with a string `path` input pointing
+    // at an env file is denied unless an allow rule explicitly names that
+    // tool+path (exact/glob match — substring `.includes('.env')` is NOT enough).
+    const maybePath = typeof call.input.path === 'string' ? String(call.input.path) : null;
+    if (maybePath !== null && isEnvPath(maybePath)) {
+      const allowed = isExplicitlyAllowedForPath(call.name, maybePath, ctx.config.allow);
+      if (!allowed) {
+        return { action: 'deny', reason: 'write to .env denied by policy — add to allow list or use --yolo' };
+      }
+    }
+    // apply_patch carries paths inside the patch text, not `input.path`.
+    if (call.name === 'apply_patch' && typeof call.input.patch === 'string') {
+      const targets = extractPatchPaths(String(call.input.patch)).filter(isEnvPath);
+      if (targets.length > 0) {
+        const allAllowed = targets.every((t) => isExplicitlyAllowedForPath(call.name, t, ctx.config.allow));
+        if (!allAllowed) {
           return { action: 'deny', reason: 'write to .env denied by policy — add to allow list or use --yolo' };
         }
+      }
+    }
+    // Shell redirection into .env (e.g. `echo x > .env`, `cmd >> .env.local`).
+    if (call.name === 'shell_exec' && typeof call.input.command === 'string') {
+      const cmd = String(call.input.command);
+      if (/>+\s*['"]?[^'"\s]*\.env/i.test(cmd)) {
+        return { action: 'deny', reason: 'write to .env via shell redirection denied' };
       }
     }
 
@@ -205,7 +221,31 @@ function asString(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
 
-function matchesGlobRule(call: ToolCallLike, rule: string): boolean {
+function isEnvPath(p: string): boolean {
+  const lower = p.toLowerCase();
+  // Sample/template carve-out: `.env.example`-style files are documentation,
+  // not secrets — reads AND writes are allowed.
+  if (/[.](example|sample|template|dist)$/.test(lower)) return false;
+  return /(^|\/)\.env(\.|$)/.test(lower) || lower.endsWith('.env');
+}
+
+function extractPatchPaths(patch: string): string[] {
+  const out: string[] = [];
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('*** Update File:')) out.push(line.replace('*** Update File:', '').trim());
+    else if (line.startsWith('*** Add File:')) out.push(line.replace('*** Add File:', '').trim());
+  }
+  return out.filter(Boolean);
+}
+
+/** True when an allow rule explicitly names this tool+path (exact/glob match, not substring). */
+function isExplicitlyAllowedForPath(callName: string, envPath: string, allow: string[] | undefined): boolean {
+  if (!allow || allow.length === 0) return false;
+  const synthetic: ToolCallLike = { name: callName, input: { path: envPath } };
+  return allow.some((r) => matchesGlobRule(synthetic, r));
+}
+
+export function matchesGlobRule(call: ToolCallLike, rule: string): boolean {
   // Rule grammar: tool or tool(glob). e.g. "write_file", "write_file(.env)", "shell_exec(npm *)".
   // Digits are allowed so generated names (e.g. mcp__server__tool2) can be targeted.
   const m = /^([a-z0-9_]+)(?:\((.*)\))?$/.exec(rule.trim());
@@ -248,6 +288,45 @@ export const shellDenyRule: PolicyRule = {
     // Pipe-to-shell: curl/wget/fetch piped into sh/bash/cmd.exe/PowerShell
     if (/\b(curl|wget|fetch|iwr|Invoke-WebRequest)\b.*\|\s*(sh|bash|zsh|cmd|powershell|pwsh|node|node\s+-e)\b/i.test(cmd)) {
       return { action: 'deny', reason: 'pipe-to-shell: remote download piped into an interpreter' };
+    }
+    // Exfiltration denylist (mirrors shell_exec DANGEROUS_PATTERNS).
+    if (/\bcurl\b.*(?:\s-d\b|\s--data(?:-binary|-urlencode)?\b|\s--upload-file\b)/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: curl with --data/-d/--upload-file denied' };
+    }
+    if (/\bwget\b.*--post-(data|file)\b/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: wget --post-data/--post-file denied' };
+    }
+    if (/\b(powershell|pwsh)\b.*-e(nc|ncodedcommand)\b/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: powershell -enc denied' };
+    }
+    if (/\bInvoke-Expression\b/i.test(cmd) || /\biex\s*\(/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: Invoke-Expression/iex denied' };
+    }
+    if (/\bcertutil\b.*-urlcache\b/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: certutil -urlcache denied' };
+    }
+    if (/\bbitsadmin\b.*\/transfer\b/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: bitsadmin /transfer denied' };
+    }
+    // .env writes via tee / PowerShell (mirrors shell_exec DANGEROUS_PATTERNS).
+    if (/\|\s*tee\b[^\n]*\.env/i.test(cmd)) {
+      return { action: 'deny', reason: 'write to .env via tee denied' };
+    }
+    if (/\b(Set-Content|Out-File)\b[^\n]*\.env/i.test(cmd)) {
+      return { action: 'deny', reason: 'write to .env via Set-Content/Out-File denied' };
+    }
+    // Upload-form exfiltration (mirrors shell_exec DANGEROUS_PATTERNS).
+    if (/\bcurl\b.*(?:\s-F\b|\s--form\b)/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: curl -F/--form denied' };
+    }
+    if (/\bwget\b.*(?:\s--method=POST\b|\s--body-data\b)/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: wget --method=POST/--body-data denied' };
+    }
+    if (/\bInvoke-RestMethod\b/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: Invoke-RestMethod denied' };
+    }
+    if (/\bStart-BitsTransfer\b/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: Start-BitsTransfer denied' };
     }
     return null;
   },

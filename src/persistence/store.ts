@@ -11,8 +11,10 @@
  */
 
 import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { redact } from '../policy/secret-redactor.js';
 
 export type SessionStatus = 'open' | 'complete' | 'verify_failed' | 'aborted' | 'max_steps' | 'stuck';
 
@@ -107,6 +109,22 @@ export class SessionStore {
   }
   private perProjectIndexPath(cwd: string): string { return path.join(this.dir, `index-${this.projectHash(cwd)}.json`); }
 
+  /** Atomic per-project index write (tmp + fsync + rename). */
+  private async writePerProjectIndex(pp: string, pIdx: Record<string, SessionRecord>): Promise<void> {
+    const tmp = `${pp}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    await fs.writeFile(tmp, JSON.stringify(pIdx, null, 2), 'utf-8');
+    try {
+      const fh = await fs.open(tmp, 'r+');
+      try { await fh.sync(); } finally { await fh.close(); }
+    } catch { /* ignore on Windows */ }
+    try {
+      await fs.rename(tmp, pp);
+    } catch {
+      await fs.unlink(tmp).catch(() => undefined);
+      throw new Error('Failed to write per-project sessions index');
+    }
+  }
+
   private titleFor(task: string): string {
     // heuristic title via first 6 words, or model.small would be used if available
     const w = task.trim().split(/\s+/).slice(0, 6).join(' ');
@@ -117,30 +135,43 @@ export class SessionStore {
     // Locked: the index read-modify-write below races under concurrent creates.
     return this.withLock('index', async () => {
       await this.ensureDir();
-      const id = randomUUID();
+      // Redact at the persist boundary — tasks routinely paste keys/tokens.
+      const task = redact(opts.task);
+      let id = randomUUID();
+      // Cross-process session lock: O_EXCL so a concurrent creator (another
+      // process resuming/creating the same id path) can detect contention.
+      // On collision fall back to a unique id suffix — never crash.
+      try {
+        await fs.writeFile(path.join(this.dir, `${id}.lock`), String(process.pid), { flag: 'wx' });
+      } catch {
+        id = `${id}-${process.pid}-${Date.now().toString(36)}`;
+        try {
+          await fs.writeFile(path.join(this.dir, `${id}.lock`), String(process.pid), { flag: 'wx' });
+        } catch { /* best-effort only */ }
+      }
       const now = Date.now();
       const record: SessionRecord = {
         id,
         cwd: opts.cwd,
-        task: opts.task,
+        task,
         status: 'open',
         createdAt: now,
         updatedAt: now,
         config: opts.config,
       };
-      (record as unknown as Record<string, unknown>).title = this.titleFor(opts.task);
+      (record as unknown as Record<string, unknown>).title = this.titleFor(task);
       await fs.writeFile(path.join(this.dir, `${id}.json`), JSON.stringify({ record, messages: [], observations: [] }, null, 2));
       await this.appendJsonl(id, { type: 'session.create', record, ts: now });
       const idx = await this.readIndex();
       idx[id] = record;
       await this.writeIndex(idx);
-      // per-project index
+      // per-project index (atomic)
       try {
         const pp = this.perProjectIndexPath(opts.cwd);
         let pIdx: Record<string, SessionRecord> = {};
         try { pIdx = JSON.parse(await fs.readFile(pp, 'utf-8')); } catch {}
         pIdx[id] = record;
-        await fs.writeFile(pp, JSON.stringify(pIdx, null, 2), 'utf-8');
+        await this.writePerProjectIndex(pp, pIdx);
       } catch {}
       return record;
     });
@@ -167,12 +198,12 @@ export class SessionStore {
     return forked;
   }
 
-  /** Delete a session and all its artifacts (record, transcript, jsonl, indexes). */
+  /** Delete a session and all its artifacts (record, transcript, jsonl, lock, indexes). */
   async delete(id: string): Promise<boolean> {
     return this.withLock('index', async () => {
       const rec = await this.get(id);
       if (!rec) return false;
-      for (const f of [`${id}.json`, `${id}.jsonl`]) {
+      for (const f of [`${id}.json`, `${id}.jsonl`, `${id}.lock`]) {
         try {
           await fs.unlink(path.join(this.dir, f));
         } catch { /* ignore */ }
@@ -185,7 +216,7 @@ export class SessionStore {
         const raw = await fs.readFile(pp, 'utf-8');
         const pIdx = JSON.parse(raw) as Record<string, SessionRecord>;
         delete pIdx[id];
-        await fs.writeFile(pp, JSON.stringify(pIdx, null, 2), 'utf-8');
+        await this.writePerProjectIndex(pp, pIdx);
       } catch { /* ignore */ }
       return true;
     });
@@ -252,7 +283,7 @@ export class SessionStore {
   async appendMessage(id: string, message: StoredMessage): Promise<void> {
     return this.withLock(id, async () => {
       const data = await this.readSession(id);
-      data.messages.push(message);
+      data.messages.push({ ...message, content: redactStoredContent(message.content) });
       await this.writeSession(id, data);
     });
   }
@@ -260,7 +291,12 @@ export class SessionStore {
   async appendObservation(id: string, obs: StoredObservation): Promise<void> {
     return this.withLock(id, async () => {
       const data = await this.readSession(id);
-      data.observations.push(obs);
+      // S4-at-rest: redact observation input/output at the persist boundary.
+      data.observations.push({
+        ...obs,
+        input: redactStoredContent(obs.input),
+        output: redactStoredContent(obs.output),
+      });
       await this.writeSession(id, data);
     });
   }
@@ -269,8 +305,15 @@ export class SessionStore {
     return this.withLock(id, async () => {
       const data = await this.readSession(id);
       data.record.status = status;
-      if (finalText !== undefined) data.record.finalText = finalText;
+      // S4-at-rest: redact finalText before persisting.
+      if (finalText !== undefined) data.record.finalText = redact(finalText);
       await this.writeSession(id, data);
+      // Terminal states release the cross-process lock (no destructor exists
+      // to do it — the session is done, so the lock is stale by definition).
+      if (status === 'complete' || status === 'aborted' || status === 'max_steps' ||
+          status === 'verify_failed' || status === 'stuck') {
+        await releaseSessionLock(this.dir, id);
+      }
     });
   }
 
@@ -295,9 +338,82 @@ export class SessionStore {
     return idx[id] ?? null;
   }
 
-  /** Atomic append — survives crashes; suitable for audit log. */
+  /** Atomic append + fsync — survives crashes; suitable for audit log. */
   static async appendJsonl(filePath: string, entry: unknown): Promise<void> {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.appendFile(filePath, JSON.stringify(entry) + '\n', 'utf-8');
+    const fh = await fs.open(filePath, 'a');
+    try { await fh.write(JSON.stringify(entry) + '\n'); await fh.sync(); } finally { await fh.close(); }
   }
+}
+
+/**
+ * Redact text blocks of a stored message at the persist boundary.
+ * Handles string content, `{ text }` blocks, arrays of blocks, and plain
+ * objects (observation input/output) via a deep walk over string leaves.
+ * Only secret-shaped strings (key/token/password patterns, [:=-] shapes)
+ * are touched — normal prose passes through unchanged.
+ */
+export function redactStoredContent(content: unknown): unknown {
+  if (typeof content === 'string') return redact(content);
+  if (Array.isArray(content)) {
+    return content.map((b) => {
+      if (b && typeof b === 'object' && typeof (b as Record<string, unknown>).text === 'string') {
+        return { ...(b as Record<string, unknown>), text: redact((b as Record<string, unknown>).text as string) };
+      }
+      if (typeof b === 'string') return redact(b);
+      if (b && typeof b === 'object') return redactStoredContent(b);
+      return b;
+    });
+  }
+  if (content && typeof content === 'object') {
+    const rec = content as Record<string, unknown>;
+    if (typeof rec.text === 'string') {
+      return { ...rec, text: redact(rec.text) };
+    }
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rec)) {
+      out[k] = typeof v === 'string' ? redact(v) : (v && typeof v === 'object' ? redactStoredContent(v) : v);
+    }
+    return out;
+  }
+  return content;
+}
+
+export interface SessionLockInfo {
+  held: boolean;
+  pid?: number;
+  /** True when the lock holder process is (probably) still running. */
+  alive?: boolean;
+}
+
+/**
+ * Cross-process session lock probe. The lock file `<sessionsDir>/<id>.lock`
+ * contains the holder's PID. `alive` is resolved via `process.kill(pid, 0)`:
+ * EPERM means alive-but-unpermitted (→ true); ESRCH / other errors → false.
+ */
+export function readSessionLock(sessionsDir: string, id: string): SessionLockInfo {
+  let raw: string;
+  try {
+    raw = fsSync.readFileSync(path.join(sessionsDir, `${id}.lock`), 'utf-8');
+  } catch {
+    return { held: false };
+  }
+  const pid = Number(raw.trim());
+  if (!Number.isInteger(pid) || pid <= 0) return { held: true };
+  let alive: boolean;
+  try {
+    process.kill(pid, 0);
+    alive = true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    alive = code === 'EPERM';
+  }
+  return { held: true, pid, alive };
+}
+
+/** Best-effort release of the cross-process session lock. Never throws. */
+export async function releaseSessionLock(sessionsDir: string, id: string): Promise<void> {
+  try {
+    await fs.unlink(path.join(sessionsDir, `${id}.lock`));
+  } catch { /* ignore */ }
 }

@@ -16,6 +16,7 @@ import { anthropicAdapter } from '../agent/anthropic-adapter.js';
 import { retryingAdapter } from '../agent/retry.js';
 import { globalBus } from '../events/bus.js';
 import { run } from '../agent/runtime.js';
+import { resolveSystemPrompt } from '../agent/runtime.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, clonePolicyConfig, PolicyEngine } from '../policy/engine.js';
 import { buildLevel6Context } from '../context/level6.js';
@@ -29,7 +30,10 @@ import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE, createReadWrapper } from '../
 import { inferProviderFromBaseURL } from '../agent/registry.js';
 import { getDefaultSessionStore } from '../persistence/session.js';
 import { buildSystemPrompt, parseImageInput } from '../context/system-prompt.js';
+import { memoryBlock } from '../context/memory.js';
 import { estimateCost } from '../providers/model-info.js';
+import { ContextTrust } from '../context/trust.js';
+import { redact } from '../policy/secret-redactor.js';
 
 export interface ReplOptions {
   systemPrompt?: string;
@@ -98,19 +102,60 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   } catch {
     /* ignore — engine defaults stand */
   }
-  // Best-effort MCP tools: never fatal, never prompts. src/mcp/registry.ts
-  // lands from a sibling agent — the lazy import keeps runtime + builds green
-  // until then (import failure is caught below). Servers live for the process
-  // lifetime, so no close wiring here (unlike runOnce's finally).
-  try {
-    // @ts-ignore — sibling-owned module may not exist yet
-    const { loadAndRegisterMcp } = await import('../mcp/registry.js');
-    const mcp = await loadAndRegisterMcp({ cwd, registry, policy });
-    for (const e of mcp.errors) process.stderr.write(`klyro: mcp ${e.server}: ${e.message}\n`);
-    if (mcp.registered.length > 0) {
-      process.stderr.write(`klyro: mcp tools: ${mcp.registered.join(', ')}\n`);
+  // Best-effort MCP tools: never fatal, never prompts. Servers live for the
+  // process lifetime, so no close wiring here (unlike runOnce's finally).
+  // NOTE: the actual loadAndRegisterMcp call lives below (after the approval
+  // object exists) so project-server approval can route through it.
+  // Local inline sanitizer for the approval prompt (duplicates the shared
+  // sanitizeForPrompt in sibling-owned policy/approval.ts — intentionally
+  // not imported; kept local to avoid coupling the REPL to that module).
+  function sanitizeForPrompt(s: string): string {
+    return s.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\x1b\[[0-9;]*[A-Za-z]/g, '').slice(0, 120);
+  }
+  async function loadMcpTools(): Promise<void> {
+    try {
+      const { loadAndRegisterMcp } = await import('../mcp/registry.js');
+      const mcp = await loadAndRegisterMcp({
+        cwd,
+        registry,
+        policy,
+        // CONTRACT (sibling D): project-server approval hook. Registries that
+        // predate the contract ignore the unknown opt (checked via try/catch
+        // below with a skip-with-warning fallback).
+        approveProjectServer: async (info: { name: string; source: string }) => {
+          // Show the disabled state alongside source before asking, so a
+          // disabled server's approval can't be mistaken for activation.
+          let disabledNote = '';
+          try {
+            const { loadMcpServers } = await import('../mcp/config.js');
+            const cfg = loadMcpServers(cwd);
+            const spec = cfg.servers[info.name];
+            if (spec?.disabled) disabledNote = ' (disabled in config)';
+          } catch { /* ignore — prompt without the note */ }
+          const safeName = sanitizeForPrompt(info.name);
+          const safeSource = sanitizeForPrompt(info.source);
+          try {
+            const choice = await approval.ask({
+              toolName: 'mcp_project_server',
+              reason: `MCP project server "${safeName}"${disabledNote} from ${safeSource} — approve to register its tools`,
+              summary: safeName,
+            });
+            return choice === 'allow' || choice === 'always' || choice === 'always-persist';
+          } catch {
+            return false;
+          }
+        },
+      });
+      for (const e of mcp.errors) process.stderr.write(`klyro: mcp ${e.server}: ${e.message}\n`);
+      if (mcp.registered.length > 0) {
+        process.stderr.write(`klyro: mcp tools: ${mcp.registered.join(', ')}\n`);
+      }
+    } catch {
+      try {
+        process.stderr.write('klyro: mcp project-server approval skipped (registry unavailable)\n');
+      } catch { /* ignore */ }
     }
-  } catch { /* ignore — MCP is optional */ }
+  }
   const providerKind = inferProviderFromBaseURL(baseUrl);
   // Local Ollama exposes OpenAI-compat but hostname could contain "anthropic"
   // via proxy — don't try anthropic adapter with empty key (would 401).
@@ -148,14 +193,16 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   let adapter = buildAdapter(currentProvider, currentBaseUrl, currentApiKey);
   const ctxBlock = await buildLevel6Context({ cwd });
   let ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
-  // 4.4 KLYRO.md hierarchy (mutable — /reload refreshes)
-  const klyroMd = await import('../context/klyro-md.js').then((m) => m.loadKlyroMd(cwd)).catch(() => '');
-  let klyroBlock = klyroMd ? `\n\n<KLYRO.md>\n${klyroMd.slice(0, 4000)}\n</KLYRO.md>` : '';
-  // 2.3 layered system prompt
-  const systemPromptFn = (_ctx: { cwd: string; telemetry?: string }): string => {
-    const base = buildSystemPrompt({ cwd, model, extraSystem: opts.systemPrompt, appendSystem: ctxPrefix + klyroBlock });
-    const t = _ctx.telemetry ? '\n\n' + _ctx.telemetry : '';
-    return base + t;
+  // 4.4 KLYRO.md hierarchy (mutable — /reload refreshes). Content is gated
+  // through the context trust store (see loadKlyroBlockTrust below) — the
+  // initial value stays empty until the gated load runs after approval setup.
+  let klyroBlock = '';
+  // 2.3 layered system prompt (split shape: stable base + volatile telemetry suffix)
+  const systemPromptFn = (_ctx: { cwd: string; telemetry?: string }): { system: string; suffix?: string } => {
+    // 8.4 — inject session memory so memory_write actually takes effect.
+    const memBlock = memoryBlock(cwd);
+    const base = buildSystemPrompt({ cwd, model, extraSystem: opts.systemPrompt, appendSystem: ctxPrefix + klyroBlock + memBlock });
+    return _ctx.telemetry ? { system: base, suffix: _ctx.telemetry } : { system: base };
   };
 
   let ac = new AbortController();
@@ -188,6 +235,45 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           });
         },
       });
+
+  // Context-file trust gate (context/trust.js): KLYRO.md / AGENTS.md content
+  // only enters the prompt after the trust store approves it. Untrusted files
+  // prompt via the repl approval object (allow/always/always-persist → true,
+  // deny → false); every decision emits context.trust_prompt on globalBus.
+  const trustStore = new ContextTrust();
+  async function loadKlyroBlockTrust(): Promise<string> {
+    try {
+      const { loadTrustedKlyroMd } = await import('../context/trust.js');
+      const text = await loadTrustedKlyroMd(cwd, {
+        trust: trustStore,
+        approve: async (file, reason) => {
+          try {
+            const choice = await approval.ask({
+              toolName: 'context_trust',
+              reason: `untrusted context file (${reason}): ${file.path}`,
+              summary: file.path,
+            });
+            return choice === 'allow' || choice === 'always' || choice === 'always-persist';
+          } catch {
+            return false;
+          }
+        },
+        sessionId: typeof tuiSessionId === 'string' ? tuiSessionId : 'ephemeral',
+        emit: (ev) => globalBus.emit(ev),
+      });
+      return text ? `\n\n<KLYRO.md>\n${text.slice(0, 4000)}\n</KLYRO.md>` : '';
+    } catch {
+      return '';
+    }
+  }
+
+  // MCP servers need the approval object above — load them now.
+  await loadMcpTools();
+  // Non-TUI runs can prompt on stdin immediately; the TUI defers the gated
+  // load to onMounted (the modal can't render before mount — see below).
+  if (!useTui) {
+    klyroBlock = await loadKlyroBlockTrust().catch(() => '');
+  }
 
   let inflight: Promise<unknown> | null = null;
   let lastStatus: import('../tui/status.js').StatusSnapshot | null = null;
@@ -488,13 +574,39 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     return s.length > cap ? s.slice(0, cap) + `\n... [truncated ${s.length - cap} chars]` : s;
   }
   async function execShell(command: string, timeoutMs = 120_000): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
-    const r = await registry.execute('shell_exec', { command, timeoutMs }, { cwd, env: process.env, nonInteractive: true });
-    if (!r.ok) throw new Error((r.error as { message?: string }).message ?? 'shell failed');
-    return r.value as { exitCode: number | null; stdout: string; stderr: string };
+    // Internal shell executions bypass the agent runtime's event path, so
+    // audit them here: a redacted tool.call before, the matching tool.result
+    // after. One helper covers every slash handler (/commit, /push, …).
+    const callId = `internal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionId = typeof tuiSessionId === 'string' ? tuiSessionId : 'ephemeral';
+    const startedAt = Date.now();
+    globalBus.emit({
+      type: 'tool.call', ts: startedAt, sessionId, callId,
+      name: 'shell_exec', input: { internal: true, command: redact(command).slice(0, 2000) },
+    });
+    try {
+      const r = await registry.execute('shell_exec', { command, timeoutMs }, { cwd, env: process.env, nonInteractive: true });
+      if (!r.ok) throw new Error((r.error as { message?: string }).message ?? 'shell failed');
+      const v = r.value as { exitCode: number | null; stdout: string; stderr: string };
+      globalBus.emit({
+        type: 'tool.result', ts: Date.now(), sessionId, callId,
+        name: 'shell_exec', output: { internal: true, exitCode: v.exitCode },
+        isError: false, latencyMs: Date.now() - startedAt,
+      });
+      return v;
+    } catch (err) {
+      globalBus.emit({
+        type: 'tool.result', ts: Date.now(), sessionId, callId,
+        name: 'shell_exec', output: { internal: true, error: err instanceof Error ? err.message : String(err) },
+        isError: true, latencyMs: Date.now() - startedAt,
+      });
+      throw err;
+    }
   }
   /** Read-only LLM answer (no tools) — powers /ask, /explain, /compact. */
   async function answerReadOnly(question: string, context?: string): Promise<string> {
-    const sys = systemPromptFn({ cwd, telemetry: '' }) + '\n\nAnswer read-only: do not call tools, do not edit files.';
+    // Legacy chat path (no modes): resolve the split prompt back to one string.
+    const sys = resolveSystemPrompt(systemPromptFn, { cwd, telemetry: '' }).system + '\n\nAnswer read-only: do not call tools, do not edit files.';
     const attached = await buildAttachedBlock();
     const userText = (context ? `${question}\n\n<context>\n${context.slice(0, 6000)}\n</context>` : question) + attached;
     const req = {
@@ -559,6 +671,14 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           else hooks.append(ev.item);
         }
         pendingQueue.length = 0;
+        // Deferred trust-gated KLYRO.md load: the approval modal can only
+        // render once the App is mounted. Prompts sent before this resolves
+        // run without the KLYRO.md block (noted in /reload output).
+        if (useTui && !klyroBlock) {
+          void loadKlyroBlockTrust()
+            .then((b) => { klyroBlock = b; })
+            .catch(() => undefined);
+        }
       },
     }),
     { patchConsole: false } as unknown as Parameters<typeof render>[1],
@@ -612,7 +732,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       try {
         const simpleReq = {
           model,
-          system: systemPromptFn({ cwd, telemetry: '' }),
+          // Legacy chat path (no modes): plain string system, untouched by the split.
+          system: resolveSystemPrompt(systemPromptFn, { cwd, telemetry: '' }).system,
           messages: [{ role: 'user' as const, content: [{ kind: 'text' as const, text: taskText }] } as unknown as import('../agent/message.js').Message],
           tools: [] as import('../agent/provider-adapter.js').ToolDefinition[],
           signal: ac.signal,
@@ -2192,8 +2313,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           }
           const ctx = await buildLevel6Context({ cwd });
           ctxPrefix = ctx.formatted ? `\n\n<context>\n${ctx.formatted}\n</context>` : '';
-          const md = await import('../context/klyro-md.js').then((m) => m.loadKlyroMd(cwd)).catch(() => '');
-          klyroBlock = md ? `\n\n<KLYRO.md>\n${md.slice(0, 4000)}\n</KLYRO.md>` : '';
+          // Trust-gated like the initial load (the modal is mounted here,
+          // so untrusted files prompt instead of being silently dropped).
+          klyroBlock = await loadKlyroBlockTrust().catch(() => '');
           queuedAppend({
             id: `reload-${Date.now()}`,
             kind: 'text',

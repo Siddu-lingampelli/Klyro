@@ -49,7 +49,10 @@ describe('anthropicAdapter', () => {
       expect(headers['x-api-key']).toBe('test-key');
       expect(headers['anthropic-version']).toBe('2023-06-01');
       const body = JSON.parse(init.body as string);
-      expect(body.system).toBe('be helpful');
+      // Prompt caching is on by default: stable system ships as an array
+      // block with an ephemeral breakpoint, plus the caching beta header.
+      expect(body.system).toEqual([{ type: 'text', text: 'be helpful', cache_control: { type: 'ephemeral' } }]);
+      expect(headers['anthropic-beta']).toContain('prompt-caching-2024-07-31');
       expect(body.model).toBe('claude-3-5-sonnet-20241022');
       expect(body.stream).toBe(true);
       expect(body.max_tokens).toBe(1024);
@@ -89,6 +92,92 @@ describe('anthropicAdapter', () => {
         description: 'Read a file',
         input_schema: { type: 'object', properties: { path: { type: 'string' } } },
       }]);
+    });
+  });
+
+  describe('prompt caching', () => {
+    async function captureBody(opts: { promptCache?: boolean; betas?: string[] }, req: CallRequest) {
+      let body: any;
+      let headers: Record<string, string> | undefined;
+      const fetchImpl = (async (_url: string, init?: RequestInit) => {
+        body = JSON.parse(init?.body as string);
+        headers = init?.headers as Record<string, string>;
+        return new Response('event: message_stop\ndata: {"type":"message_stop"}\n\n', {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }) as typeof fetch;
+      const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl, ...opts });
+      for await (const _ of adapter.stream(req)) { /* drain */ }
+      return { body, headers: headers! };
+    }
+
+    it('puts the breakpoint on the stable block only when a suffix is present', async () => {
+      const { body } = await captureBody({}, {
+        model: 'm', system: 'stable', systemSuffix: 'volatile telemetry', messages: [], tools: [],
+      });
+      expect(body.system).toEqual([
+        { type: 'text', text: 'stable', cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: 'volatile telemetry' },
+      ]);
+    });
+
+    it('omits the breakpoint and beta when promptCache is false', async () => {
+      const { body, headers } = await captureBody({ promptCache: false }, {
+        model: 'm', system: 'be helpful', messages: [], tools: [],
+      });
+      expect(body.system).toBe('be helpful');
+      expect(headers['anthropic-beta'] ?? '').not.toContain('prompt-caching-2024-07-31');
+    });
+
+    it('keeps string form (suffix concatenated by caller contract) when disabled with suffix', async () => {
+      const { body } = await captureBody({ promptCache: false }, {
+        model: 'm', system: 'stable', systemSuffix: 'volatile', messages: [], tools: [],
+      });
+      // Disabled: array form still splits halves, but with no breakpoint.
+      expect(body.system).toEqual([
+        { type: 'text', text: 'stable' },
+        { type: 'text', text: 'volatile' },
+      ]);
+    });
+
+    it('merges the caching beta with user betas without duplicating', async () => {
+      const { headers } = await captureBody(
+        { betas: ['tools-2024-04-04', 'prompt-caching-2024-07-31'] },
+        { model: 'm', messages: [], tools: [] },
+      );
+      const betas = (headers['anthropic-beta'] ?? '').split(',');
+      expect(betas).toContain('tools-2024-04-04');
+      expect(betas.filter((b) => b === 'prompt-caching-2024-07-31')).toHaveLength(1);
+    });
+
+    it('parses cache_creation/cache_read tokens into usage', async () => {
+      const body = sse([
+        ['message_start', { type: 'message_start', message: { usage: { input_tokens: 100, cache_creation_input_tokens: 90, cache_read_input_tokens: 10 } } }],
+        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } }],
+        ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+        ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } }],
+        ['message_stop', { type: 'message_stop' }],
+      ]);
+      const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl: makeFetch(body) });
+      const events = [];
+      for await (const ev of adapter.stream({ model: 'm', messages: [], tools: [] })) events.push(ev);
+      const end = events.find((e) => e.kind === 'message_end');
+      expect(end).toMatchObject({ kind: 'message_end', usage: { input: 100, output: 5, cacheRead: 10, cacheWrite: 90 } });
+    });
+
+    it('omits cache counters from usage when the provider sends none', async () => {
+      const body = sse([
+        ['message_start', { type: 'message_start', message: { usage: { input_tokens: 7 } } }],
+        ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } }],
+        ['message_stop', { type: 'message_stop' }],
+      ]);
+      const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl: makeFetch(body) });
+      const events = [];
+      for await (const ev of adapter.stream({ model: 'm', messages: [], tools: [] })) events.push(ev);
+      const end = events.find((e) => e.kind === 'message_end') as { usage?: Record<string, number> };
+      expect(end?.usage).toEqual({ input: 7, output: 3 });
     });
   });
 

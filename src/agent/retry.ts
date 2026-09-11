@@ -15,7 +15,7 @@
  *
  *   delay = min(maxMs, baseMs * 2^attempt) ± jitter
  *
- * The default policy matches the L6 plan: 3 attempts, 500ms base, 8s cap.
+ * The default policy matches the L6 plan: 5 attempts, 500ms base, 8s cap.
  */
 
 import type { ProviderAdapter, StreamEvent, CallRequest } from './provider-adapter.js';
@@ -40,7 +40,7 @@ export interface RetryOptions {
 }
 
 export const DEFAULT_RETRY: Required<Omit<RetryOptions, 'signal' | 'onAttempt' | 'onRetry'>> = {
-  maxAttempts: 3,
+  maxAttempts: 5,
   baseMs: 500,
   maxMs: 8_000,
   sleep: defaultSleep,

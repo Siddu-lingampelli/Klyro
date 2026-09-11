@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { patternForCall } from './patterns.js';
-import { PatternApprovalCache } from './approval.js';
+import { PatternApprovalCache, approvalChoiceForKey, sanitizeForPrompt } from './approval.js';
 import { PolicyEngine, builtinRules, clonePolicyConfig } from './engine.js';
 
 describe('patternForCall', () => {
@@ -95,5 +95,44 @@ describe('PatternApprovalCache', () => {
     await cache.ask(req('shell_exec(npm *)'));
     await cache.ask(req('shell_exec(npm *)'));
     expect(inner.ask).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('approvalChoiceForKey', () => {
+  it("'A' persists to settings while 'a' is session-only", () => {
+    expect(approvalChoiceForKey('A')).toBe('always-persist');
+    expect(approvalChoiceForKey('a')).toBe('always');
+  });
+
+  it('maps single keys (case-insensitive except A)', () => {
+    expect(approvalChoiceForKey('y')).toBe('allow');
+    expect(approvalChoiceForKey('Y')).toBe('allow');
+    expect(approvalChoiceForKey('n')).toBe('deny');
+    expect(approvalChoiceForKey('d')).toBe('deny');
+    expect(approvalChoiceForKey('f')).toBe('expand');
+    expect(approvalChoiceForKey('?')).toBe('explain');
+    expect(approvalChoiceForKey('z')).toBeNull();
+  });
+});
+
+describe('sanitizeForPrompt', () => {
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+  it('strips ANSI CSI and OSC escapes', () => {
+    expect(sanitizeForPrompt(`${ESC}[31mred${ESC}[0m`)).toBe('red');
+    expect(sanitizeForPrompt(`a${ESC}]0;title${BEL}b`)).toBe('ab');
+  });
+
+  const SOH = String.fromCharCode(1);
+  const STX = String.fromCharCode(2);
+  it('strips control chars but keeps newline and tab', () => {
+    expect(sanitizeForPrompt(`a${SOH}b${STX}c`)).toBe('abc');
+    expect(sanitizeForPrompt('line1\nline2\tindented')).toBe('line1\nline2\tindented');
+  });
+
+  it('truncates to 500 chars with a hidden-count marker', () => {
+    const out = sanitizeForPrompt('x'.repeat(600));
+    expect(out).toBe('x'.repeat(500) + '…[+100 hidden]');
+    expect(sanitizeForPrompt('x'.repeat(500))).toBe('x'.repeat(500));
   });
 });

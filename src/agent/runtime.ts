@@ -31,10 +31,21 @@ import { detectVerifyCommand } from '../verification/auto.js';
 import { detectVerifiers } from '../verification/registry.js';
 import { ensureBaseline, getBaseline } from '../verification/baseline.js';
 import { compressTranscript, totalTokens } from '../context/tokenizer.js';
+import { ratesFor } from '../providers/model-info.js';
 import { classifyFailure, rerunOnce, gatherRepairContext, guardRepair } from '../verification/classify.js';
 import { findRelatedTests, buildScopedCommand, runScopedVerify, syntaxCheck, checkImports } from '../verification/scoped.js';
 import { EventBus, globalBus } from '../events/bus.js';
+import type { KlyroEvent } from '../events/catalog.js';
 import { TraceWriter } from '../trace/writer.js';
+
+/**
+ * Verification mode. The canonical definition lives in verification/engine.ts
+ * (sibling-owned: `export type VerifyMode = 'strict'|'advisory'|'off'`). It is
+ * resolved conditionally here so this file typechecks regardless of sibling
+ * landing order — and converges to the sibling type automatically once the
+ * sibling export exists.
+ */
+export type VerifyMode = typeof import('../verification/engine.js') extends { VerifyMode: infer V } ? V : 'strict' | 'advisory' | 'off';
 
 export interface RuntimeDeps {
   adapter: ProviderAdapter;
@@ -43,11 +54,33 @@ export interface RuntimeDeps {
   approval: ApprovalPrompt;
   /**
    * Build a system prompt given cwd + the current Level-7 runtime telemetry.
-   * The telemetry block is a compact, in-memory summary of the run so far
-   * (step count, last tool calls, recent errors). Injected as part of the
-   * system prompt so the model can see its own state mid-run.
+   *
+   * TELEMETRY SPLIT: the fn may return either a plain string (legacy —
+   * telemetry already concatenated, cache-unfriendly) or
+   * `{system, suffix}` where `suffix` is the volatile telemetry block.
+   * The runtime forwards both halves via CallRequest (`system` +
+   * `systemSuffix`) so adapters can keep the suffix out of the cacheable
+   * prefix (Anthropic array form) or concatenate it (OpenAI — unchanged).
+   * Both shapes are accepted so custom fns keep compiling.
    */
-  systemPrompt: (ctx: { cwd: string; telemetry?: string }) => string;
+  systemPrompt: SystemPromptFn;
+}
+
+/** Split system-prompt result: stable prefix + volatile telemetry suffix. */
+export interface SystemPromptResult {
+  system: string;
+  suffix?: string;
+}
+
+export type SystemPromptFn = (ctx: { cwd: string; telemetry?: string }) => string | SystemPromptResult;
+
+/** Normalize either systemPrompt shape into {system, suffix}. */
+export function resolveSystemPrompt(
+  fn: SystemPromptFn,
+  ctx: { cwd: string; telemetry?: string },
+): { system: string; suffix?: string } {
+  const r = fn(ctx);
+  return typeof r === 'string' ? { system: r } : { system: r.system, suffix: r.suffix };
 }
 
 export type Phase = 'understanding' | 'exploring' | 'planning' | 'implementing' | 'verifying' | 'done' | 'blocked' | 'limit';
@@ -93,6 +126,9 @@ export interface RunOptions {
     maxRepairAttempts?: number;
     timeoutMs?: number;
     requireVerify?: boolean;
+    /** Verification mode (default 'strict'). 'off' skips the pipeline;
+     * 'advisory' runs verify once on completion without repair turns. */
+    mode?: VerifyMode;
   };
   /**
    * Level 9 — persistence. When a SessionStore is provided, every message
@@ -115,6 +151,8 @@ export interface RunOptions {
     depth: number;
     maxDepth: number;
     allowedTools?: ReadonlySet<string>;
+    /** Path allow-set inherited from the parent (sibling C contract). */
+    allowedPaths?: readonly string[];
     model?: string;
   };
   /**
@@ -145,7 +183,7 @@ export type RuntimeEvent =
   | { kind: 'tool_call_end'; id: string; name: string; input: Record<string, unknown> }
   | { kind: 'policy_decision'; id: string; name: string; action: 'allow' | 'ask' | 'deny'; reason?: string }
   | { kind: 'tool_result'; id: string; name: string; output: unknown; isError: boolean; latencyMs: number }
-  | { kind: 'usage'; input: number; output: number; estimated?: boolean }
+  | { kind: 'usage'; input: number; output: number; estimated?: boolean; cacheRead?: number; cacheWrite?: number }
   | { kind: 'final_text'; text: string }
   | { kind: 'aborted' }
   | { kind: 'plan_update'; plan: PlanStep[] }
@@ -164,11 +202,11 @@ export interface RunResult {
   transcript: Message[];
   /** Whether any file-mutating tool ran (drives --require-verify semantics). */
   hasEdits: boolean;
-  usage: { input: number; output: number; estimated?: boolean };
+  usage: { input: number; output: number; estimated?: boolean; cacheRead?: number; cacheWrite?: number };
   /** Number of policy-driven user prompts the user accepted. */
   repairs?: number;
   /** Verification outcome (Level 8) */
-  verification?: { ok: boolean; command?: string; attempts: number; failureType?: string };
+  verification?: { ok: boolean; command?: string; attempts: number; failureType?: string; repairTokens?: { input: number; output: number } };
   /** 5.1 phase */
   phase?: Phase;
 }
@@ -184,20 +222,16 @@ export function toolDefinitions(registry: ToolRegistry): ToolDefinition[] {
   }));
 }
 
-// BUG-005: Model-aware cost estimation with sensible defaults.
-// Rates are per-1K tokens (input / output). Local models are $0.
-const MODEL_RATES: ReadonlyArray<{ test: (model: string) => boolean; input: number; output: number }> = [
-  { test: (m) => /gpt-4/i.test(m), input: 0.003, output: 0.015 },
-  { test: (m) => /gpt-3\.5/i.test(m), input: 0.0005, output: 0.0015 },
-  { test: (m) => /claude|anthropic/i.test(m), input: 0.003, output: 0.015 },
-  { test: (m) => /gemini/i.test(m), input: 0.00075, output: 0.003 },
-  { test: (m) => /o1/i.test(m), input: 0.015, output: 0.06 },
-];
-
+// BUG-005: Model-aware cost estimation, single-sourced from the
+// providers/model-info.ts rate table (local/unknown models are $0).
+// Cost is computed on input/output ONLY: cacheRead/cacheWrite are tracked
+// for observability but excluded because cached tokens bill at
+// provider-specific discounted rates we don't model — charging them at
+// full input rates would overstate spend, silently dropping them
+// understates it, so we keep them visible and out of the math.
 /** Estimate USD cost of a usage block given the model name. */
 export function estimateCost(model: string, usage: { input: number; output: number }): number {
-  const match = MODEL_RATES.find((r) => r.test(model));
-  const { input: inRate, output: outRate } = match ?? { input: 0.003, output: 0.015 };
+  const { input: inRate, output: outRate } = ratesFor(model);
   return (usage.input / 1000) * inRate + (usage.output / 1000) * outRate;
 }
 
@@ -237,13 +271,36 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     }
     return [{ role: 'user', content: [text(opts.task)] }];
   })();
-  const usage: { input: number; output: number; estimated?: boolean } = { input: 0, output: 0 };
+  const usage: { input: number; output: number; estimated?: boolean; cacheRead?: number; cacheWrite?: number } = { input: 0, output: 0 };
   let steps = 0;
   let toolCallCount = 0;
   let finalText = '';
   let repairs = 0;
   let verificationAttempts = 0;
   let hasEdits = false;
+  // Overflow recovery: at most one compress-and-retry per run.
+  let overflowRetried = false;
+  // Repair ledger + guard: set from the first verification failure until a
+  // verification passes. repairUsageStart snapshots usage at failure time so
+  // every verification payload can attribute its repairTokens delta.
+  let inRepairTurn = false;
+  let repairUsageStart: { input: number; output: number } | undefined;
+  const verifyMode: VerifyMode = opts.verify?.mode ?? 'strict';
+  const markRepairStarted = (): void => {
+    if (!repairUsageStart) repairUsageStart = { input: usage.input, output: usage.output };
+    inRepairTurn = true;
+  };
+  const repairTokensNow = (): { input: number; output: number } | undefined =>
+    repairUsageStart
+      ? { input: usage.input - repairUsageStart.input, output: usage.output - repairUsageStart.output }
+      : undefined;
+  /** Attach repairTokens to a verification payload when a repair ledger exists. */
+  const withRepairTokens = <V extends { ok: boolean; command?: string; attempts: number; failureType?: string }>(
+    v: V,
+  ): V & { repairTokens?: { input: number; output: number } } => {
+    const rt = repairTokensNow();
+    return rt ? { ...v, repairTokens: rt } : v;
+  };
   const emit = opts.onEvent;
   const telemetry = new RuntimeTelemetry();
   telemetry.setMaxSteps(maxSteps);
@@ -255,7 +312,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     tracer = new TraceWriter(opts.persist.sessionId);
     await tracer.init().catch(() => undefined);
   }
-  const emitKlyro = (ev: import('../events/catalog.js').KlyroEvent) => {
+  const emitKlyro = (ev: KlyroEvent) => {
     bus.emit(ev);
     tracer?.write(ev).catch(() => undefined);
   };
@@ -273,7 +330,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       phase = p;
       // Emit as any (RuntimeEvent extension) + KlyroEvent
       (emit as unknown as ((ev: unknown) => void))?.({ kind: 'phase_changed', phase });
-      emitKlyro({ type: 'phase.changed', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', phase } as unknown as import('../events/catalog.js').KlyroEvent);
+      emitKlyro({ type: 'phase.changed', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', phase });
     }
   };
   const store = opts.persist?.store;
@@ -344,7 +401,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
       await closeTracer();
-      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined, phase: 'blocked' };
+      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined, phase: 'blocked' };
     }
     steps++;
     // 5.1 phase transitions (model-narrated)
@@ -356,20 +413,29 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     emit?.({ kind: 'step_start', step: steps });
     telemetry.recordStepStart(steps);
 
-    const systemPrompt = deps.systemPrompt({ cwd: opts.cwd, telemetry: steps === 1 ? emptyTelemetryBlock() : telemetry.format() });
+    const { system: stableSystem, suffix: telemetrySuffix } = resolveSystemPrompt(deps.systemPrompt, {
+      cwd: opts.cwd,
+      telemetry: steps === 1 ? emptyTelemetryBlock() : telemetry.format(),
+    });
+    // Budget accounting sees what the model sees (prefix + suffix); the
+    // request itself keeps the halves split for cache-friendly adapters.
+    const systemForBudget = telemetrySuffix ? `${stableSystem}\n\n${telemetrySuffix}` : stableSystem;
     const BUDGET = { total: 120_000, reservedOutput: 4000 };
     let reqMessages = transcript;
-    let reqSystem: string | undefined = systemPrompt;
-    if (cachedTotalTokens(systemPrompt, transcript) > BUDGET.total) {
-      const c = compressTranscript(systemPrompt, transcript, BUDGET);
+    let reqSystem: string | undefined = stableSystem;
+    let reqSuffix: string | undefined = telemetrySuffix;
+    if (cachedTotalTokens(systemForBudget, transcript) > BUDGET.total) {
+      const c = compressTranscript(systemForBudget, transcript, BUDGET);
       reqSystem = c.system;
+      reqSuffix = undefined; // telemetry is regenerable — drop it under pressure
       reqMessages = c.messages;
       tokenCache = { lastRef: null, lastSystem: undefined, lastCount: 0 };
-      if (c.dropped > 0) emitKlyro({ type: 'context.compacted', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', dropped: c.dropped } as unknown as import('../events/catalog.js').KlyroEvent);
+      if (c.dropped > 0) emitKlyro({ type: 'context.compacted', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', dropped: c.dropped });
     }
     const req = {
       model: opts.parentContext?.model ?? opts.model,
       system: reqSystem,
+      ...(reqSuffix ? { systemSuffix: reqSuffix } : {}),
       messages: reqMessages,
       tools: toolDefinitions(deps.registry),
       ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
@@ -384,6 +450,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     let thinkingBuf = '';
     const pendingToolCalls = new Map<string, { id: string; name: string; argsJson: string }>();
     let lastFinishReason: string | undefined;
+    // Set when this step's request must be re-issued after overflow recovery.
+    let overflowRetryPending = false;
 
     for await (const ev of events) {
       if (opts.signal?.aborted) break outer;
@@ -407,13 +475,19 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         if (ev.usage) {
           usage.input += ev.usage.input;
           usage.output += ev.usage.output;
+          if (ev.usage.cacheRead !== undefined) usage.cacheRead = (usage.cacheRead ?? 0) + ev.usage.cacheRead;
+          if (ev.usage.cacheWrite !== undefined) usage.cacheWrite = (usage.cacheWrite ?? 0) + ev.usage.cacheWrite;
           telemetry.recordUsage(ev.usage.input, ev.usage.output);
-          emit?.({ kind: 'usage', input: usage.input, output: usage.output });
+          emit?.({
+            kind: 'usage', input: usage.input, output: usage.output,
+            ...(usage.cacheRead !== undefined ? { cacheRead: usage.cacheRead } : {}),
+            ...(usage.cacheWrite !== undefined ? { cacheWrite: usage.cacheWrite } : {}),
+          });
         } else {
           // Providers that omit usage (Ollama, vLLM, proxies): estimate from
           // the actual request + generated output so cost accounting never
           // silently records zero. Marked estimated for the UI/debugging.
-          const est = estimateTurnUsage(reqSystem, reqMessages, textBuf, pendingToolCalls);
+          const est = estimateTurnUsage(systemForBudget, reqMessages, textBuf, pendingToolCalls);
           usage.input += est.input;
           usage.output += est.output;
           usage.estimated = true;
@@ -421,6 +495,29 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           emit?.({ kind: 'usage', input: usage.input, output: usage.output, estimated: true });
         }
       } else if (ev.kind === 'error') {
+        // Overflow recovery: on the first REQUEST_TOO_LARGE of a run,
+        // aggressively compact the transcript and re-issue the request once.
+        // A second occurrence fails normally (returned as no_final below).
+        if (ev.code === 'REQUEST_TOO_LARGE' && !overflowRetried) {
+          overflowRetried = true;
+          overflowRetryPending = true;
+          telemetry.recordError('overflow_retry');
+          emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'REQUEST_TOO_LARGE', message: 'context overflow — aggressively compacting transcript and retrying the request once' });
+          try {
+            const compacted = compressTranscript(reqSystem, transcript, { total: 30_000, reservedOutput: 4000 });
+            if (compacted.messages.length < transcript.length || compacted.dropped > 0) {
+              transcript.splice(0, transcript.length, ...compacted.messages);
+            } else {
+              // Transcript already fits the aggressive budget — force it
+              // strictly smaller so the retry cannot repeat the overflow.
+              const halved = Math.max(4000, Math.floor(totalTokens(reqSystem, transcript) / 2));
+              const smaller = compressTranscript(reqSystem, transcript, { total: halved, reservedOutput: 4000 });
+              transcript.splice(0, transcript.length, ...smaller.messages);
+            }
+            tokenCache = { lastRef: null, lastSystem: undefined, lastCount: 0 };
+          } catch { /* ignore — retry with the transcript as-is */ }
+          break;
+        }
         telemetry.recordError(`stream_error: ${ev.code}`);
         if (store && sessionId) {
           try { await store.setStatus(sessionId, 'aborted', textBuf); } catch { /* ignore */ }
@@ -435,9 +532,18 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           hasEdits,
           usage,
           repairs,
-          verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined,
+          verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined,
         };
       }
+    }
+
+    // Overflow recovery lands here via `break`: re-issue the same step
+    // without consuming the step budget.
+    if (overflowRetryPending) {
+      overflowRetryPending = false;
+      steps--;
+      emit?.({ kind: 'step_end', step: steps + 1 });
+      continue outer;
     }
 
     // Build the assistant message. Tool calls are finalized here: JSON is
@@ -494,7 +600,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
       await closeTracer();
-      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+      return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined };
     }
     if (finalizedCalls.length === 0) {
       if (hadInvalidTool) {
@@ -506,6 +612,56 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         continue;
       }
       finalText = textBuf;
+      // Verify modes: 'off' skips the pipeline entirely (verification stays
+      // undefined, no repair turns). 'advisory' runs verify once on
+      // completion and reports the outcome without repair turns. 'strict'
+      // (default) runs the full pipeline with autonomous repair below.
+      if (verifyMode === 'off') {
+        emit?.({ kind: 'final_text', text: finalText });
+        emit?.({ kind: 'step_end', step: steps });
+        if (store && sessionId) {
+          try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
+        }
+        await closeTracer();
+        return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: undefined };
+      }
+      if (verifyMode === 'advisory') {
+        const advisoryCmd = opts.verify?.command ?? detectVerifyCommand(opts.cwd);
+        if (opts.verify?.enabled !== false && hasEdits && advisoryCmd) {
+          emit?.({ kind: 'verification_started', command: advisoryCmd });
+          let advisoryResult: VerifyResult;
+          try {
+            advisoryResult = await verify({ cwd: opts.cwd, command: advisoryCmd, timeoutMs: opts.verify?.timeoutMs });
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            advisoryResult = { ok: false, exitCode: -1, stdout: '', stderr: msg, failure: { type: 'unknown', files: [], raw: msg, exitCode: -1 } };
+          }
+          verificationAttempts++;
+          if (advisoryResult.ok) {
+            inRepairTurn = false;
+            emit?.({ kind: 'verification_succeeded', command: advisoryCmd });
+            emit?.({ kind: 'final_text', text: finalText });
+            emit?.({ kind: 'step_end', step: steps });
+            if (store && sessionId) {
+              try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
+            }
+            await closeTracer();
+            return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: withRepairTokens({ ok: true, command: advisoryCmd, attempts: verificationAttempts }) };
+          }
+          const advisoryFailure = advisoryResult.failure?.type ?? 'unknown';
+          markRepairStarted();
+          emit?.({ kind: 'verification_failed', step: String(steps), reason: diagnosticForModel(advisoryResult).slice(0, 800) });
+          emit?.({ kind: 'final_text', text: finalText });
+          emit?.({ kind: 'step_end', step: steps });
+          if (store && sessionId) {
+            try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
+          }
+          await closeTracer();
+          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: withRepairTokens({ ok: false, command: advisoryCmd, attempts: verificationAttempts, failureType: advisoryFailure }) };
+        }
+        // No verify applicable (disabled, no edits, or no command) — fall
+        // through to the normal completion return below.
+      }
       // Level 8 — Verification + Autonomous Repair (gated on hasEdits below — pure analysis skips verify)
       const verifyEnabled = opts.verify?.enabled !== false;
       const verifyCmd = opts.verify?.command ?? detectVerifyCommand(opts.cwd);
@@ -559,6 +715,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           } catch { /* scoped success is enough */ }
         }
         if (vResult.ok) {
+          inRepairTurn = false;
           emit?.({ kind: 'verification_succeeded', command: verifyCmd });
           emit?.({ kind: 'final_text', text: finalText });
           emit?.({ kind: 'step_end', step: steps });
@@ -566,7 +723,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
           }
           await closeTracer();
-          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
+          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: withRepairTokens({ ok: true, command: verifyCmd, attempts: verificationAttempts }) };
         }
         // 6.4 — classify
         const baseline = await getBaseline(opts.cwd, verifyCmd);
@@ -574,6 +731,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         const cls = classifyFailure({ failure: vResult.failure, stdout: vResult.stdout, stderr: vResult.stderr }, baseline, isFlaky);
         if (cls === 'flaky') {
           // rerun succeeded on second try — treat as flaky, don't count as repair
+          inRepairTurn = false;
           emit?.({ kind: 'verification_succeeded', command: verifyCmd });
           emit?.({ kind: 'final_text', text: finalText });
           emit?.({ kind: 'step_end', step: steps });
@@ -581,7 +739,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
           }
           await closeTracer();
-          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
+          return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: withRepairTokens({ ok: true, command: verifyCmd, attempts: verificationAttempts }) };
         }
         if (cls === 'env') {
           // don't try to repair env failures with code edits
@@ -589,10 +747,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           transcript.push(envMsg);
           await checkpoint(envMsg);
           verificationAttempts++;
+          markRepairStarted();
           emit?.({ kind: 'verification_failed', step: String(steps), reason: `env: ${diagnosticForModel(vResult).slice(0, 600)}` });
           if (verificationAttempts >= maxRepairs) {
             await closeTracer();
-            return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: false, command: verifyCmd, attempts: verificationAttempts, failureType: 'env' } };
+            return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: withRepairTokens({ ok: false, command: verifyCmd, attempts: verificationAttempts, failureType: 'env' }) };
           }
           emit?.({ kind: 'step_end', step: steps });
           continue;
@@ -608,6 +767,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           const failurePaths = new Set(vResult.failure?.files.map((f) => f.path).filter(Boolean) ?? []);
           const overlaps = [...failurePaths].some((p) => introducedPaths.has(p) || introducedPaths.has(path.basename(p)));
           if (!overlaps) {
+            inRepairTurn = false;
             emit?.({ kind: 'verification_succeeded', command: verifyCmd });
             emit?.({ kind: 'final_text', text: finalText });
             emit?.({ kind: 'step_end', step: steps });
@@ -615,11 +775,12 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
               try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
             }
             await closeTracer();
-            return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: true, command: verifyCmd, attempts: verificationAttempts } };
+            return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: withRepairTokens({ ok: true, command: verifyCmd, attempts: verificationAttempts }) };
           }
         }
         // Failure → repair loop (introduced)
         verificationAttempts++;
+        markRepairStarted();
         const diagnostic = diagnosticForModel(vResult);
         const failureType = vResult.failure?.type ?? 'unknown';
         // 6.4 — gather context
@@ -655,7 +816,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           emit?.({ kind: 'final_text', text: finalText });
           emit?.({ kind: 'step_end', step: steps });
           await closeTracer();
-          return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: { ok: false, command: verifyCmd, attempts: verificationAttempts, failureType } };
+          return { status: 'verify_failed', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: withRepairTokens({ ok: false, command: verifyCmd, attempts: verificationAttempts, failureType }) };
         }
         emit?.({ kind: 'step_end', step: steps });
         continue; // -> next iteration lets model repair
@@ -666,14 +827,21 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         try { await store.setStatus(sessionId, 'complete', finalText); } catch { /* ignore */ }
       }
       await closeTracer();
-      return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: true, attempts: verificationAttempts } : undefined };
+      return { status: 'complete', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: true, attempts: verificationAttempts }) : undefined };
     }
 
     // 3.1 — emit turn events
     emitKlyro({ type: 'turn.start', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', turn: steps, model: opts.model });
 
     // Execute each tool call (after policy) — 3.5 parallel if all concurrencySafe
-    const toolCtx: ToolContext = {
+    // Extended context carries sibling-C contract fields (agentAllowedPaths,
+    // repairGuard) via an intersection so this file compiles whether or not
+    // the sibling has landed those members on ToolContext yet.
+    type ExtendedToolContext = ToolContext & {
+      agentAllowedPaths?: readonly string[];
+      repairGuard?: { denyTestEdits: boolean };
+    };
+    const toolCtx: ExtendedToolContext = {
       cwd: opts.cwd,
       env: process.env,
       signal: opts.signal,
@@ -686,7 +854,9 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       agentDepth: opts.parentContext?.depth ?? 0,
       agentMaxDepth: opts.parentContext?.maxDepth ?? 1,
       ...(opts.parentContext?.allowedTools ? { agentAllowedTools: opts.parentContext.allowedTools } : {}),
+      ...(opts.parentContext?.allowedPaths ? { agentAllowedPaths: opts.parentContext.allowedPaths } : {}),
       ...(opts.parentContext?.model ?? opts.model ? { agentModel: opts.parentContext?.model ?? opts.model } : {}),
+      repairGuard: { denyTestEdits: inRepairTurn },
     };
     const allSafe = finalizedCalls.length > 1 && finalizedCalls.every((c) => deps.registry.get(c.name)?.isConcurrencySafe !== false);
     // Gate phase: policy decision + approval prompt for one call. Runs
@@ -700,7 +870,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       );
       emit?.({ kind: 'policy_decision', id: call.id, name: call.name, action: decision.action, ...(decision.action !== 'allow' ? { reason: (decision as { reason?: string }).reason } : {}) });
       // Mirror to KlyroEvent bus
-      emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: decision.action, ...(decision.action !== 'allow' ? { reason: (decision as { reason?: string }).reason } : {}) } as import('../events/catalog.js').KlyroEvent);
+      if (decision.action === 'allow') {
+        emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: 'allow' });
+      } else {
+        emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: decision.action, reason: (decision as { reason?: string }).reason });
+      }
 
       if (decision.action === 'deny') {
         const denyMsg: Message = {
@@ -771,7 +945,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     // call ×3 and same-file edited >8×.
     const markStuck = async (msg: string): Promise<void> => {
       stuckTriggers++;
-      emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: msg } as unknown as import('../events/catalog.js').KlyroEvent);
+      emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'stuck', message: msg });
       if (stuckTriggers === 1) {
         const note: Message = { role: 'user', content: [text(`[system note] Stuck detected: ${msg}. Stop repeating the same action; change approach.`)] };
         transcript.push(note);
@@ -882,6 +1056,18 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         if (opts.signal?.aborted) break;
       }
     }
+    // P0 — drain finished sub-agent completions into parent visibility.
+    // drainCompletions is OPTIONAL on the bridge — guarded with `?.` so
+    // older bridges without it simply yield nothing.
+    try {
+      const completions = opts.agentBridge?.drainCompletions?.() ?? [];
+      for (const c of completions) {
+        const body = c.finalText ?? c.error?.message ?? '';
+        const msg: Message = { role: 'user', content: [text(`Subtask ${c.taskId} (${c.agentName}) ${c.status}: ${body.slice(0, 500)}`)] };
+        transcript.push(msg);
+        await checkpoint(msg);
+      }
+    } catch { /* ignore — completions are best-effort visibility */ }
     emit?.({ kind: 'step_end', step: steps });
     emitKlyro({ type: 'turn.end', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', turn: steps });
     // Level 9 — checkpoint status after each step
@@ -898,7 +1084,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
     }
     await closeTracer();
-    return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+    return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined };
   }
 
   // 5.2 — stuck termination (P0-3): bounded stop instead of unbounded token burn.
@@ -908,7 +1094,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       try { await store.setStatus(sessionId, 'stuck', finalText); } catch { /* ignore */ }
     }
     await closeTracer();
-    return { status: 'stuck', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+    return { status: 'stuck', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined };
   }
 
   emit?.({ kind: 'final_text', text: finalText });
@@ -916,7 +1102,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     try { await store.setStatus(sessionId, 'max_steps', finalText); } catch { /* ignore */ }
   }
   await closeTracer();
-  return { status: 'max_steps', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? { ok: false, attempts: verificationAttempts } : undefined };
+  return { status: 'max_steps', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined };
 }
 
 /**
@@ -1062,7 +1248,7 @@ function inferFileChanged(
   return null;
 }
 
-export function defaultSystemPrompt(ctx: { cwd: string; telemetry?: string }): string {
+export function defaultSystemPrompt(ctx: { cwd: string; telemetry?: string }): SystemPromptResult {
   const base = [
     'You are Klyro, an autonomous coding harness. You solve the user\'s task by',
     'calling tools in a loop. Prefer the smallest change that solves the task.',
@@ -1070,7 +1256,10 @@ export function defaultSystemPrompt(ctx: { cwd: string; telemetry?: string }): s
     'Do not invent file paths. Do not call tools outside the working directory.',
   ].join(' ');
   if (ctx.telemetry) {
-    return base + '\n\n' + ctx.telemetry + '\n\nUse the telemetry above to avoid repeating the same failing call and to keep within the step budget.';
+    return {
+      system: base,
+      suffix: ctx.telemetry + '\n\nUse the telemetry above to avoid repeating the same failing call and to keep within the step budget.',
+    };
   }
-  return base;
+  return { system: base };
 }

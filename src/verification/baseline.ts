@@ -8,7 +8,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { primaryVerifyCommand } from './registry.js';
+import { primaryVerifyCommand, filteredVerifyEnv } from './registry.js';
 
 export interface BaselineResult {
   head: string;
@@ -22,7 +22,8 @@ export interface BaselineResult {
 
 async function gitHead(cwd: string): Promise<string> {
   return new Promise((resolve) => {
-    const child = spawn('git', ['rev-parse', 'HEAD'], { cwd, shell: false });
+    // S2: verify commands run with filtered env; servers needing keys must use explicit config.
+    const child = spawn('git', ['rev-parse', 'HEAD'], { cwd, shell: false, env: filteredVerifyEnv() });
     let out = '';
     child.stdout.on('data', (b: Buffer) => { out += b.toString(); });
     child.on('close', () => resolve(out.trim() || 'no-head'));
@@ -71,6 +72,12 @@ export async function runBaseline(cwd: string, command?: string, timeoutMs = 90_
     fs.mkdirSync(path.dirname(p), { recursive: true });
     const tmp = `${p}.tmp-${crypto.randomBytes(4).toString('hex')}`;
     fs.writeFileSync(tmp, JSON.stringify(baseline, null, 2));
+    // N5: fsync before rename — mirrors the persistence/store.ts writeIndex
+    // idiom (write → fsync → rename) so a crash can't lose the baseline.
+    try {
+      const fh = fs.openSync(tmp, 'r');
+      try { fs.fsyncSync(fh); } finally { fs.closeSync(fh); }
+    } catch { /* ignore on Windows */ }
     fs.renameSync(tmp, p);
   } catch { /* ignore */ }
   return baseline;
@@ -79,7 +86,8 @@ export async function runBaseline(cwd: string, command?: string, timeoutMs = 90_
 const MAX_BASELINE_BYTES = 256 * 1024;
 function runCmd(cwd: string, command: string, timeoutMs: number): Promise<{ ok: boolean; exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd, shell: true, env: process.env });
+    // S2: verify commands run with filtered env; servers needing keys must use explicit config.
+    const child = spawn(command, { cwd, shell: true, env: filteredVerifyEnv() });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
     let done = false;

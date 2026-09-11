@@ -29,10 +29,13 @@ export type KlyroEvent =
   | { type: 'subtask.progress'; ts: number; sessionId: string; taskId: string; note: string }
   | { type: 'subtask.completed'; ts: number; sessionId: string; taskId: string; status: 'succeeded'; durationMs: number; steps: number; toolCalls: number }
   | { type: 'subtask.failed'; ts: number; sessionId: string; taskId: string; status: 'failed' | 'cancelled' | 'timed_out' | 'blocked'; durationMs: number; error?: { code: string; message: string } }
+  | { type: 'subtask.cancelled'; ts: number; sessionId: string; taskId: string; status: 'cancelled'; durationMs: number; error?: { code: string; message: string } }
+  | { type: 'subtask.timed_out'; ts: number; sessionId: string; taskId: string; status: 'timed_out'; durationMs: number; error?: { code: string; message: string } }
   | { type: 'subtask.tool_call'; ts: number; sessionId: string; taskId: string; callId: string; name: string }
   | { type: 'subtask.tool_result'; ts: number; sessionId: string; taskId: string; callId: string; name: string; isError: boolean; latencyMs: number }
-  | { type: 'subtask.merged'; ts: number; sessionId: string; taskId: string; changedFiles: string[] }
+  | { type: 'subtask.merged'; ts: number; sessionId: string; taskId: string; changedFiles: string[]; merged?: boolean }
   | { type: 'provider.retry'; ts: number; sessionId: string; attempt: number; status: string; retryAfterMs?: number }
-  | { type: 'context.trust_prompt'; ts: number; sessionId: string; path: string; reason: 'unknown' | 'changed'; trusted: boolean };
+  | { type: 'context.trust_prompt'; ts: number; sessionId: string; path: string; reason: 'unknown' | 'changed'; trusted: boolean }
+  | { type: 'context.compacted'; ts: number; sessionId: string; dropped: number };
 
 export type KlyroEventType = KlyroEvent['type'];
