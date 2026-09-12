@@ -125,7 +125,7 @@ export class McpClient implements McpClientLike {
             await this.request('initialize', {
               protocolVersion: PROTOCOL_VERSION,
               capabilities: {},
-              clientInfo: { name: 'klyro', version: '1.0.1' },
+              clientInfo: { name: 'klyro', version: '1.0.2' },
             }, timeoutMs);
             this.notify('notifications/initialized', {});
             this.connected = true;
