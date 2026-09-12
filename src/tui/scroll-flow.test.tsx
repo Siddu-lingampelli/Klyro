@@ -82,7 +82,7 @@ describe('scroll flow diagnostics', () => {
     }
     const frozen = lastFrame() ?? '';
     expect(frozen).toContain('MSG-00-tag'); // viewport did not yank down
-    expect(frozen).toMatch(/↓ \d+ new/); // badge visible
+    expect(frozen).toMatch(/↓ \d+ unread/); // badge visible
     expect(rowsOf(frozen)).toBeLessThanOrEqual(32);
     stdin.write('\x1b[F'); // End → follow
     await tick(50);

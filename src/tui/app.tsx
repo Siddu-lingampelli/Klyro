@@ -17,6 +17,7 @@ import {
   scrollReducer,
   resolveTopRow,
   maxTopFor,
+  badgeLabel,
   type ScrollState,
   type ScrollAction,
   type ScrollCtx,
@@ -377,7 +378,7 @@ export function App(props: AppProps): React.JSX.Element {
   );
 
   const scroll = useChatScroll({ keys: blockKeys, heights: blockHeights, viewportH, width });
-  const { topRow, maxTop, pinned, pendingNew, commands } = scroll;
+  const { topRow, maxTop, pinned, pendingNew, commands, atBottom } = scroll;
   const trackH = viewportH;
   const thumbPos = maxTop === 0 ? 0 : Math.round((topRow / maxTop) * (trackH - 1));
 
@@ -555,6 +556,7 @@ export function App(props: AppProps): React.JSX.Element {
       if (tcmd) { transcriptHandle.runTranscriptCommand(tcmd); return; }
       if (key.home) { commands.jumpTop(); return; }
       if (key.end)  { commands.jumpBottom(); return; }
+      if (inputStr === ' ' && pinned && pendingNew > 0) { commands.jumpBottom(); return; } // Space → jump to unread tail
       if (key.ctrl && inputStr === 'g') { commands.jumpBottom(); return; } // Ctrl+G → bottom
       if ((key.ctrl && inputStr === 'b')) { commands.pageUp(); return; }
       if ((key.ctrl && inputStr === 'f')) { commands.pageDown(); return; }
@@ -745,7 +747,7 @@ export function App(props: AppProps): React.JSX.Element {
             </Box>
           ) : null}
         </Box>
-        {isFullscreen ? (
+        {isFullscreen && !atBottom ? (
           <Box flexDirection="column" width={1} marginLeft={1}>
             {Array.from({ length: trackH }).map((_, i) => (
               <Text key={i} color={i === thumbPos ? (tokens.colors.accent as string) : (tokens.colors.guide as string)}>{i === thumbPos ? '●' : '│'}</Text>
@@ -753,10 +755,10 @@ export function App(props: AppProps): React.JSX.Element {
           </Box>
         ) : null}
       </Box>
-      {pinned && pendingNew > 0 ? (
-        <Box justifyContent="flex-end" paddingX={1} flexShrink={0}>
+      {pinned && badgeLabel(atBottom, pendingNew, status.status !== 'running') ? (
+        <Box justifyContent="center" flexShrink={0}>
           <Text backgroundColor={tokens.colors.accentSoft as string} color={tokens.colors.accent as string} bold>
-            {' ↓ '}{pendingNew >= 1000 ? '999+ new' : `${pendingNew} new`}{' '}
+            {' '}{badgeLabel(atBottom, pendingNew, status.status !== 'running')}{' '}
           </Text>
         </Box>
       ) : null}

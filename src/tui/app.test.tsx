@@ -847,13 +847,13 @@ describe('App', () => {
     await waitForMatch(lastFrame, /⇅ 0\/\d+/);
     hooks!.append({ id: 'late-1', kind: 'text', text: 'LATE-1-tag', role: 'assistant' });
     // Badge counts lines grown while pinned.
-    await waitForMatch(lastFrame, /↓ \d+ new/);
+    await waitForMatch(lastFrame, /↓ \d+ unread/);
     hooks!.clearTranscript();
     // Wait for transcript content to actually clear (no stale MSG-* items) —
     // this is the "no stale badge" invariant: after a clear, the view must
     // drop back to follow-tail with the pin/count reset.
     await waitForAbsent(lastFrame, /MSG-\d{2}-tag/);
-    await waitForAbsent(lastFrame, /↓ \d+ new/);
+    await waitForAbsent(lastFrame, /↓ \d+ unread/);
     // Fresh session: seed 25 more, let them settle to a bottom-anchored view.
     for (let i = 0; i < 25; i++) {
       hooks!.append({ id: `n-${i}`, kind: 'text', text: `NEW-${i.toString().padStart(2, '0')}-tag`, role: 'user' });
@@ -864,7 +864,7 @@ describe('App', () => {
     await waitForMatch(lastFrame, /NEWLATE-tag/);
     await new Promise((r) => setTimeout(r, 100));
     const afterFollow = lastFrame() ?? '';
-    expect(afterFollow).not.toMatch(/↓ \d+ new/);
+    expect(afterFollow).not.toMatch(/↓ \d+ unread/);
     expect(afterFollow).not.toMatch(/MSG-\d{2}-tag/);
   });
 

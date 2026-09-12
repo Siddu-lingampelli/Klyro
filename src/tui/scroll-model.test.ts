@@ -48,13 +48,15 @@ describe('freeze when pinned (§5.6)', () => {
     const after = scrollReducer(pinned, { type: 'CONTENT_GREW', lines: 6 }, grown);
     expect(resolveTopRow(after, grown).topRow).toBe(before);
     expect(after.newSinceUnstick).toBe(6);
-    expect(badgeLabel(false, after.newSinceUnstick, false)).toBe('↓ 6 new');
+    expect(badgeLabel(false, after.newSinceUnstick, false)).toBe('↓ 6 unread');
   });
   it('badge counts display lines, caps at 999+', () => {
-    expect(badgeLabel(false, 1200, false)).toBe('↓ 999+ new');
+    expect(badgeLabel(false, 1200, false)).toBe('↓ 999+ unread');
     expect(badgeLabel(true, 5, false)).toBe('');
     expect(badgeLabel(false, 0, false)).toBe('');
-    expect(badgeLabel(false, 5, true)).toBe('↓ jump to end');
+    // Idle no longer flips the wording (Ink can't capture the click the
+    // "jump to end" affordance implied); the count shows either way (§7.2).
+    expect(badgeLabel(false, 5, true)).toBe('↓ 5 unread');
   });
 });
 

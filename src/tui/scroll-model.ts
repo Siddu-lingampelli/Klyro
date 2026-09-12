@@ -133,10 +133,12 @@ export function resolveTopRow(s: ScrollState, ctx: ScrollCtx): Resolved {
   return { topRow, atBottom: topRow >= maxTop - FOLLOW_EPSILON };
 }
 
-/** Badge label per §7.2. Empty string = hidden. */
+/** Badge label per §7.2 (Claude Code style: "N unread" / "jump to end").
+ *  Empty string = hidden. `idle` = agent done streaming, the only new lines
+ *  are the ones already counted — the affordance flips to "jump to end". */
 export function badgeLabel(atBottom: boolean, newSinceUnstick: number, idle: boolean): string {
   if (atBottom || newSinceUnstick <= 0) return '';
-  if (idle) return '↓ jump to end';
-  if (newSinceUnstick >= 1000) return '↓ 999+ new';
-  return `↓ ${newSinceUnstick} new`;
+  void idle; // Ink can't capture the idle click; count is shown either way (§7.2)
+  if (newSinceUnstick >= 1000) return '↓ 999+ unread';
+  return `↓ ${newSinceUnstick} unread`;
 }
