@@ -17,7 +17,7 @@ export const todoWriteTool = defineTool({
   name: 'todo_write',
   description: 'Update the live plan checklist. Persisted and re-injected when stale.',
   inputSchema: InputSchema,
-  permission: 'read',
+  permission: 'edit',
   isConcurrencySafe: true,
   execute: async (input, ctx) => {
     return safe(async () => {

@@ -3,7 +3,8 @@ import { Writable } from 'node:stream';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { runOnce, loadTranscript } from './run.js';
+import { runOnce, loadTranscript, shouldForceExit } from './run.js';
+import { ConfigSchema, resolveProviderChain } from './config.js';
 import type { ProviderAdapter, StreamEvent } from '../agent/provider-adapter.js';
 
 function scriptedAdapter(events: StreamEvent[][]): ProviderAdapter {
@@ -265,8 +266,7 @@ describe('runOnce', () => {
   });
 
   describe('--dry-run', () => {
-    it('prints the prompt assembly as JSON and exits 0 without calling the model', async () => {
-      const stream = vi.fn(async function* () {
+    it('prints the prompt assembly as JSON and exits 0 without calling the model', async () => {      const stream = vi.fn(async function* () {
         // should never be called
         yield { kind: 'message_start' as const };
       });
@@ -292,6 +292,43 @@ describe('runOnce', () => {
       expect(Array.isArray(report.policyRules)).toBe(true);
       expect(typeof report.systemPrompt).toBe('string');
       expect(report.systemPrompt.length).toBeGreaterThan(0);
+    });
+
+    it('redacts secrets in task and systemPrompt (sk-ant-XXX → [REDACTED])', async () => {
+      const rawKey = 'sk-ant-ABCDEFGHIJKLMNOPQRSTUVWX';
+      const adapter: ProviderAdapter = { id: 'mock', stream: vi.fn(async function* () { yield { kind: 'message_start' as const }; }) };
+      const { out, value } = await captureStdout(() => runOnce({
+        task: `use key ${rawKey} now`,
+        cwd: process.cwd(),
+        model: 'mock-model',
+        adapter,
+        dryRun: true,
+        abortOnSigint: false,
+      }));
+      expect(value).toBe(0);
+      const report = JSON.parse(out.trim());
+      expect(report.task).toContain('[REDACTED');
+      expect(report.task).not.toContain(rawKey);
+      expect(out).not.toContain(rawKey);
+    });
+  });
+
+  describe('--agent', () => {
+    it('returns 2 for an unknown agent without touching the network', async () => {
+      const stream = vi.fn(async function* () {
+        yield { kind: 'message_start' as const };
+      });
+      const adapter: ProviderAdapter = { id: 'mock', stream };
+      const code = await runOnce({
+        task: 'do things',
+        cwd: process.cwd(),
+        model: 'mock-model',
+        adapter,
+        agent: 'no-such-agent',
+        abortOnSigint: false,
+      });
+      expect(code).toBe(2);
+      expect(stream).not.toHaveBeenCalled();
     });
   });
 
@@ -355,6 +392,68 @@ describe('runOnce', () => {
         abortOnSigint: false,
       })).rejects.toThrow(/cannot read transcript file/);
     });
+  });
+});
+
+describe('shouldForceExit (double-Ctrl+C)', () => {
+  it('forces exit only when the previous SIGINT is within 1500ms', () => {
+    expect(shouldForceExit(undefined, 1000)).toBe(false);
+    expect(shouldForceExit(0, 1499)).toBe(true);
+    expect(shouldForceExit(0, 1500)).toBe(false);
+    expect(shouldForceExit(0, 5000)).toBe(false);
+    expect(shouldForceExit(1000, 1000)).toBe(true);
+  });
+});
+
+describe('providers.failover config + resolveProviderChain', () => {
+  const ENV_KEY = 'KLYRO_TEST_FAILOVER_KEY';
+  beforeEach(() => { process.env[ENV_KEY] = 'fallback-secret'; });
+  afterEach(() => { delete process.env[ENV_KEY]; });
+
+  it('accepts a valid failover list in the zod schema', () => {
+    const res = ConfigSchema.safeParse({
+      providers: {
+        failover: [
+          { provider: 'anthropic', apiKeyEnv: ENV_KEY },
+          { provider: 'openai', baseURL: 'http://localhost:11434/v1', apiKey: 'local' },
+        ],
+      },
+    });
+    expect(res.success).toBe(true);
+  });
+
+  it('rejects invalid failover entries (exit-3 validation)', () => {
+    expect(ConfigSchema.safeParse({ providers: { failover: [{ provider: 'bogus' }] } }).success).toBe(false);
+    expect(ConfigSchema.safeParse({ providers: { failover: 'nope' } }).success).toBe(false);
+    expect(ConfigSchema.safeParse({}).success).toBe(true);
+  });
+
+  it('resolves primary + failover entries and skips missing-key entries', async () => {
+    const chain = await resolveProviderChain(process.cwd(), {
+      provider: 'openai',
+      apiKey: 'primary-key',
+      baseUrl: 'http://primary/v1',
+      providers: {
+        failover: [
+          { provider: 'anthropic', apiKeyEnv: ENV_KEY },
+          // No key anywhere — skipped with a stderr reason.
+          { provider: 'openai', baseURL: 'http://dead/v1' },
+        ],
+      },
+    });
+    expect(chain.length).toBe(2);
+    expect(chain[0]).toMatchObject({ provider: 'openai', apiKey: 'primary-key', baseURL: 'http://primary/v1' });
+    expect(chain[1]).toMatchObject({ provider: 'anthropic', apiKey: 'fallback-secret' });
+  });
+
+  it('resolves apiKeyEnv from the environment', async () => {
+    const chain = await resolveProviderChain(process.cwd(), {
+      provider: 'openai',
+      apiKey: 'primary-key',
+      providers: { failover: [{ provider: 'anthropic', baseURL: 'https://api.anthropic.com', apiKeyEnv: ENV_KEY }] },
+    });
+    expect(chain[1]?.apiKey).toBe('fallback-secret');
+    expect(chain[1]?.baseURL).toBe('https://api.anthropic.com');
   });
 });
 

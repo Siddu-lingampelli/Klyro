@@ -6,6 +6,13 @@
  * the serialized line is passed through redact() before it hits disk so
  * secrets never land in the trace. readAll skips corrupt lines instead of
  * discarding the whole trace.
+ *
+ * Trace-dir rationale (PRD divergence): the PRD places traces at
+ * `~/.klyro/projects/<hash>/traces/<session>.jsonl` (global store), but this
+ * writer defaults to `<cwd>/.klyro/traces/<session>.jsonl` (project-local)
+ * so traces travel with the working tree — inspectable offline, backed up
+ * with the repo, and resolvable without a global-project-hash lookup. The
+ * `dir` ctor param preserves the PRD path for callers that want it.
  */
 
 import * as fs from 'node:fs/promises';

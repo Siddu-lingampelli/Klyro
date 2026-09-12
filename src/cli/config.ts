@@ -26,10 +26,103 @@ export const ConfigSchema = z
     // Global flags persisted
     'model.default': z.string().optional(),
     'model.small': z.string().optional(),
+    // Provider failover chain (L15): ordered fallbacks after the primary.
+    // Optional so existing configs keep validating; invalid entries exit 3.
+    providers: z
+      .object({
+        failover: z
+          .array(
+            z.object({
+              provider: z.enum(['openai', 'anthropic']),
+              baseURL: z.string().optional(),
+              apiKey: z.string().optional(),
+              apiKeyEnv: z.string().optional(),
+            }),
+          )
+          .optional(),
+      })
+      .optional(),
   })
   .passthrough();
 
 export type KlyroConfig = z.infer<typeof ConfigSchema>;
+
+// --- Provider failover chain (L15 differentiator) ---
+// `providers.failover` is an ordered list of fallback providers. Entries
+// with unresolvable/missing API keys are skipped at chain-build time.
+export const FailoverEntrySchema = z.object({
+  provider: z.enum(['openai', 'anthropic']),
+  baseURL: z.string().optional(),
+  apiKey: z.string().optional(),
+  apiKeyEnv: z.string().optional(),
+});
+
+export type FailoverEntry = z.infer<typeof FailoverEntrySchema>;
+
+export const FailoverConfigSchema = z.object({
+  failover: z.array(FailoverEntrySchema).optional(),
+});
+
+export interface ResolvedProviderEntry {
+  provider: 'openai' | 'anthropic';
+  baseURL?: string;
+  apiKey?: string;
+}
+
+/**
+ * Build the ordered provider chain: primary (existing precedence:
+ * flags > env > merged config > defaults) followed by `providers.failover`
+ * entries. `apiKeyEnv` names an env var resolved at build time; entries
+ * whose key is missing/empty are skipped (with a stderr reason) so a
+ * half-configured fallback can never become the active provider.
+ */
+export async function resolveProviderChain(cwd = process.cwd(), flags: Record<string, unknown> = {}): Promise<ResolvedProviderEntry[]> {
+  const merged = await loadMergedConfig(cwd, flags);
+  const chain: ResolvedProviderEntry[] = [];
+  const skipped: string[] = [];
+
+  // Primary — mirror the precedence resolveProvider uses: explicit flags,
+  // then KLYRO_* env, then merged config.
+  const flagProvider = typeof flags['provider'] === 'string' ? (flags['provider'] as string) : undefined;
+  const flagBaseUrl = typeof flags['baseUrl'] === 'string' ? (flags['baseUrl'] as string) : typeof flags['baseURL'] === 'string' ? (flags['baseURL'] as string) : undefined;
+  const flagApiKey = typeof flags['apiKey'] === 'string' ? (flags['apiKey'] as string) : undefined;
+  const primaryProvider = (flagProvider ?? (merged.provider as string | undefined) ?? process.env.KLYRO_PROVIDER ?? 'openai') as 'openai' | 'anthropic';
+  const primaryBaseURL = flagBaseUrl ?? (merged.baseUrl as string | undefined) ?? (merged.baseURL as string | undefined) ?? process.env.KLYRO_BASE_URL;
+  const primaryApiKey = flagApiKey ?? (merged.apiKey as string | undefined) ?? (merged.api_key as string | undefined) ?? process.env.KLYRO_API_KEY;
+  if (primaryProvider === 'openai' || primaryProvider === 'anthropic') {
+    chain.push({
+      provider: primaryProvider,
+      ...(primaryBaseURL ? { baseURL: primaryBaseURL } : {}),
+      ...(primaryApiKey ? { apiKey: primaryApiKey } : {}),
+    });
+  }
+
+  // Failover list — validated leniently (invalid entries skipped, never fatal).
+  const providersRaw = merged.providers as unknown;
+  const parsed = FailoverConfigSchema.safeParse(providersRaw ?? {});
+  if (parsed.success && parsed.data.failover) {
+    for (const entry of parsed.data.failover) {
+      let key = entry.apiKey;
+      if (!key && entry.apiKeyEnv) {
+        const v = process.env[entry.apiKeyEnv];
+        if (v && v.length > 0) key = v;
+      }
+      if (!key) {
+        skipped.push(`failover ${entry.provider}${entry.apiKeyEnv ? ` (env ${entry.apiKeyEnv} unset)` : ' (no apiKey)'}`);
+        continue;
+      }
+      chain.push({
+        provider: entry.provider,
+        ...(entry.baseURL ? { baseURL: entry.baseURL } : {}),
+        apiKey: key,
+      });
+    }
+  }
+  for (const reason of skipped) {
+    try { process.stderr.write(`klyro: skipping failover entry — ${reason}\n`); } catch { /* ignore */ }
+  }
+  return chain;
+}
 
 // --- Paths ---
 export function getConfigDir(): string {

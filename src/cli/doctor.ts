@@ -11,7 +11,6 @@ import { spawn } from 'node:child_process';
 import { getConfigPath, loadConfig } from './config.js';
 import { resolveProvider, providerHelp } from '../providers.js';
 import { getDefaultSessionsDir } from '../persistence/session.js';
-import { builtinRegistry } from '../tools/registry.js';
 
 interface Check {
   name: string;
@@ -99,9 +98,15 @@ function checkGit(): Promise<Check> {
   });
 }
 
-function checkTools(): Check {
-  const reg = builtinRegistry();
-  return { name: 'Tools', ok: true, detail: `${reg.list().length} tools: ${reg.list().map((t) => t.name).join(', ')}` };
+async function checkTools(): Promise<Check> {
+  try {
+    const { builtinRegistry } = await import('../tools/registry.js');
+    const reg = builtinRegistry();
+    return { name: 'Tools', ok: true, detail: `${reg.list().length} tools: ${reg.list().map((t) => t.name).join(', ')}` };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { name: 'Tools', ok: false, detail: `registry unavailable: ${msg}` };
+  }
 }
 
 function checkPlatform(): Check {
@@ -109,20 +114,76 @@ function checkPlatform(): Check {
   return { name: 'Platform', ok, detail: `${process.platform} ${process.arch} ${ok ? '✓' : '✗ unsupported'}` };
 }
 
-export async function runDoctor(opts: { json?: boolean } = {}): Promise<number> {
+async function checkMcp(cwd: string): Promise<Check> {
+  try {
+    const { loadMcpServers } = await import('../mcp/config.js');
+    const cfg = loadMcpServers(cwd);
+    const names = Object.keys(cfg.servers);
+    if (names.length === 0) return { name: 'MCP servers', ok: true, detail: 'none' };
+    let project = 0;
+    for (const n of names) {
+      if (cfg.sources[n] === 'project') project++;
+    }
+    return { name: 'MCP servers', ok: true, detail: `${names.length} servers (global ${names.length - project}/project ${project})` };
+  } catch {
+    return { name: 'MCP servers', ok: true, detail: 'none' };
+  }
+}
+
+function countTrustEntries(p: string): number | null {
+  try {
+    const raw = fsSync.readFileSync(p, 'utf-8');
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return Object.keys(parsed as Record<string, unknown>).length;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function checkTrust(): Promise<Check> {
+  try {
+    const [{ defaultTrustStorePath }] = [await import('../context/trust.js')];
+    const [{ defaultMcpTrustStorePath }] = [await import('../mcp/trust.js')];
+    const ctx = countTrustEntries(defaultTrustStorePath());
+    const mcp = countTrustEntries(defaultMcpTrustStorePath());
+    if (ctx === null && mcp === null) return { name: 'Trust stores', ok: true, detail: 'none' };
+    return {
+      name: 'Trust stores',
+      ok: true,
+      detail: `context-trust ${ctx ?? 0} entries, mcp-trust ${mcp ?? 0} entries`,
+    };
+  } catch {
+    return { name: 'Trust stores', ok: true, detail: 'none' };
+  }
+}
+
+export async function runDoctor(opts: { json?: boolean; cwd?: string } = {}): Promise<number> {
+  const cwd = opts.cwd ?? process.cwd();
   const checks: Check[] = [];
   checks.push(checkNode());
   checks.push(await checkConfig());
   checks.push(await checkProvider());
   checks.push(await checkSessions());
   checks.push(await checkGit());
-  checks.push(checkTools());
+  checks.push(await checkTools());
   checks.push(checkPlatform());
+  const mcpCheck = await checkMcp(cwd);
+  const trustCheck = await checkTrust();
+  checks.push(mcpCheck);
+  checks.push(trustCheck);
 
   const allOk = checks.every((c) => c.ok);
 
   if (opts.json) {
-    process.stdout.write(JSON.stringify({ ok: allOk, checks }, null, 2) + '\n');
+    process.stdout.write(JSON.stringify({
+      ok: allOk,
+      checks,
+      mcp: { ok: mcpCheck.ok, detail: mcpCheck.detail },
+      trust: { ok: trustCheck.ok, detail: trustCheck.detail },
+    }, null, 2) + '\n');
     return allOk ? 0 : 1;
   }
 

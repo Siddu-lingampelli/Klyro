@@ -356,7 +356,7 @@ async function main(): Promise<void> {
 
   program
     .command('chat [prompt]')
-    .description('Legacy streamed chat. Without a prompt, start an interactive REPL.')
+    .description('Legacy streamed chat. Without a prompt, start an interactive REPL. (deprecated: history truncation is approximate; prefer `klyro tui`)')
     .option('-s, --system <text>', 'System message', 'You are a helpful assistant.')
     .option('-m, --model <id>', 'Override the model (default: env KLYRO_MODEL)')
     .option('-t, --timeout <ms>', 'Request timeout in ms (default: env KLYRO_TIMEOUT_MS or 60000)', (v) => parsePositiveInt('-t/--timeout', v))
@@ -593,12 +593,73 @@ async function main(): Promise<void> {
     }
   });
   mcp.command('add <name> <url>').description('Add MCP server').action(async (name: string) => { process.stdout.write(`added mcp ${name} (stub)\n`); });
+  mcp.command('probe <name>').description('Connect to an MCP server (15s timeout), list its tools, print count+names').action(async (name: string) => {
+    const { loadMcpServers } = await import('./mcp/config.js');
+    const cfg = loadMcpServers(process.cwd());
+    const spec = cfg.servers[name];
+    if (!spec) {
+      process.stderr.write(`klyro: mcp server not found: ${name}\n`);
+      process.exit(2);
+    }
+    const { McpClient } = await import('./mcp/client.js');
+    const client = new McpClient(name, spec);
+    // 15s overall probe budget (connect has its own internal timeout too).
+    const timer = setTimeout(() => {
+      process.stderr.write(`klyro: mcp probe ${name} timed out after 15s\n`);
+      process.exit(2);
+    }, 15_000);
+    try {
+      await client.connect();
+      const tools = await client.listTools();
+      const names = tools.map((t) => t.name);
+      process.stdout.write(`${name}: ${tools.length} tool(s)${names.length > 0 ? `: ${names.join(', ')}` : ''}\n`);
+      process.exit(0);
+    } catch (err) {
+      process.stderr.write(`klyro: mcp probe ${name} failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(2);
+    } finally {
+      clearTimeout(timer);
+      try { await client.close(); } catch { /* ignore */ }
+    }
+  });
   mcp.command('serve').description('Serve as MCP server').action(async () => { process.stdout.write('klyro mcp serve — exposing tools (stub)\n'); });
 
-  // 10.2 — Hooks / agents
-  program.command('hooks').description('List hooks (10.2)').action(async () => { process.stdout.write('hooks: SessionStart UserPromptSubmit PreToolUse PostToolUse (stub)\n'); });
-  program.command('agents [name]').description('List agents (10.2) or show one agent definition').action(async (name?: string) => {
+  // 10.2 — Hooks: list configured preToolUse/postToolUse hooks.
+  program.command('hooks [cmd]').description('Hooks (10.2): `klyro hooks` or `klyro hooks list` prints configured hooks').action(async (cmd?: string) => {
+    if (cmd && cmd !== 'list') {
+      process.stderr.write(`klyro: unknown hooks command: ${cmd} (usage: klyro hooks [list])\n`);
+      process.exit(2);
+    }
+    const { loadHooks } = await import('./cli/hooks.js');
+    const hooks = loadHooks(process.cwd());
+    if (hooks.length === 0) {
+      process.stdout.write('hooks: none configured (.klyro/hooks.json, ~/.klyro/hooks.json)\n');
+      return;
+    }
+    for (const h of hooks) process.stdout.write(`${h.name} ${h.event} ${h.command}\n`);
+  });
+  program.command('agents [name] [extra...]').description('List agents (10.2), show one, or run: agents run <name> <task...>').action(async (name?: string, extra?: string[]) => {
     const { BUILTIN_AGENTS } = await import('./agent/orchestrator.js');
+    // `klyro agents run <name> <task...>`: one-shot run under a named agent.
+    if (name === 'run') {
+      const [agentName, ...taskParts] = extra ?? [];
+      if (!agentName || !BUILTIN_AGENTS.some((a) => a.id === agentName)) {
+        process.stderr.write(`klyro: unknown agent: ${agentName ?? '(missing)'} (known: ${BUILTIN_AGENTS.map((a) => a.id).join(', ')})\n`);
+        process.exit(2);
+      }
+      const task = (taskParts ?? []).join(' ').trim();
+      if (!task) {
+        process.stderr.write('klyro: agents run requires a task (usage: klyro agents run <name> <task...>)\n');
+        process.exit(2);
+      }
+      const model = process.env.KLYRO_MODEL;
+      if (!model) {
+        process.stderr.write('klyro: KLYRO_MODEL is not set (or pass --model via klyro run)\n');
+        process.exit(2);
+      }
+      const code = await runOnce({ task, cwd: process.cwd(), model, agent: agentName });
+      process.exit(code);
+    }
     if (!name) {
       for (const a of BUILTIN_AGENTS) process.stdout.write(`${a.id} — ${a.description}\n`);
       return;
@@ -623,7 +684,24 @@ async function main(): Promise<void> {
   });
 
   // 10.3 — Web / git workflows / SDK
-  program.command('commit').description('Create commit (10.3)').action(async () => { process.stdout.write('commit — conventional message (stub, use /commit)\n'); });
+  program
+    .command('commit')
+    .description('Commit staged changes with a conventional message (verification hooks always run)')
+    .option('--dry-run', 'Print the message + files without committing')
+    .option('--message <msg>', 'Summary for the conventional message (default: update <n> files)')
+    .option('--force-secret', 'Commit even if the staged diff looks like it contains a secret')
+    .action(async (opts: { dryRun?: boolean; message?: string; forceSecret?: boolean }) => {
+      const { runCommit } = await import('./cli/commit.js');
+      const globalYes = program.opts<{ yes?: boolean }>().yes ?? process.env.KLYRO_YES === '1';
+      const code = await runCommit({
+        cwd: process.cwd(),
+        yes: !!globalYes,
+        dryRun: !!opts.dryRun,
+        ...(opts.message !== undefined ? { message: opts.message } : {}),
+        forceSecret: !!opts.forceSecret,
+      });
+      process.exit(code);
+    });
   program.command('audit [session]').description('Verify audit chain (13.4)').action(async (session?: string) => {
     if (!session) {
       process.stderr.write('klyro: audit requires a session id (usage: klyro audit <session>)\n');

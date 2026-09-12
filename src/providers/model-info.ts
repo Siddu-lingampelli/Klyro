@@ -63,6 +63,15 @@ export function ratesFor(modelId: string): { input: number; output: number } {
   return { input: 0, output: 0 };
 }
 
+/**
+ * True for Anthropic-family model ids (Claude). Used by the runtime's
+ * cache-aware cost math: only Anthropic bills cacheRead/cacheWrite, so
+ * other families keep ignoring those counters.
+ */
+export function isAnthropicModel(modelId: string): boolean {
+  return /anthropic|claude/i.test(modelId);
+}
+
 export function estimateCost(modelId: string, inputTokens: number, outputTokens: number): number {
   // Single source: delegate to ratesFor so registry, family fallbacks, and
   // local-$0 rules live in exactly one place (no split-brain with getModelInfo).

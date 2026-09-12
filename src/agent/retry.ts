@@ -19,6 +19,7 @@
  */
 
 import type { ProviderAdapter, StreamEvent, CallRequest } from './provider-adapter.js';
+import { acquireStreamSlot, noteRateLimited } from './stream-budget.js';
 
 export interface RetryOptions {
   maxAttempts: number; // total attempts (1 = no retry)
@@ -109,6 +110,27 @@ export function computeBackoff(attempt: number, baseMs: number, maxMs: number): 
   return Math.max(0, Math.floor(exp + jitter));
 }
 
+/**
+ * True when a retryable error event carries a 429 rate-limit signal.
+ * Checks the `status` field first, then `code`; accepts numeric values
+ * and `'429'` substrings (e.g. `'429'`, `'HTTP_429'`).
+ */
+function isRateLimitedError(ev: StreamEvent): boolean {
+  if (ev.kind !== 'error') return false;
+  const rec = ev as unknown as Record<string, unknown>;
+  for (const key of ['status', 'code'] as const) {
+    const value = rec[key];
+    if (typeof value === 'string' && value.includes('429')) return true;
+    if (typeof value === 'number' && String(value).includes('429')) return true;
+  }
+  return false;
+}
+
+function rateLimitDelayMs(ev: StreamEvent): number | undefined {
+  const raw = (ev as unknown as Record<string, unknown>)['retryAfterMs'];
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
 export function retryingAdapter(inner: ProviderAdapter, opts: Partial<RetryOptions> = {}): ProviderAdapter {
   const cfg = { ...DEFAULT_RETRY, ...opts };
   const sleep = opts.sleep ?? defaultSleep;
@@ -141,19 +163,35 @@ export function retryingAdapter(inner: ProviderAdapter, opts: Partial<RetryOptio
         const attemptReq: CallRequest = effectiveSignal ? { ...req, signal: effectiveSignal } : req;
         opts.onAttempt?.(attempt);
         if (effectiveSignal?.aborted) return;
+        // Rate-limit scheduler: hold one stream slot for the duration of
+        // this attempt's inner.stream consumption. Abort while queued ends
+        // the stream promptly with no inner call.
+        let release: (() => void) | undefined;
         let sawRetryable = false;
         let lastError: StreamEvent | null = null;
-        for await (const ev of streamWithAbort(inner.stream(attemptReq), effectiveSignal)) {
-          if (effectiveSignal?.aborted) return;
-          if (ev.kind === 'error' && ev.retryable) {
-            // Buffer the retryable error; don't yield it yet. We'll either
-            // re-issue (and the caller will never see the error) or, on
-            // final attempt, yield it as the terminal error.
-            sawRetryable = true;
-            lastError = ev;
-            break; // stop consuming; the stream is dead on retryable errors.
+        try {
+          try {
+            release = await acquireStreamSlot(effectiveSignal);
+          } catch {
+            return;
           }
-          yield ev;
+          for await (const ev of streamWithAbort(inner.stream(attemptReq), effectiveSignal)) {
+            if (effectiveSignal?.aborted) return;
+            if (ev.kind === 'error' && ev.retryable) {
+              // Adaptive throttling: a 429 collapses the global stream cap
+              // to 1 for retryAfterMs (or 60s) — see stream-budget.ts.
+              if (isRateLimitedError(ev)) noteRateLimited(rateLimitDelayMs(ev));
+              // Buffer the retryable error; don't yield it yet. We'll either
+              // re-issue (and the caller will never see the error) or, on
+              // final attempt, yield it as the terminal error.
+              sawRetryable = true;
+              lastError = ev;
+              break; // stop consuming; the stream is dead on retryable errors.
+            }
+            yield ev;
+          }
+        } finally {
+          release?.();
         }
         if (!sawRetryable) return; // success or non-retryable error — done.
         if (attempt === cfg.maxAttempts - 1) {

@@ -63,7 +63,7 @@ describe('multi_edit', () => {
   });
 
   it('repairGuard allows latest.ts / attest.ts (not test-like)', async () => {
-    for (const name of ['latest.ts', 'attest.ts']) {
+    for (const name of ['latest.ts', 'attest.ts', 'contest-data.txt']) {
       const p = path.join(tmp, name);
       await fs.writeFile(p, 'a b', 'utf-8');
       const r = await multiEditTool.execute(
@@ -91,5 +91,24 @@ describe('multi_edit', () => {
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe('POLICY_DENIED');
+  });
+
+  it('denies multi-edits redirected through a swapped-in symlink', async () => {
+    if (process.platform === 'win32') return; // symlink creation needs privilege (EPERM) on Windows
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'klyro-multi-out-'));
+    try {
+      const outsideFile = path.join(outside, 'secret.txt');
+      await fs.writeFile(outsideFile, 'hi', 'utf-8');
+      await fs.symlink(outsideFile, path.join(tmp, 'link.txt'));
+      const r = await multiEditTool.execute(
+        { path: 'link.txt', edits: [{ find: 'hi', replace: 'pwned' }] },
+        { cwd: tmp, env: {} },
+      );
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe('PATH_ESCAPE');
+      expect(await fs.readFile(outsideFile, 'utf-8')).toBe('hi');
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
   });
 });

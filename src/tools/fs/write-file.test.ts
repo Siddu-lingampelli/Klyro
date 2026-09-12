@@ -77,4 +77,48 @@ describe('write_file guards', () => {
     expect(denied.ok).toBe(false);
     if (!denied.ok) expect(denied.error.code).toBe('POLICY_DENIED');
   });
+
+  it('assertNotSymlink: symlink throws PATH_ESCAPE, file/missing pass', async () => {
+    const { assertNotSymlink } = await import('../../policy/path-guard.js');
+    const target = path.join(tmp, 'real.txt');
+    await fs.writeFile(target, 'data', 'utf-8');
+    await assertNotSymlink(target); // regular file → ok
+    await assertNotSymlink(path.join(tmp, 'nope.txt')); // missing → ok
+    if (process.platform === 'win32') return; // symlink creation needs privilege (EPERM) on Windows
+    const link = path.join(tmp, 'link.txt');
+    await fs.symlink(target, link);
+    const code = await assertNotSymlink(link).then(
+      () => 'ok',
+      (e: unknown) => (e as { code?: string }).code,
+    );
+    expect(code).toBe('PATH_ESCAPE');
+  });
+
+  it('openNoFollowForWrite creates and writes content', async () => {
+    const { openNoFollowForWrite } = await import('../../policy/path-guard.js');
+    const nodeFs = await import('node:fs');
+    const fd = openNoFollowForWrite(tmp, 'nf.txt');
+    try {
+      nodeFs.writeFileSync(fd, 'hello');
+    } finally {
+      nodeFs.closeSync(fd);
+    }
+    expect(await fs.readFile(path.join(tmp, 'nf.txt'), 'utf-8')).toBe('hello');
+  });
+
+  it('denies writes redirected through a swapped-in symlink', async () => {
+    if (process.platform === 'win32') return; // symlink creation needs privilege (EPERM) on Windows
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'klyro-write-out-'));
+    try {
+      const outsideFile = path.join(outside, 'secret.txt');
+      await fs.writeFile(outsideFile, 'secret', 'utf-8');
+      await fs.symlink(outsideFile, path.join(tmp, 'link.txt'));
+      const r = await writeFileTool.execute({ path: 'link.txt', content: 'pwned' }, { cwd: tmp, env: {} });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe('PATH_ESCAPE');
+      expect(await fs.readFile(outsideFile, 'utf-8')).toBe('secret');
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  });
 });

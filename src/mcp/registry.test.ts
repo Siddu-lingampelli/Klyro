@@ -394,6 +394,111 @@ describe('loadAndRegisterMcp project consent', () => {
     await res.closeAll();
   });
 
+describe('KLYRO_MCP_DEBUG capture', () => {
+  const SECRET = 'sk-proj-DDDDDDDDDDDDDDDDDDDDDDDD';
+
+  function withDebugEnv(dir: string | undefined, flag: string | undefined): { prevDebug: string | undefined; prevCfg: string | undefined } {
+    const prevDebug = process.env.KLYRO_MCP_DEBUG;
+    const prevCfg = process.env.KLYRO_CONFIG_DIR;
+    if (flag === undefined) delete process.env.KLYRO_MCP_DEBUG;
+    else process.env.KLYRO_MCP_DEBUG = flag;
+    if (dir === undefined) delete process.env.KLYRO_CONFIG_DIR;
+    else process.env.KLYRO_CONFIG_DIR = dir;
+    return { prevDebug, prevCfg };
+  }
+
+  function restoreDebugEnv(saved: { prevDebug: string | undefined; prevCfg: string | undefined }): void {
+    if (saved.prevDebug === undefined) delete process.env.KLYRO_MCP_DEBUG;
+    else process.env.KLYRO_MCP_DEBUG = saved.prevDebug;
+    if (saved.prevCfg === undefined) delete process.env.KLYRO_CONFIG_DIR;
+    else process.env.KLYRO_CONFIG_DIR = saved.prevCfg;
+  }
+
+  function listDebugFiles(dir: string): string[] {
+    const outDir = path.join(dir, 'tool-output');
+    if (!fs.existsSync(outDir)) return [];
+    return fs.readdirSync(outDir).filter((f) => f.startsWith('mcp-') && f.endsWith('.json'));
+  }
+
+  it('writes the UNREDACTED payload (mode 0600) on success when enabled', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-mcp-debug-'));
+    const saved = withDebugEnv(dir, '1');
+    try {
+      const fake = new FakeClient([{ name: 'leak' }], {
+        handler: () => ({ text: `token is ${SECRET} done`, isError: false, raw: { secret: SECRET } }),
+      });
+      const registry = new ToolRegistry();
+      const res = await registerMcpServers(
+        { servers: { srv: spec({ allowTools: ['leak'] }) } },
+        { registry, clientFactory: () => fake },
+      );
+      const out = await registry.execute('mcp__srv__leak', {}, ctx);
+      expect(out.ok).toBe(true);
+      if (out.ok) expect(String(out.value)).not.toContain(SECRET);
+      const files = listDebugFiles(dir);
+      expect(files).toHaveLength(1);
+      const file = path.join(dir, 'tool-output', files[0]!);
+      expect(file).toContain('mcp-srv-');
+      const raw = fs.readFileSync(file, 'utf-8');
+      expect(raw).toContain(SECRET); // unredacted on disk
+      if (process.platform !== 'win32') {
+        expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      }
+      await res.closeAll();
+    } finally {
+      restoreDebugEnv(saved);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('captures on tool error too (McpError keeps code, message redacted for the model)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-mcp-debug-'));
+    const saved = withDebugEnv(dir, '1');
+    try {
+      const fake = new FakeClient([{ name: 'flaky' }], {
+        callError: new McpError(`boom ${SECRET}`, 'TIMEOUT'),
+      });
+      const registry = new ToolRegistry();
+      const resFlaky = await registerMcpServers(
+        { servers: { srv: spec({ allowTools: ['flaky'] }) } },
+        { registry, clientFactory: () => fake },
+      );
+      const out = await registry.execute('mcp__srv__flaky', {}, ctx);
+      expect(out.ok).toBe(false);
+      if (!out.ok) {
+        expect(out.error.code).toBe('TIMEOUT');
+        expect(out.error.message).not.toContain(SECRET);
+      }
+      const files = listDebugFiles(dir);
+      expect(files).toHaveLength(1);
+      expect(fs.readFileSync(path.join(dir, 'tool-output', files[0]!), 'utf-8')).toContain(SECRET);
+      await resFlaky.closeAll();
+    } finally {
+      restoreDebugEnv(saved);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes nothing when the flag is off (default behaviour unchanged)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-mcp-debug-'));
+    const saved = withDebugEnv(dir, undefined);
+    try {
+      const fake = new FakeClient([{ name: 't' }]);
+      const registry = new ToolRegistry();
+      const resOff = await registerMcpServers(
+        { servers: { srv: spec({ allowTools: ['t'] }) } },
+        { registry, clientFactory: () => fake },
+      );
+      await registry.execute('mcp__srv__t', {}, ctx);
+      expect(listDebugFiles(dir)).toEqual([]);
+      expect(fs.existsSync(path.join(dir, 'tool-output'))).toBe(false);
+      await resOff.closeAll();
+    } finally {
+      restoreDebugEnv(saved);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
   it('skips project servers declined by the callback', async () => {
     const dir = mkProjectDir({ proj1: projSpec });
     const registry = new ToolRegistry();

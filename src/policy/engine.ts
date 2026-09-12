@@ -115,7 +115,13 @@ export class PolicyEngine {
       // auto / --yolo: allow everything (except hard deny already handled)
     } else if (ctx.config.mode === 'plan') {
       // plan mode: block all writes (edit)
-      if (call.name === 'write_file' || call.name === 'edit_file') {
+      if (
+        call.name === 'write_file' ||
+        call.name === 'edit_file' ||
+        call.name === 'multi_edit' ||
+        call.name === 'apply_patch' ||
+        call.name === 'memory_write'
+      ) {
         return { action: 'deny', reason: 'plan mode: writes blocked — use /permissions to allow or switch mode' };
       }
     } else if (ctx.config.mode === 'accept-edits') {
@@ -272,6 +278,51 @@ function startsWithAny(haystack: string, needles: string[]): boolean {
   });
 }
 
+/** Branches that `git push` must never target without an explicit opt-out. */
+export const PROTECTED_BRANCHES = ['main', 'master', 'production'];
+
+/** Matches `push` with a protected branch name later on the same line. */
+export const PROTECTED_PUSH_RE = /\bpush\b[^\n]*\b(main|master|production)\b/;
+
+const GIT_PUSH_RE = /\bgit\b[^\n]*\bpush\b/;
+
+/**
+ * True when the command is a `git push` with NO ref/positional args
+ * (e.g. `git push`, `git push -f`) — i.e. it pushes whatever is checked
+ * out. `git push origin feature` is explicit, not bare.
+ */
+export function isBareGitPush(cmd: string): boolean {
+  if (!GIT_PUSH_RE.test(cmd)) return false;
+  const idx = cmd.search(/\bpush\b/);
+  const rest = idx >= 0 ? cmd.slice(idx + 4) : '';
+  const segment = (rest.split(/[;&|]/)[0] ?? '').split(/\n/)[0] ?? '';
+  const tokens = segment.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const positionals = tokens.filter((t) => {
+    const unquoted = t.replace(/^["']|["']$/g, '');
+    return unquoted.length > 0 && !unquoted.startsWith('-');
+  });
+  return positionals.length === 0;
+}
+
+/**
+ * Resolve the currently checked-out branch via `git branch --show-current`.
+ * Returns null on any failure (not a repo, git missing) — callers treat
+ * null as "unknown" and allow the normal policy flow to continue.
+ */
+export function currentGitBranch(cwd: string): string | null {
+  try {
+    const out = execFileSync('git', ['-C', cwd, 'branch', '--show-current'], {
+      timeout: 3000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf-8',
+    });
+    const branch = String(out).trim();
+    return branch.length > 0 ? branch : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Hard-deny for obviously destructive shell patterns. */
 export const shellDenyRule: PolicyRule = {
   name: 'shell-deny',
@@ -315,6 +366,16 @@ export const shellDenyRule: PolicyRule = {
     if (/\b(Set-Content|Out-File)\b[^\n]*\.env/i.test(cmd)) {
       return { action: 'deny', reason: 'write to .env via Set-Content/Out-File denied' };
     }
+    // Shell-redirection containment: deny `>` / `>>` into dotfiles.
+    // Home/abs dotfile target (e.g. `> ~/.klyro/mcp.json`, `> /home/u/.config/x`).
+    // The `(?<![0-9])` guard excludes the `2>` stderr-redirect prefix.
+    if (/(?<![0-9])>+\s*["']?(~|\/)[^"'\s]*\/\.[^"'\s]+/.test(cmd)) {
+      return { action: 'deny', reason: 'redirect into dotfile under home/abs path denied' };
+    }
+    // Bare project dotfile target (e.g. `> .mcp.json`, `>> .env.local`).
+    if (/(?<![0-9])>+\s*["']?\.[^"'\s\/][^"'\s]*/.test(cmd)) {
+      return { action: 'deny', reason: 'redirect into project dotfile denied' };
+    }
     // Upload-form exfiltration (mirrors shell_exec DANGEROUS_PATTERNS).
     if (/\bcurl\b.*(?:\s-F\b|\s--form\b)/i.test(cmd)) {
       return { action: 'deny', reason: 'exfiltration: curl -F/--form denied' };
@@ -327,6 +388,22 @@ export const shellDenyRule: PolicyRule = {
     }
     if (/\bStart-BitsTransfer\b/i.test(cmd)) {
       return { action: 'deny', reason: 'exfiltration: Start-BitsTransfer denied' };
+    }
+    // Protected-branch push deny (mirrors shell_exec DANGEROUS_PATTERNS).
+    // Explicit `git push ... main|master|production` is denied outright;
+    // a bare `git push` (no ref args) is denied when the checkout is on a
+    // protected branch. Escape hatch: KLYRO_ALLOW_MAIN_PUSH=1.
+    if (process.env.KLYRO_ALLOW_MAIN_PUSH !== '1') {
+      if (PROTECTED_PUSH_RE.test(cmd)) {
+        return { action: 'deny', reason: 'protected-branch push denied (main/master/production) — set KLYRO_ALLOW_MAIN_PUSH=1 to override' };
+      }
+      if (isBareGitPush(cmd)) {
+        const branch = currentGitBranch(ctx.cwd);
+        if (branch !== null && PROTECTED_BRANCHES.includes(branch)) {
+          return { action: 'deny', reason: `bare git push on protected branch '${branch}' denied — set KLYRO_ALLOW_MAIN_PUSH=1 to override` };
+        }
+        // currentGitBranch null (not a repo / git missing) → allow normal flow.
+      }
     }
     return null;
   },
@@ -425,4 +502,5 @@ export async function evaluatePolicy(
 //  policy/ depending only on tools/normalize, no other tool code.)
 import * as path from 'node:path';
 import * as fsSync from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { resolveWithinCwd } from './path-guard.js';

@@ -21,7 +21,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
-import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
+import { resolveAndFollowSymlinks, assertNotSymlink } from '../../policy/path-guard.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
 import { wasRead } from './read-history.js';
 
@@ -242,6 +242,9 @@ export const applyPatchTool = defineTool({
           await guardWrite(ctx.cwd, sec.path, resolved);
           await assertSameTarget(ctx.cwd, sec.path, resolved);
           await fs.mkdir(path.dirname(resolved), { recursive: true });
+          // Symlink-swap guard: refuse if the final dest became a symlink
+          // since the up-front resolve (lstat never follows the final link).
+          await assertNotSymlink(resolved);
           await fs.writeFile(resolved, content ? content + '\n' : '', 'utf-8');
           patchedFiles.push(sec.path);
           continue;
@@ -262,6 +265,8 @@ export const applyPatchTool = defineTool({
         const next = applyHunks(sec.path, fileLines, hunks);
         await assertSameTarget(ctx.cwd, sec.path, resolved);
         await fs.mkdir(path.dirname(resolved), { recursive: true });
+        // Symlink-swap guard (mirrors the creation path above).
+        await assertNotSymlink(resolved);
         await fs.writeFile(resolved, next.join('\n') + (hasTrailingNewline ? '\n' : ''), 'utf-8');
         patchedFiles.push(sec.path);
       }

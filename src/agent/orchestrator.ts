@@ -14,7 +14,7 @@
  */
 
 import type { ProviderAdapter } from './provider-adapter.js';
-import type { RuntimeDeps, RunOptions, RunResult } from './runtime.js';
+import type { RuntimeDeps, RunOptions, RunResult, RuntimeEvent } from './runtime.js';
 import type { ToolResult } from '../tools/types.js';
 import { run, resolveSystemPrompt } from './runtime.js';
 import { ScopedRegistry } from './scoped-registry.js';
@@ -217,6 +217,47 @@ function mapResultStatus(status: RunResult['status']): 'succeeded' | 'failed' | 
   }
 }
 
+/**
+ * Build a `subtask.progress` note for one finished tool call.
+ * Pure — unit-tested directly (see agent-tools.test.ts).
+ */
+export function progressNote(step: number, tool: string, isError: boolean): string {
+  return `step ${step}: ${tool} ${isError ? 'ERR' : 'ok'}`;
+}
+
+/**
+ * Build the `RunOptions.onEvent` handler the orchestrator passes into each
+ * child's run options. Emits at most one `subtask.progress` per tool call:
+ * a `tool_result` is only mirrored when its `tool_call_end` was observed
+ * first, so duplicate/late results can never double-emit. (The note needs
+ * the ok/ERR outcome, which only `tool_result` carries — `tool_call_end`
+ * alone cannot build it — hence the end-gated result throttle.)
+ */
+export function createSubtaskProgressEmitter(opts: {
+  taskId: string;
+  sessionId: string;
+}): (ev: RuntimeEvent) => void {
+  let step = 0;
+  const ended = new Set<string>();
+  return (ev: RuntimeEvent): void => {
+    if (ev.kind === 'step_start') {
+      step = ev.step;
+    } else if (ev.kind === 'tool_call_end') {
+      ended.add(ev.id);
+    } else if (ev.kind === 'tool_result') {
+      if (!ended.has(ev.id)) return;
+      ended.delete(ev.id);
+      globalBus.emit({
+        type: 'subtask.progress',
+        ts: Date.now(),
+        sessionId: opts.sessionId,
+        taskId: opts.taskId,
+        note: progressNote(step, ev.name, ev.isError),
+      });
+    }
+  };
+}
+
 export class AgentOrchestrator {
   readonly sessionId: string;
   readonly deps: RuntimeDeps;
@@ -361,14 +402,17 @@ export class AgentOrchestrator {
     const resolved = this.resolveChild(def, parent, registryTools);
     const childModel = input.model ?? resolved.model ?? parent.model;
 
-    // Worktree isolation: write-capable children without an explicit cwd get
-    // their own worktree; readonly agents keep the parent cwd. A
-    // write-capable spawn outside a git repo is rejected outright.
+    // Worktree isolation: write-capable children get their own worktree —
+    // including when the spawn carries an explicit cwd (the worktree is
+    // then rooted at the resolved explicit cwd, which containment above
+    // already pinned inside the parent). Readonly agents keep the resolved
+    // cwd with no worktree. A write-capable spawn outside a git repo is
+    // rejected outright.
     const writeCapable = [...resolved.allowed].some((t) => DEFAULT_WRITE_TOOLS.has(t));
     let childCwd = baseCwd;
     let worktree: WorktreeInfo | undefined;
     let repoCwd: string | undefined;
-    if (!resolved.readonly && writeCapable && !input.cwd) {
+    if (!resolved.readonly && writeCapable) {
       const isRepo = await ensureGitRepo(baseCwd).catch(() => false);
       if (!isRepo) {
         return {
@@ -441,6 +485,11 @@ export class AgentOrchestrator {
       maxTimeMs: def.maxTimeMs ?? input.timeoutMs,
       signal: record.abortController.signal,
       nonInteractive: true,
+      // Mid-life progress: mirror each finished tool call as one
+      // `subtask.progress` bus event (see createSubtaskProgressEmitter).
+      // Process-isolated children don't run this closure — only the
+      // in-process path reports mid-life progress.
+      onEvent: createSubtaskProgressEmitter({ taskId: record.id, sessionId: this.sessionId }),
       // Grandchildren: only children that canSpawn receive the bridge —
       // otherwise tools see NO_ORCHESTRATOR as before.
       ...(resolved.canSpawn ? { agentBridge: this.bridgeFor(childRef) } : {}),

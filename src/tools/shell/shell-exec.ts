@@ -9,7 +9,7 @@
  *     the output). The agent reads exitCode to decide what to do next.
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fsp from 'node:fs/promises';
@@ -72,6 +72,16 @@ export function filteredEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
 // Interactive command detection (3.3)
 const INTERACTIVE_PATTERNS = [/^\s*vim\b/, /^\s*nano\b/, /^\s*htop\b/, /^\s*less\b/, /^\s*more\b/, /^\s*ssh\b/, /^\s*tmux\b/];
 
+/**
+ * Protected-branch push helpers (mirror policy engine shellDenyRule).
+ * `git push` targeting main/master/production is denied outright; a bare
+ * `git push` (no ref args) is denied when the checkout sits on a protected
+ * branch. Escape hatch: KLYRO_ALLOW_MAIN_PUSH=1.
+ */
+export const PROTECTED_BRANCHES = ['main', 'master', 'production'];
+export const PROTECTED_PUSH_RE = /\bpush\b[^\n]*\b(main|master|production)\b/;
+const GIT_PUSH_RE = /\bgit\b[^\n]*\bpush\b/;
+
 // Hard-coded dangerous patterns. These are non-overridable, configurable via --yolo only.
 const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /rm\s+-rf?\s+\//, reason: 'recursive delete at filesystem root' },
@@ -111,12 +121,79 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   // .env writes via tee / PowerShell (mirrors policy engine .env guard).
   { pattern: /\|\s*tee\b[^\n]*\.env/i, reason: 'write to .env via tee denied' },
   { pattern: /\b(Set-Content|Out-File)\b[^\n]*\.env/i, reason: 'write to .env via Set-Content/Out-File denied' },
+  // Shell-redirection containment (mirrors policy engine shellDenyRule):
+  // deny `>` / `>>` into dotfiles under home/abs paths or bare project
+  // dotfiles. `(?<![0-9])` excludes the `2>` stderr-redirect prefix.
+  { pattern: /(?<![0-9])>+\s*["']?(~|\/)[^"'\s]*\/\.[^"'\s]+/, reason: 'redirect into dotfile under home/abs path denied' },
+  { pattern: /(?<![0-9])>+\s*["']?\.[^"'\s\/][^"'\s]*/, reason: 'redirect into project dotfile denied' },
   // Upload-form exfiltration (mirrors policy engine shellDenyRule).
   { pattern: /\bcurl\b.*(?:\s-F\b|\s--form\b)/i, reason: 'exfiltration: curl -F/--form denied' },
   { pattern: /\bwget\b.*(?:\s--method=POST\b|\s--body-data\b)/i, reason: 'exfiltration: wget --method=POST/--body-data denied' },
   { pattern: /\bInvoke-RestMethod\b/i, reason: 'exfiltration: Invoke-RestMethod denied' },
   { pattern: /\bStart-BitsTransfer\b/i, reason: 'exfiltration: Start-BitsTransfer denied' },
+  // Protected-branch push deny (mirrors policy engine shellDenyRule).
+  // Explicit `git push ... main|master|production`. Honored only when
+  // KLYRO_ALLOW_MAIN_PUSH=1 is NOT set (see findBlockedReason). Bare
+  // `git push` on a protected checkout is handled in execute() with cwd.
+  { pattern: PROTECTED_PUSH_RE, reason: 'protected-branch push denied (main/master/production) — set KLYRO_ALLOW_MAIN_PUSH=1 to override' },
 ];
+
+/**
+ * True when KLYRO_ALLOW_MAIN_PUSH=1 opts out of the protected-push deny. */
+export function isMainPushEscape(): boolean {
+  return process.env.KLYRO_ALLOW_MAIN_PUSH === '1';
+}
+
+/**
+ * True when the command is a `git push` with NO ref/positional args
+ * (e.g. `git push`, `git push -f`) — i.e. it pushes whatever is checked
+ * out. `git push origin feature` is explicit, not bare.
+ */
+export function isBareGitPush(cmd: string): boolean {
+  if (!GIT_PUSH_RE.test(cmd)) return false;
+  const idx = cmd.search(/\bpush\b/);
+  const rest = idx >= 0 ? cmd.slice(idx + 4) : '';
+  const segment = (rest.split(/[;&|]/)[0] ?? '').split(/\n/)[0] ?? '';
+  const tokens = segment.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const positionals = tokens.filter((t) => {
+    const unquoted = t.replace(/^["']|["']$/g, '');
+    return unquoted.length > 0 && !unquoted.startsWith('-');
+  });
+  return positionals.length === 0;
+}
+
+/**
+ * Resolve the currently checked-out branch via `git branch --show-current`.
+ * Returns null on any failure (not a repo, git missing) — callers treat
+ * null as "unknown" and allow the normal flow to continue.
+ */
+export function currentGitBranch(cwd: string): string | null {
+  try {
+    const out = execFileSync('git', ['-C', cwd, 'branch', '--show-current'], {
+      timeout: 3000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf-8',
+    });
+    const branch = String(out).trim();
+    return branch.length > 0 ? branch : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bare-push check with cwd: deny `git push` with no ref args when the
+ * checkout is on a protected branch. Returns the block reason or null.
+ */
+export function findBareProtectedPushReason(command: string, cwd: string): string | null {
+  if (isMainPushEscape()) return null;
+  if (!isBareGitPush(command)) return null;
+  const branch = currentGitBranch(cwd);
+  if (branch !== null && PROTECTED_BRANCHES.includes(branch)) {
+    return `bare git push on protected branch '${branch}' — set KLYRO_ALLOW_MAIN_PUSH=1 to override`;
+  }
+  return null;
+}
 
 /**
  * Repair-guard mirror: heredoc/redirect writes to test paths, or test-path
@@ -134,6 +211,8 @@ const REPAIR_GUARD_SHELL_RE = />+\s*['"]?[^'"\s]*test[^'"\s]*|\b(sed|python|perl
  */
 export function findBlockedReason(command: string): string | null {
   for (const { pattern, reason } of DANGEROUS_PATTERNS) {
+    // Protected-push entry honors the KLYRO_ALLOW_MAIN_PUSH=1 escape hatch.
+    if (pattern === PROTECTED_PUSH_RE && isMainPushEscape()) continue;
     if (pattern.test(command)) return reason;
   }
   return null;
@@ -213,6 +292,13 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
       const timeoutMs = Math.min(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
       const env = filteredEnv(input.env);
       const start = Date.now();
+      // Protected-branch bare push: `git push` with no ref args while the
+      // effective checkout sits on main/master/production. Explicit
+      // `push ... main` was already denied by findBlockedReason above.
+      const barePushReason = findBareProtectedPushReason(input.command, cwd);
+      if (barePushReason) {
+        throw Object.assign(new Error(`Command blocked: ${barePushReason}`), { code: TOOL_ERROR_CODES.COMMAND_DENIED });
+      }
 
       // Detached on POSIX so timeout kills the whole process GROUP
       // (child.kill alone orphans grandchildren holding the pipes).

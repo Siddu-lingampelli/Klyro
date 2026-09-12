@@ -107,7 +107,7 @@ describe('apply_patch', () => {
   });
 
   it('repairGuard allows latest.ts / attest.ts (not test-like)', async () => {
-    for (const name of ['latest.ts', 'attest.ts']) {
+    for (const name of ['latest.ts', 'attest.ts', 'contest-data.txt']) {
       const patch = `*** Begin Patch\n*** Add File: ${name}\n+hello\n*** End Patch`;
       const r = await applyPatchTool.execute({ patch }, { cwd: tmp, env: {}, repairGuard: { denyTestEdits: true } });
       expect(r.ok).toBe(true);
@@ -142,5 +142,22 @@ describe('apply_patch', () => {
     const r = await applyPatchTool.execute({ patch }, { cwd: tmp, env: {}, agentAllowedPaths: [path.join(tmp, 'inside')] });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe('POLICY_DENIED');
+  });
+
+  it('denies patches redirected through a swapped-in symlink', async () => {
+    if (process.platform === 'win32') return; // symlink creation needs privilege (EPERM) on Windows
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'klyro-patch-out-'));
+    try {
+      const outsideFile = path.join(outside, 'secret.txt');
+      await fs.writeFile(outsideFile, 'hi', 'utf-8');
+      await fs.symlink(outsideFile, path.join(tmp, 'link.txt'));
+      const patch = `*** Begin Patch\n*** Add File: link.txt\n+pwned\n*** End Patch`;
+      const r = await applyPatchTool.execute({ patch }, { cwd: tmp, env: {} });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe('PATH_ESCAPE');
+      expect(await fs.readFile(outsideFile, 'utf-8')).toBe('hi');
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
   });
 });

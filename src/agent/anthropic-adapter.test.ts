@@ -87,11 +87,51 @@ describe('anthropicAdapter', () => {
         messages: [],
         tools: [{ name: 'read_file', description: 'Read a file', inputSchema: { type: 'object', properties: { path: { type: 'string' } } } }],
       })) { /* drain */ }
+      // Prompt caching is on by default: the last tool carries the
+      // cache breakpoint so tool definitions join the cacheable prefix.
       expect(body.tools).toEqual([{
         name: 'read_file',
         description: 'Read a file',
         input_schema: { type: 'object', properties: { path: { type: 'string' } } },
+        cache_control: { type: 'ephemeral' },
       }]);
+    });
+
+    it('omits the tools breakpoint when promptCache is false', async () => {
+      let body: any;
+      const fetchImpl = (async (_url, init) => {
+        body = JSON.parse(init?.body as string);
+        return new Response('', { status: 200 });
+      }) as typeof fetch;
+      const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl, promptCache: false });
+      for await (const _ of adapter.stream({
+        model: 'm',
+        messages: [],
+        tools: [
+          { name: 'a_tool', description: 'A', inputSchema: { type: 'object' } },
+          { name: 'b_tool', description: 'B', inputSchema: { type: 'object' } },
+        ],
+      })) { /* drain */ }
+      expect(body.tools).toEqual([
+        { name: 'a_tool', description: 'A', input_schema: { type: 'object' } },
+        { name: 'b_tool', description: 'B', input_schema: { type: 'object' } },
+      ]);
+    });
+
+    it('puts the tools breakpoint on the last tool only when promptCache is enabled', () => {
+      const tools = [
+        { name: 'a_tool', description: 'A', inputSchema: { type: 'object' } },
+        { name: 'b_tool', description: 'B', inputSchema: { type: 'object' } },
+      ];
+      expect(_internal.buildAnthropicTools(tools, true)).toEqual([
+        { name: 'a_tool', description: 'A', input_schema: { type: 'object' } },
+        { name: 'b_tool', description: 'B', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral' } },
+      ]);
+      expect(_internal.buildAnthropicTools(tools, false)).toEqual([
+        { name: 'a_tool', description: 'A', input_schema: { type: 'object' } },
+        { name: 'b_tool', description: 'B', input_schema: { type: 'object' } },
+      ]);
+      expect(_internal.buildAnthropicTools([], true)).toBeUndefined();
     });
   });
 

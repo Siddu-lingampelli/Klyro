@@ -1,6 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { retryingAdapter, DEFAULT_RETRY, computeBackoff, sleepAbortable } from './retry.js';
+import { acquireStreamSlot, setStreamBudgetForTests, streamBudgetState } from './stream-budget.js';
 import type { ProviderAdapter, StreamEvent, CallRequest } from './provider-adapter.js';
+
+beforeEach(() => setStreamBudgetForTests());
+afterEach(() => setStreamBudgetForTests());
 
 /** Test adapter that emits a scripted sequence per call. */
 function scripted(events: StreamEvent[][]): ProviderAdapter & { calls: number } {
@@ -246,8 +250,7 @@ describe('retryingAdapter', () => {
     expect(sleeps).toEqual([5000]);
   });
 
-  it('honors retryAfterMs from the error event as the backoff delay', async () => {
-    const inner = scripted([
+  it('honors retryAfterMs from the error event as the backoff delay', async () => {    const inner = scripted([
       [{ kind: 'error', code: 'HTTP_429', message: 'slow', retryable: true, status: '429', retryAfterMs: 2500 } as StreamEvent],
       [{ kind: 'message_end', finishReason: 'stop' } as StreamEvent],
     ]);
@@ -261,5 +264,113 @@ describe('retryingAdapter', () => {
     expect(sleeps).toEqual([2500]);
     expect(onRetry).toHaveBeenCalledTimes(1);
     expect(onRetry).toHaveBeenCalledWith({ attempt: 1, status: '429', retryAfterMs: 2500 });
+  });
+});
+
+describe('retryingAdapter stream budget', () => {
+  /** After a 429 the global cap collapses to 1: a second slot must wait. */
+  async function expectCapCollapsedToOne(): Promise<void> {
+    expect(streamBudgetState().cap).toBe(1);
+    const first = await acquireStreamSlot();
+    try {
+      let granted = false;
+      const second = acquireStreamSlot().then((release) => {
+        granted = true;
+        return release;
+      });
+      second.catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(granted).toBe(false);
+      first();
+      (await second)();
+    } catch {
+      first();
+      throw new Error('expected cap 1 after 429');
+    }
+  }
+
+  async function drain(stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
+    const events: StreamEvent[] = [];
+    for await (const ev of stream) events.push(ev);
+    return events;
+  }
+
+  it("notes rate-limit on status string '429'", async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'HTTP_429', message: 'slow', retryable: true, status: '429', retryAfterMs: 60_000 } as StreamEvent],
+      [{ kind: 'message_end', finishReason: 'stop' } as StreamEvent],
+    ]);
+    const out = retryingAdapter(inner, { sleep: async () => {} });
+    expect((await drain(out.stream({} as CallRequest))).map((e) => e.kind)).toEqual(['message_end']);
+    await expectCapCollapsedToOne();
+  });
+
+  it('notes rate-limit on code substring (no status field)', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'HTTP_429', message: 'slow', retryable: true, retryAfterMs: 60_000 } as StreamEvent],
+      [{ kind: 'message_end', finishReason: 'stop' } as StreamEvent],
+    ]);
+    const out = retryingAdapter(inner, { sleep: async () => {} });
+    expect((await drain(out.stream({} as CallRequest))).map((e) => e.kind)).toEqual(['message_end']);
+    await expectCapCollapsedToOne();
+  });
+
+  it('notes rate-limit on numeric 429 fields', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'E', message: 'slow', retryable: true, status: 429, retryAfterMs: 60_000 } as unknown as StreamEvent],
+      [{ kind: 'message_end', finishReason: 'stop' } as StreamEvent],
+    ]);
+    const out = retryingAdapter(inner, { sleep: async () => {} });
+    expect((await drain(out.stream({} as CallRequest))).map((e) => e.kind)).toEqual(['message_end']);
+    await expectCapCollapsedToOne();
+  });
+
+  it('non-429 retryable errors leave the cap at 4', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'HTTP_503', message: 'flaky', retryable: true } as StreamEvent],
+      [{ kind: 'message_end', finishReason: 'stop' } as StreamEvent],
+    ]);
+    const out = retryingAdapter(inner, { sleep: async () => {} });
+    expect((await drain(out.stream({} as CallRequest))).map((e) => e.kind)).toEqual(['message_end']);
+    expect(streamBudgetState().cap).toBe(4);
+    const releases = await Promise.all([
+      acquireStreamSlot(),
+      acquireStreamSlot(),
+      acquireStreamSlot(),
+      acquireStreamSlot(),
+    ]);
+    for (const release of releases) release();
+  });
+
+  it('slots are released after each attempt (no leak across retries)', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'NETWORK', message: 'a', retryable: true } as StreamEvent],
+      [{ kind: 'message_end', finishReason: 'stop' } as StreamEvent],
+    ]);
+    const out = retryingAdapter(inner, { sleep: async () => {} });
+    await drain(out.stream({} as CallRequest));
+    expect(streamBudgetState().inFlight).toBe(0);
+  });
+
+  it('abort while queued for a slot ends promptly with no inner call', async () => {
+    const holders = await Promise.all([
+      acquireStreamSlot(),
+      acquireStreamSlot(),
+      acquireStreamSlot(),
+      acquireStreamSlot(),
+    ]);
+    try {
+      const inner = scripted([[{ kind: 'message_end', finishReason: 'stop' } as StreamEvent]]);
+      const ctrl = new AbortController();
+      const out = retryingAdapter(inner, { sleep: async () => {} });
+      setTimeout(() => ctrl.abort(), 10);
+      const start = Date.now();
+      const events = await drain(out.stream({} as CallRequest, ctrl.signal));
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(events).toHaveLength(0);
+      expect(inner.calls).toBe(0);
+    } finally {
+      for (const release of holders) release();
+    }
   });
 });

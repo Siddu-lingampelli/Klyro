@@ -6,11 +6,12 @@
  */
 
 import * as fs from 'node:fs/promises';
+import * as fsSyncNode from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
-import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
+import { resolveAndFollowSymlinks, assertNotSymlink, openNoFollowForWrite } from '../../policy/path-guard.js';
 import { safe } from '../normalize.js';
 
 // Extension-anchored: matches test.ts, foo.test.ts, foo-test.ts, foo.spec.js,
@@ -106,14 +107,20 @@ export const writeFileTool = defineTool<z.infer<typeof InputSchema>, WriteFileOu
       if ((await canon(reResolved)) !== (await canon(resolved))) {
         throw Object.assign(new Error(`Path target changed between check and write: ${input.path} (POLICY_DENIED)`), { code: 'POLICY_DENIED' });
       }
-      // Truncate to 8k tokens ~32k chars for result
-      const fh = await fs.open(tmp, 'w');
+      // Truncate to 8k tokens ~32k chars for result.
+      // The tmp file is opened O_NOFOLLOW (POSIX; plain 'w' on Windows —
+      // see openNoFollowForWrite) so a planted link at the fresh tmp name
+      // can't redirect the content write; atomic tmp+rename semantics stay.
+      const fd = openNoFollowForWrite(parent, path.basename(tmp));
       try {
-        await fh.writeFile(data);
-        await fh.sync();
+        fsSyncNode.writeFileSync(fd, data);
+        fsSyncNode.fsyncSync(fd);
       } finally {
-        await fh.close().catch(() => undefined);
+        try { fsSyncNode.closeSync(fd); } catch { /* already closed */ }
       }
+      // Symlink-swap guard: lstat the final dest immediately before rename
+      // and refuse if it became a symlink since the up-front resolve.
+      await assertNotSymlink(resolved);
       try {
         await fs.rename(tmp, resolved);
       } catch (err) {

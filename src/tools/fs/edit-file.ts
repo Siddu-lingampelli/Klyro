@@ -8,7 +8,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
-import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
+import { resolveAndFollowSymlinks, assertNotSymlink } from '../../policy/path-guard.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
 import { wasRead } from './read-history.js';
 
@@ -185,6 +185,9 @@ export const editFileTool = defineTool<z.infer<typeof InputSchema>, EditFileOutp
       // Ensure fsync before rename (like write_file)
       const fh = await fs.open(tmp, 'r+');
       try { await fh.sync(); } finally { await fh.close().catch(() => undefined); }
+      // Symlink-swap guard: refuse if the final dest became a symlink
+      // since the up-front resolve (lstat never follows the final link).
+      await assertNotSymlink(resolved);
       try {
         await fs.rename(tmp, resolved);
       } catch (err) {

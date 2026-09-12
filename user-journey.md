@@ -173,7 +173,7 @@ $ klyro login
 
 $ klyro
 Welcome to Klyro 0.1.0 — my-app (main)
-Telemetry is off. Enable with KLYRO_TELEMETRY=1. Type /help for commands.
+Telemetry is off (no product telemetry exists in this version). Type /help for commands.
 
 klyro › hello
 Hi! I'm Klyro. Tell me what you'd like to do in this repository.

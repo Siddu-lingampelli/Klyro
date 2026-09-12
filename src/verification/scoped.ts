@@ -67,13 +67,39 @@ export function buildScopedCommand(cwd: string, baseCommand: string, relatedTest
   if (baseCommand.includes('pytest')) {
     return `pytest ${safe.map((f) => `"${f}"`).join(' ')}`;
   }
-  if (baseCommand.includes('go test')) {
-    // go test ./... with file filter — fallback to full
+  if (baseCommand.includes('cargo test')) {
+    // Cargo keeps the full suite: `cargo test` selects by test-target name
+    // (`--test <name>`), lib/bin unit-test filters, or `-- <filter>` args —
+    // none of which map 1:1 onto file paths. Interpolating a file path as a
+    // filter would silently run the WRONG subset (substring match against
+    // test names), so fall back to the full suite rather than lie about
+    // coverage. (Checked before the `go test` branch: "cargo test" contains
+    // the substring "go test".)
     return null;
   }
-  if (baseCommand.includes('cargo test')) {
-    // cargo test --test <name>
-    return null;
+  // NOTE: `baseCommand.includes('go test')` must stay AFTER the cargo branch
+  // above — "cargo test" contains "go test" as a substring.
+  if (baseCommand.includes('go test')) {
+    // Go has no file-scoped test selection: `go test` takes package
+    // patterns, not file paths (passing `foo_test.go` directly errors with
+    // "no Go files in ..."). Derive `go test ./<pkgdirs...>` from the
+    // directories of the related test files instead: dedupe, cap 10, and
+    // reuse the same containment-validated `safe` list as every other
+    // branch (untrusted paths never reach the shell).
+    const dirs: string[] = [];
+    const seen = new Set<string>();
+    for (const f of safe) {
+      const d = path.dirname(f);
+      const pkg = d === '.' ? '.' : `./${d.split(path.sep).join('/')}`;
+      if (!seen.has(pkg)) { seen.add(pkg); dirs.push(pkg); }
+      if (dirs.length >= 10) break;
+    }
+    if (dirs.length === 0) return null;
+    // Preserve a './...'-style base by replacing it; otherwise append.
+    if (baseCommand.includes('./...')) {
+      return baseCommand.replace('./...', dirs.join(' '));
+    }
+    return `${baseCommand} ${dirs.join(' ')}`;
   }
   return null;
 }

@@ -22,6 +22,7 @@ import type { Message } from '../agent/message.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, clonePolicyConfig, PolicyEngine } from '../policy/engine.js';
 import { DenyAllApprovalPrompt } from '../policy/approval.js';
+import { redact } from '../policy/secret-redactor.js';
 import { buildLevel6Context } from '../context/level6.js';
 import { memoryBlock } from '../context/memory.js';
 import { getDefaultSessionStore, resolveSessionId } from '../persistence/session.js';
@@ -93,6 +94,15 @@ function readEnv(name: string, fallback?: string): string | undefined {
   return v && v.length > 0 ? v : fallback;
 }
 
+/**
+ * Double-Ctrl+C detector (pure, exported for tests): the second SIGINT
+ * within 1500ms of the first forces `process.exit(130)`. The live handler
+ * below owns the timestamp closure; tests exercise only this predicate.
+ */
+export function shouldForceExit(lastSigintAt: number | undefined, now: number): boolean {
+  return lastSigintAt !== undefined && now - lastSigintAt < 1500;
+}
+
 export async function runOnce(opts: RunCliOptions): Promise<number> {
   // P0.5 — load <cwd>/.env first so KLYRO_* vars resolve without `export`.
   // Never throws (missing file is a no-op); explicit env wins (no-clobber).
@@ -158,6 +168,33 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       adapter = retryingAdapter(httpChatAdapter({ baseURL: baseUrl, apiKey, timeoutMs: opts.timeoutMs ?? 60_000 }), { onRetry: onRetryEmit });
     }
   }
+  // L15 provider failover: extra chain entries (after the primary) become
+  // fallback adapters for the runtime. Custom injected adapters (tests)
+  // skip chain wiring. Failures resolving the chain never block the run.
+  let failoverAdapters: import('../agent/provider-adapter.js').ProviderAdapter[] | undefined;
+  if (!opts.adapter) {
+    try {
+      const { resolveProviderChain } = await import('./config.js');
+      const chain = await resolveProviderChain(opts.cwd);
+      const fallbacks = chain.slice(1);
+      if (fallbacks.length > 0) {
+        const built: import('../agent/provider-adapter.js').ProviderAdapter[] = [];
+        for (const entry of fallbacks) {
+          if (!entry.apiKey) continue;
+          const base = entry.provider === 'anthropic'
+            ? anthropicAdapter({ baseURL: entry.baseURL, apiKey: entry.apiKey, timeoutMs: opts.timeoutMs ?? 60_000 })
+            : entry.baseURL
+              ? httpChatAdapter({ baseURL: entry.baseURL, apiKey: entry.apiKey, timeoutMs: opts.timeoutMs ?? 60_000 })
+              : null;
+          if (base) built.push(retryingAdapter(base, { onRetry: onRetryEmit }));
+        }
+        if (built.length > 0) {
+          failoverAdapters = built;
+          stderr.write(`klyro: failover chain: ${built.map((b) => b.id).join(' → ')}\n`);
+        }
+      }
+    } catch { /* best-effort — single-provider run proceeds */ }
+  }
   const registry = builtinRegistry();
   const policy = new PolicyEngine(builtinRules(), clonePolicyConfig());
   // Persisted "always allow" patterns apply to one-shot runs too.
@@ -215,6 +252,15 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
         return 2;
       }
       sessionId = full;
+      // M22 resume-lock warning (read-only probe — takeover proceeds anyway).
+      try {
+        const { readSessionLock } = await import('../persistence/store.js');
+        const { getDefaultSessionsDir } = await import('../persistence/session.js');
+        const lock = readSessionLock(opts.sessionsDir ?? getDefaultSessionsDir(), sessionId);
+        if (lock.held && lock.alive) {
+          stderr.write(`klyro: session ${sessionId.slice(0, 8)} is locked by live pid ${lock.pid ?? '?'} — taking over (proceeding anyway)\n`);
+        }
+      } catch { /* probe is best-effort; never block resume */ }
       const msgs = await store.loadMessages(sessionId);
       // Convert StoredMessage to Message
       initialTranscript = msgs.map((m) => ({ role: m.role as Message['role'], content: m.content as Message['content'] }));
@@ -240,7 +286,17 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   sessionIdForRetry.id = sessionId ?? 'ephemeral';
 
   const ac = new AbortController();
+  // Double-Ctrl+C: first press aborts the run; a second press within
+  // 1500ms forces process.exit(130) (shouldForceExit owns the predicate).
+  let lastSigintAt: number | undefined;
   const onSigint = (): void => {
+    const now = Date.now();
+    if (shouldForceExit(lastSigintAt, now)) {
+      stderr.write('\nklyro: SIGINT twice — forcing exit\n');
+      process.exit(130);
+      return;
+    }
+    lastSigintAt = now;
     stderr.write('\nklyro: SIGINT — aborting\n');
     ac.abort();
   };
@@ -352,10 +408,19 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
           stderr.write(`[repair] attempt ${ev.attempt}/${ev.maxAttempts}\n`);
         } else if (ev.kind === 'checkpoint_saved') {
           if (output === 'human') stderr.write(`[session ${ev.sessionId.slice(0, 8)} checkpoint]\n`);
+        } else if (ev.kind === 'provider_failover') {
+          stderr.write(`[failover] ${ev.from} → ${ev.to}: ${ev.reason.slice(0, 200)}\n`);
+        } else if (ev.kind === 'budget_warning') {
+          stderr.write(`[budget] ${(ev.ratio * 100).toFixed(0)}% of max cost used (threshold ${(ev.threshold * 100).toFixed(0)}%)\n`);
+        } else if (ev.kind === 'model_override') {
+          stderr.write(`[model] override: requested ${ev.requested} → effective ${ev.effective}\n`);
         }
       },
     },
-      { adapter, registry, policy, approval: new DenyAllApprovalPrompt(), systemPrompt },
+      {
+        adapter, registry, policy, approval: new DenyAllApprovalPrompt(), systemPrompt,
+        ...(failoverAdapters ? { failoverAdapters } : {}),
+      },
     );
   } finally {
     doneSigint();
@@ -457,8 +522,10 @@ async function dryRunReport(opts: RunCliOptions): Promise<number> {
     maxSteps: opts.maxSteps,
     maxTokens: opts.maxTokens,
     temperature: opts.temperature,
-    systemPrompt,
-    task: opts.task,
+    // Secrets must never leak into a printable report: redact both the
+    // assembled system prompt and the task before printing.
+    systemPrompt: redact(systemPrompt),
+    task: redact(opts.task),
     toolCount: registry.list().length,
     toolNames: registry.list().map((t) => t.name),
     policyRules: rules.map((r) => r.name),

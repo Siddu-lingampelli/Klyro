@@ -298,5 +298,11 @@ export const DEFAULT_SPAWN_TOOLS: ReadonlySet<string> = new Set([
 
 /** Default deny-list — these are NEVER allowed, even if explicitly requested. */
 export const DEFAULT_DENIED_TOOLS: ReadonlySet<string> = new Set([
-  // Add dangerous tools here. Empty by default — extend as policy matures.
+  // Intentionally empty. Deny happens per-pattern (shellDenyRule /
+  // DANGEROUS_PATTERNS, .env guards, repair-guard), not per-tool: a
+  // tool-granularity deny-all entry (e.g. banning `shell_exec` outright)
+  // would break legitimate flows that rely on the allowlist + approval
+  // path. Seed candidates considered and rejected: `shell_exec` (needed
+  // for tests/builds via approval), `run_verify` (needed by tester/
+  // implementer agents), `write_file`/`edit_file` (core agent function).
 ]);

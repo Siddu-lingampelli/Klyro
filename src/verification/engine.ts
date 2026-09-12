@@ -12,11 +12,21 @@ import { spawn } from 'node:child_process';
 import { detect, summarize, type Failure, type FailureType } from './detect.js';
 import { filteredVerifyEnv } from './registry.js';
 import { redact } from '../policy/secret-redactor.js';
+import { globalBus } from '../events/bus.js';
+
+/** Verification mode. Canonical definition — agent/runtime.ts converges to
+ * this type automatically once this export exists (see its conditional
+ * VerifyMode). Backward-compatible: pure type, no runtime change. */
+export type VerifyMode = 'strict' | 'advisory' | 'off';
 
 export interface VerifyOptions {
   cwd: string;
   command: string;
   timeoutMs?: number;
+  /** Owning session for `verification.*` bus events. Optional for backward
+   * compatibility — siblings pass `sessionId` at verify call sites; when
+   * absent the emitted events fall back to 'ephemeral'. */
+  sessionId?: string;
 }
 
 export interface VerifyResult {
@@ -65,9 +75,21 @@ const DANGEROUS_VERIFY_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
 ];
 
 export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
+  const sid = opts.sessionId ?? 'ephemeral';
+  const emitStarted = (): void => {
+    try { globalBus.emit({ type: 'verification.started', ts: Date.now(), sessionId: sid, command: opts.command }); } catch { /* bus never throws */ }
+  };
+  const emitSucceeded = (): void => {
+    try { globalBus.emit({ type: 'verification.succeeded', ts: Date.now(), sessionId: sid, command: opts.command }); } catch { /* bus never throws */ }
+  };
+  const emitFailed = (reason: string): void => {
+    try { globalBus.emit({ type: 'verification.failed', ts: Date.now(), sessionId: sid, command: opts.command, reason }); } catch { /* bus never throws */ }
+  };
+  emitStarted();
   // SEC-004: reject dangerous patterns before spawning
   for (const { pattern, reason } of DANGEROUS_VERIFY_PATTERNS) {
     if (pattern.test(opts.command)) {
+      emitFailed(`Command blocked: ${reason}`);
       return {
         ok: false,
         exitCode: -1,
@@ -91,6 +113,7 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
       const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_VERIFY_BYTES);
       const se = Buffer.concat(errChunks).toString('utf-8').slice(0, MAX_VERIFY_BYTES);
       const raw = se + '\n' + so;
+      emitFailed('[verify timeout]');
       resolve({
         ok: false,
         exitCode: -1,
@@ -110,10 +133,12 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
       const se = Buffer.concat(errChunks).toString('utf-8').slice(0, MAX_VERIFY_BYTES);
       const exit = typeof code === 'number' ? code : -1;
       if (exit === 0) {
+        emitSucceeded();
         resolve({ ok: true, exitCode: 0, stdout: so, stderr: se });
         return;
       }
       const failure = detect(so, se, exit);
+      emitFailed(failure.type);
       resolve({ ok: false, exitCode: exit, stdout: so, stderr: se, failure });
     });
   });

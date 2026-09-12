@@ -107,4 +107,20 @@ describe('checkpoints', () => {
     // diff artifacts are never undo targets
     expect(await listCheckpoints(tmp)).not.toContain(`${id}.diff`);
   });
+
+  it('locks down snapshot content + meta to 0600 and ckpt dir to 0700 (POSIX)', async () => {
+    const p = path.join(tmp, 'a.txt');
+    await fs.writeFile(p, 'v1', 'utf-8');
+    const id = await snapshot(tmp, ['a.txt']);
+    // Mutate + restore still works with locked-down files.
+    await fs.writeFile(p, 'v2', 'utf-8');
+    await undo(tmp, 1);
+    expect(await fs.readFile(p, 'utf-8')).toBe('v1');
+    if (process.platform === 'win32') return; // mode bits are POSIX-only
+    const modeOf = async (f: string): Promise<number> =>
+      (await fs.stat(f)).mode & 0o777;
+    expect(await modeOf(path.join(tmp, '.klyro', 'checkpoints'))).toBe(0o700);
+    expect(await modeOf(path.join(tmp, '.klyro', 'checkpoints', id, 'a.txt'))).toBe(0o600);
+    expect(await modeOf(path.join(tmp, '.klyro', 'checkpoints', id, '.meta.json'))).toBe(0o600);
+  });
 });

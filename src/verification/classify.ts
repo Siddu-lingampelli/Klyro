@@ -4,6 +4,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
+import { filteredVerifyEnv } from './registry.js';
 import type { Failure, FailureType } from './detect.js';
 import { detect } from './detect.js';
 import type { BaselineResult } from './baseline.js';
@@ -61,7 +62,7 @@ export function classifyFailure(
 
 export async function rerunOnce(cwd: string, command: string, timeoutMs = 45_000): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn(command, { cwd, shell: true, env: process.env });
+    const child = spawn(command, { cwd, shell: true, env: filteredVerifyEnv() });
     let done = false;
     const t = setTimeout(() => { if (!done) { done = true; try { child.kill('SIGKILL'); } catch {} resolve(false); } }, timeoutMs);
     child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
@@ -102,7 +103,7 @@ export async function gatherRepairContext(cwd: string, failure: Failure | undefi
 
 function execCapturePipe(cwd: string, cmd: string): Promise<string> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, { cwd, shell: true, env: process.env });
+    const child = spawn(cmd, { cwd, shell: true, env: filteredVerifyEnv() });
     const chunks: Buffer[] = [];
     child.stdout.on('data', (b: Buffer) => { chunks.push(b); });
     child.stderr.on('data', (b: Buffer) => { chunks.push(b); });
@@ -113,7 +114,7 @@ function execCapturePipe(cwd: string, cmd: string): Promise<string> {
 
 function execCaptureArgv(cwd: string, file: string, args: string[]): Promise<string> {
   return new Promise((resolve) => {
-    const child = spawn('git', [...args, file], { cwd, shell: false, env: process.env });
+    const child = spawn('git', [...args, file], { cwd, shell: false, env: filteredVerifyEnv() });
     const chunks: Buffer[] = [];
     child.stdout.on('data', (b: Buffer) => { chunks.push(b); });
     child.stderr.on('data', (b: Buffer) => { chunks.push(b); });

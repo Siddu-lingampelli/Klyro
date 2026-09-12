@@ -140,7 +140,7 @@ describe('edit_file core (4.1)', () => {
   });
 
   it('repairGuard allows latest.ts / attest.ts (not test-like)', async () => {
-    for (const p of ['latest.ts', 'attest.ts']) {
+    for (const p of ['latest.ts', 'attest.ts', 'contest-data.txt']) {
       await write(p, 'hello world');
       const r = await editFileTool.execute(
         { path: p, find: 'world', replace: 'there' },
@@ -170,5 +170,21 @@ describe('edit_file core (4.1)', () => {
     );
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.error.code).toBe('POLICY_DENIED');
+  });
+
+  it('denies edits redirected through a swapped-in symlink', async () => {
+    if (process.platform === 'win32') return; // symlink creation needs privilege (EPERM) on Windows
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'klyro-edit-out-'));
+    try {
+      const outsideFile = path.join(outside, 'secret.txt');
+      await fs.writeFile(outsideFile, 'hello secret', 'utf-8');
+      await fs.symlink(outsideFile, path.join(tmp, 'link.txt'));
+      const r = await editFileTool.execute({ path: 'link.txt', find: 'secret', replace: 'pwned' }, { cwd: tmp, env: {} });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe('PATH_ESCAPE');
+      expect(await fs.readFile(outsideFile, 'utf-8')).toBe('hello secret');
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true });
+    }
   });
 });

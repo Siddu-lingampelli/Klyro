@@ -1,13 +1,32 @@
 /**
  * 4.5 — Checkpoint snapshots: every mutation to checkpoints dir
+ *
+ * Snapshot bytes stay RAW (no redaction): checkpoint copies must be
+ * bit-identical to the working tree so undo() restores exact fidelity —
+ * redacting at snapshot time would corrupt restores (a redacted snapshot
+ * written back would permanently replace real code with [REDACTED]).
+ * Same-trust-domain rationale: snapshots never leave the project dir and
+ * are only read back by undo() into the same tree, so secret hygiene is
+ * enforced at the trace/persist boundaries (TraceWriter, SessionStore)
+ * instead of here.
  */
 
 import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
 function ckptDir(cwd: string): string {
   return path.join(cwd, '.klyro', 'checkpoints');
+}
+
+/**
+ * Best-effort permission lockdown (0600 files / 0700 dirs).
+ * Windows ACLs ignore POSIX mode bits — no-op by design.
+ */
+function lockDown(p: string, mode: number): void {
+  if (process.platform === 'win32') return;
+  try { fsSync.chmodSync(p, mode); } catch { /* best-effort only */ }
 }
 
 /** Best-effort fsync of a just-written file (crash safety). */
@@ -33,9 +52,11 @@ function containedPath(cwd: string, base: string, rel: string): string | null {
 export async function snapshot(cwd: string, files: string[]): Promise<string> {
   const dir = ckptDir(cwd);
   await fs.mkdir(dir, { recursive: true });
+  lockDown(dir, 0o700);
   const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dest = path.join(dir, id);
   await fs.mkdir(dest, { recursive: true });
+  lockDown(dest, 0o700);
   const missing: string[] = [];
   const kept: string[] = [];
   for (const f of files) {
@@ -48,6 +69,7 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
       if (!out) continue;
       await fs.mkdir(path.dirname(out), { recursive: true });
       await fs.writeFile(out, data);
+      lockDown(out, 0o600);
       await fsyncFile(out);
       kept.push(rel);
     } catch (e: unknown) {
@@ -62,6 +84,7 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
     metaPath,
     JSON.stringify({ id, files: kept, missing, ts: Date.now() }, null, 2),
   );
+  lockDown(metaPath, 0o600);
   await fsyncFile(metaPath);
   // Best-effort last.diff for the repair guard (guardRepair reads it).
   try {

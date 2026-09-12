@@ -31,12 +31,13 @@ import { detectVerifyCommand } from '../verification/auto.js';
 import { detectVerifiers } from '../verification/registry.js';
 import { ensureBaseline, getBaseline } from '../verification/baseline.js';
 import { compressTranscript, totalTokens } from '../context/tokenizer.js';
-import { ratesFor } from '../providers/model-info.js';
+import { ratesFor, isAnthropicModel } from '../providers/model-info.js';
 import { classifyFailure, rerunOnce, gatherRepairContext, guardRepair } from '../verification/classify.js';
 import { findRelatedTests, buildScopedCommand, runScopedVerify, syntaxCheck, checkImports } from '../verification/scoped.js';
 import { EventBus, globalBus } from '../events/bus.js';
 import type { KlyroEvent } from '../events/catalog.js';
 import { TraceWriter } from '../trace/writer.js';
+import { loadHooks, runHook, type Hook } from '../cli/hooks.js';
 
 /**
  * Verification mode. The canonical definition lives in verification/engine.ts
@@ -49,6 +50,13 @@ export type VerifyMode = typeof import('../verification/engine.js') extends { Ve
 
 export interface RuntimeDeps {
   adapter: ProviderAdapter;
+  /**
+   * Ordered failover adapters (L15). When the active adapter ends a step
+   * with a terminal provider error, the runtime swaps to the next entry
+   * and re-issues the step (bounded by chain length, never loops).
+   * Optional — single-adapter callers behave exactly as before.
+   */
+  failoverAdapters?: ProviderAdapter[];
   registry: ToolRegistry;
   policy: PolicyEngine;
   approval: ApprovalPrompt;
@@ -192,7 +200,11 @@ export type RuntimeEvent =
   | { kind: 'verification_started'; command: string }
   | { kind: 'verification_succeeded'; command: string }
   | { kind: 'repair_started'; attempt: number; maxAttempts: number; reason: string }
-  | { kind: 'checkpoint_saved'; sessionId: string };
+  | { kind: 'checkpoint_saved'; sessionId: string }
+  | { kind: 'status'; message: string }
+  | { kind: 'budget_warning'; ratio: number; threshold: number }
+  | { kind: 'provider_failover'; from: string; to: string; reason: string }
+  | { kind: 'model_override'; requested: string; effective: string };
 
 export interface RunResult {
   status: 'complete' | 'max_steps' | 'aborted' | 'no_final' | 'verify_failed' | 'limit' | 'blocked' | 'stuck';
@@ -222,18 +234,34 @@ export function toolDefinitions(registry: ToolRegistry): ToolDefinition[] {
   }));
 }
 
-// BUG-005: Model-aware cost estimation, single-sourced from the
+// Model-aware cost estimation, single-sourced from the
 // providers/model-info.ts rate table (local/unknown models are $0).
-// Cost is computed on input/output ONLY: cacheRead/cacheWrite are tracked
-// for observability but excluded because cached tokens bill at
-// provider-specific discounted rates we don't model — charging them at
-// full input rates would overstate spend, silently dropping them
-// understates it, so we keep them visible and out of the math.
+// Cache-aware: for Anthropic-family models (isAnthropicModel), cacheRead
+// bills at 0.1× the input rate and cacheWrite at 1.25×; all other
+// families ignore cache counters (discounted billing, unmodeled).
 /** Estimate USD cost of a usage block given the model name. */
-export function estimateCost(model: string, usage: { input: number; output: number }): number {
+export function estimateCost(
+  model: string,
+  usage: { input: number; output: number; cacheRead?: number; cacheWrite?: number },
+): number {
   const { input: inRate, output: outRate } = ratesFor(model);
-  return (usage.input / 1000) * inRate + (usage.output / 1000) * outRate;
+  const base = (usage.input / 1000) * inRate + (usage.output / 1000) * outRate;
+  if (!isAnthropicModel(model)) return base;
+  const read = ((usage.cacheRead ?? 0) / 1000) * inRate * 0.1;
+  const write = ((usage.cacheWrite ?? 0) / 1000) * inRate * 1.25;
+  return base + read + write;
 }
+
+/**
+ * Parallel fan-out cap: approved concurrencySafe tool calls execute in
+ * sequential chunks of at most this size. Commit order stays identical
+ * (commits run sequentially after execution), so the transcript reads as
+ * if the calls ran in order.
+ */
+export const MAX_PARALLEL_TOOLS = 8;
+
+/** Progressive budget-warning thresholds (fraction of maxCost), fired once each per run. */
+export const BUDGET_WARNING_THRESHOLDS = [0.4, 0.7, 0.9] as const;
 
 // PERF-002: Memoized token counting cache.
 let tokenCache: { lastRef: Message[] | null; lastSystem: string | undefined; lastCount: number } = {
@@ -272,6 +300,17 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     return [{ role: 'user', content: [text(opts.task)] }];
   })();
   const usage: { input: number; output: number; estimated?: boolean; cacheRead?: number; cacheWrite?: number } = { input: 0, output: 0 };
+  /** Emit one `budget_warning` per threshold the cost ratio has crossed. */
+  const checkBudgetWarnings = (): void => {
+    if (maxCost === undefined || maxCost <= 0) return;
+    const ratio = estimateCost(opts.model, usage) / maxCost;
+    for (const threshold of BUDGET_WARNING_THRESHOLDS) {
+      if (ratio >= threshold && !firedBudgetWarnings.has(threshold)) {
+        firedBudgetWarnings.add(threshold);
+        emit?.({ kind: 'budget_warning', ratio, threshold });
+      }
+    }
+  };
   let steps = 0;
   let toolCallCount = 0;
   let finalText = '';
@@ -305,6 +344,29 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   const telemetry = new RuntimeTelemetry();
   telemetry.setMaxSteps(maxSteps);
 
+  // Model-override surfacing (informational): when a parent/orchestrator
+  // context carries a model override, emit it once so UIs can show which
+  // model actually serves this run.
+  if (opts.parentContext?.model) {
+    emit?.({ kind: 'model_override', requested: opts.model, effective: opts.parentContext.model });
+  }
+
+  // Hooks engine: loaded once per run. Zero-cost fast path — when no hooks
+  // file exists, both lists are empty and every hook call site is skipped.
+  let runHooks: Hook[] = [];
+  try {
+    runHooks = loadHooks(opts.cwd);
+  } catch {
+    runHooks = [];
+  }
+  const preHooks = runHooks.filter((h) => h.event === 'preToolUse');
+  const postHooks = runHooks.filter((h) => h.event === 'postToolUse');
+
+  // L15 failover chain: the active adapter starts as deps.adapter; each
+  // terminal provider error consumes one fallback. Bounded — never loops.
+  let activeAdapter: ProviderAdapter = deps.adapter;
+  const failoverQueue: ProviderAdapter[] = [...(deps.failoverAdapters ?? [])];
+
   // 3.1 — Event bus + TraceWriter
   const bus: EventBus = (deps as unknown as { bus?: EventBus }).bus ?? globalBus;
   let tracer: TraceWriter | undefined;
@@ -323,6 +385,10 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   // 5.1 — phases and limits
   const maxCost = opts.maxCost;
   const maxTimeMs = opts.maxTimeMs;
+  // Progressive budget warnings: fire once per threshold per run when the
+  // cost ratio crosses 0.4 / 0.7 / 0.9 of maxCost (checker defined after
+  // `usage` is declared below).
+  const firedBudgetWarnings = new Set<number>();
   const startTime = Date.now();
   let phase: Phase = 'understanding';
   const setPhase = (p: Phase) => {
@@ -443,7 +509,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       ...(opts.signal ? { signal: opts.signal } : {}),
     };
 
-    const events = deps.adapter.stream(req);
+    const events = activeAdapter.stream(req);
     let textBuf = '';
     // Thinking is ephemeral: streamed to the UI live, never stored in the
     // transcript, and cleared when the turn's answer completes.
@@ -452,6 +518,12 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     let lastFinishReason: string | undefined;
     // Set when this step's request must be re-issued after overflow recovery.
     let overflowRetryPending = false;
+    // Set when a terminal provider error consumed a failover adapter — the
+    // step is re-issued against the next adapter without consuming budget.
+    let failoverPending = false;
+    let failoverFrom = '';
+    let failoverTo = '';
+    let failoverReason = '';
 
     for await (const ev of events) {
       if (opts.signal?.aborted) break outer;
@@ -483,6 +555,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             ...(usage.cacheRead !== undefined ? { cacheRead: usage.cacheRead } : {}),
             ...(usage.cacheWrite !== undefined ? { cacheWrite: usage.cacheWrite } : {}),
           });
+          checkBudgetWarnings();
         } else {
           // Providers that omit usage (Ollama, vLLM, proxies): estimate from
           // the actual request + generated output so cost accounting never
@@ -493,6 +566,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           usage.estimated = true;
           telemetry.recordUsage(est.input, est.output);
           emit?.({ kind: 'usage', input: usage.input, output: usage.output, estimated: true });
+          checkBudgetWarnings();
         }
       } else if (ev.kind === 'error') {
         // Overflow recovery: on the first REQUEST_TOO_LARGE of a run,
@@ -518,6 +592,24 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           } catch { /* ignore — retry with the transcript as-is */ }
           break;
         }
+        // L15 failover: a terminal provider error swaps to the next chained
+        // adapter and re-issues the step (bounded by chain length). Context
+        // overflow is excluded — it owns its own recovery above. By the time
+        // an error reaches the runtime, per-adapter retries are exhausted,
+        // so any provider error here is terminal for the active adapter.
+        if (failoverQueue.length > 0) {
+          const next = failoverQueue.shift()!;
+          failoverPending = true;
+          failoverFrom = activeAdapter.id;
+          failoverTo = next.id;
+          failoverReason = `${ev.code}: ${ev.message}`.slice(0, 300);
+          activeAdapter = next;
+          telemetry.recordError(`failover: ${ev.code}`);
+          emit?.({ kind: 'provider_failover', from: failoverFrom, to: failoverTo, reason: failoverReason });
+          emit?.({ kind: 'status', message: `provider ${failoverFrom} failed (${ev.code}) — failing over to ${failoverTo}` });
+          emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: ev.code, message: `failing over ${failoverFrom} → ${failoverTo}: ${ev.message.slice(0, 200)}` });
+          break;
+        }
         telemetry.recordError(`stream_error: ${ev.code}`);
         if (store && sessionId) {
           try { await store.setStatus(sessionId, 'aborted', textBuf); } catch { /* ignore */ }
@@ -541,6 +633,20 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     // without consuming the step budget.
     if (overflowRetryPending) {
       overflowRetryPending = false;
+      steps--;
+      emit?.({ kind: 'step_end', step: steps + 1 });
+      continue outer;
+    }
+
+    // Failover lands here via `break`: discard the failed attempt's partial
+    // output and re-issue the same step against the next adapter, again
+    // without consuming the step budget.
+    if (failoverPending) {
+      failoverPending = false;
+      textBuf = '';
+      thinkingBuf = '';
+      pendingToolCalls.clear();
+      lastFinishReason = undefined;
       steps--;
       emit?.({ kind: 'step_end', step: steps + 1 });
       continue outer;
@@ -631,7 +737,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           emit?.({ kind: 'verification_started', command: advisoryCmd });
           let advisoryResult: VerifyResult;
           try {
-            advisoryResult = await verify({ cwd: opts.cwd, command: advisoryCmd, timeoutMs: opts.verify?.timeoutMs });
+            // CONTRACT (a): sessionId passthrough to the verify engine.
+            advisoryResult = await verify({ cwd: opts.cwd, command: advisoryCmd, timeoutMs: opts.verify?.timeoutMs, ...(sessionId ? { sessionId } : {}) });
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             advisoryResult = { ok: false, exitCode: -1, stdout: '', stderr: msg, failure: { type: 'unknown', files: [], raw: msg, exitCode: -1 } };
@@ -700,7 +807,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
               const det = sr.ok ? undefined : (await import('../verification/detect.js')).detect(sr.stdout, sr.stderr, sr.exitCode);
               vResult = { ok: sr.ok, exitCode: sr.exitCode, stdout: sr.stdout, stderr: sr.stderr, ...(det ? { failure: det } : {}) } as VerifyResult;
             } else {
-              vResult = await verify({ cwd: opts.cwd, command: cmdToRun, timeoutMs: opts.verify?.timeoutMs });
+              vResult = await verify({ cwd: opts.cwd, command: cmdToRun, timeoutMs: opts.verify?.timeoutMs, ...(sessionId ? { sessionId } : {}) });
             }
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
@@ -710,7 +817,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         // If scoped passed but full may still fail, run full before declaring success
         if (vResult.ok && isScoped) {
           try {
-            const full = await verify({ cwd: opts.cwd, command: verifyCmd, timeoutMs: opts.verify?.timeoutMs });
+            const full = await verify({ cwd: opts.cwd, command: verifyCmd, timeoutMs: opts.verify?.timeoutMs, ...(sessionId ? { sessionId } : {}) });
             if (!full.ok) vResult = full;
           } catch { /* scoped success is enough */ }
         }
@@ -928,6 +1035,31 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     ): Promise<{ obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number }> => {
       const t0 = Date.now();
       emitKlyro({ type: 'tool.call', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, input: call.input });
+      // Hooks: every preToolUse hook runs before execution. A non-zero exit
+      // denies the tool with POLICY_DENIED — the real tool never runs.
+      if (preHooks.length > 0) {
+        for (const hook of preHooks) {
+          let exitCode: number | null = -1;
+          let detail = '';
+          try {
+            const r = await runHook(hook, { toolName: call.name, input: call.input });
+            exitCode = r.exitCode;
+            detail = (r.stderr || r.stdout || '').slice(0, 300);
+          } catch (err) {
+            detail = String(err instanceof Error ? err.message : err).slice(0, 300);
+          }
+          if (exitCode !== 0) {
+            const reason = `hook ${hook.name} denied: ${detail || 'hook failed'}`;
+            emit?.({ kind: 'policy_decision', id: call.id, name: call.name, action: 'deny', reason });
+            emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: 'deny', reason });
+            const latencyMs = Date.now() - t0;
+            return {
+              obs: { ok: false, error: { code: 'POLICY_DENIED', message: reason } } as import('../tools/types.js').ToolResult<unknown>,
+              latencyMs,
+            };
+          }
+        }
+      }
       let obs: import('../tools/types.js').ToolResult<unknown>;
       try {
         obs = await deps.registry.execute(call.name, call.input, toolCtx);
@@ -1013,6 +1145,24 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       if (last3.length === 3 && last3[0] === last3[1] && last3[1] === last3[2]) {
         await markStuck(`identical call ×3: ${sig}`);
       }
+      // Hooks: postToolUse hooks are best-effort — failures warn on stderr
+      // plus a bus event, and never fail the turn.
+      if (postHooks.length > 0) {
+        for (const hook of postHooks) {
+          try {
+            const r = await runHook(hook, { toolName: call.name, input: call.input });
+            if (!r.ok || r.exitCode !== 0) {
+              const msg = `klyro: hooks: postToolUse ${hook.name} failed (exit ${String(r.exitCode)}): ${(r.stderr || r.stdout || '').slice(0, 200)}\n`;
+              try { process.stderr.write(msg); } catch { /* ignore */ }
+              emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'hook_failed', message: msg.slice(0, 300) });
+            }
+          } catch (err) {
+            const msg = `klyro: hooks: postToolUse ${hook.name} error: ${String(err instanceof Error ? err.message : err).slice(0, 200)}\n`;
+            try { process.stderr.write(msg); } catch { /* ignore */ }
+            emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'hook_failed', message: msg.slice(0, 300) });
+          }
+        }
+      }
     };
 
     // Sequential path: gate → execute → commit per call, in order.
@@ -1035,8 +1185,16 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         if (opts.signal?.aborted) break;
       }
       if (approved.length > 0 && !opts.signal?.aborted) {
-        const settled = await Promise.allSettled(approved.map((c) => execTool(c)));
-        for (let i = 0; i < approved.length; i++) {
+        // Fan-out cap: execute in sequential chunks of MAX_PARALLEL_TOOLS.
+        // Commits below stay in original call order, so the transcript is
+        // unaffected by the chunking.
+        const settled: PromiseSettledResult<{ obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number }>[] = [];
+        for (let off = 0; off < approved.length; off += MAX_PARALLEL_TOOLS) {
+          if (opts.signal?.aborted) break;
+          const chunk = approved.slice(off, off + MAX_PARALLEL_TOOLS);
+          settled.push(...await Promise.allSettled(chunk.map((c) => execTool(c))));
+        }
+        for (let i = 0; i < settled.length; i++) {
           const s = settled[i]!;
           if (s.status === 'fulfilled') {
             await commitResult(approved[i]!, s.value.obs, s.value.latencyMs);

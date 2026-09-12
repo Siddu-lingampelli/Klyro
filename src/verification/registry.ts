@@ -6,6 +6,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { filteredEnv as siblingFilteredEnv } from '../tools/shell/shell-exec.js';
 
 export type VerifierKind = 'tests' | 'typecheck' | 'lint' | 'build' | 'format-check' | 'custom';
 
@@ -110,10 +111,13 @@ export function primaryVerifyCommand(cwd: string): string | null {
 
 // S2 — filtered env for ALL spawned verify commands.
 //
-// Sibling `tools/shell/shell-exec.ts` owns an equivalent `filteredEnv` but
-// does not export it, so this mirrors that filter (allowlisted prefixes +
-// exact keys, secret-ish names stripped, preload vectors deleted) instead of
-// importing sibling internals.
+// Delegates to the sibling-owned `filteredEnv` from
+// `tools/shell/shell-exec.ts` (EXACT export name — verified via grep) for
+// the allowlist base, then applies this module's stricter secret strip
+// (sibling only strips SECRET/TOKEN + named keys; verify children also
+// strip KEY-shaped names like NODE_API_KEY) plus the Windows shell vars a
+// spawned shell needs (SystemRoot/COMSPEC/...) and preload-vector deletes.
+// `filteredVerifyEnv` already exists — reuse it, don't duplicate it.
 const VERIFY_ENV_PREFIXES = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'NODE_', 'NPM_', 'PNPM_', 'YARN_'];
 // Exact keys: sibling's PWD/TMPDIR/TEMP plus the Windows OS vars a spawned
 // shell needs to start (COMSPEC/SystemRoot/PATHEXT/...) — none carry secrets.
@@ -126,7 +130,13 @@ const VERIFY_ENV_SECRET_RE = /SECRET|TOKEN|KEY/i;
 
 /** Filtered env for verify children: allowlist + secret strip + preload-vector delete. */
 export function filteredVerifyEnv(): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = {};
+  // Sibling-owned base (allowlisted prefixes + secret strip).
+  const out: NodeJS.ProcessEnv = { ...siblingFilteredEnv() };
+  // Harden beyond the sibling: strip KEY-shaped names the sibling passes
+  // through (e.g. NODE_API_KEY) before overlaying our own allowlist.
+  for (const k of Object.keys(out)) {
+    if (VERIFY_ENV_SECRET_RE.test(k)) delete out[k];
+  }
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
     if (VERIFY_ENV_SECRET_RE.test(k)) continue;

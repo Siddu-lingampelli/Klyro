@@ -6,7 +6,7 @@ import * as fs from 'node:fs/promises';
 import * as crypto from 'node:crypto';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
-import { resolveAndFollowSymlinks } from '../../policy/path-guard.js';
+import { resolveAndFollowSymlinks, assertNotSymlink } from '../../policy/path-guard.js';
 import { safe } from '../normalize.js';
 import { wasRead } from './read-history.js';
 import { checkStaleness, recordEditStaleness } from './edit-file.js';
@@ -101,6 +101,9 @@ export const multiEditTool = defineTool({
       }
       const tmp = `${resolved}.klyro-multi-${Date.now()}.tmp`;
       await fs.writeFile(tmp, content, 'utf-8');
+      // Symlink-swap guard: refuse if the final dest became a symlink
+      // since the up-front resolve (lstat never follows the final link).
+      await assertNotSymlink(resolved);
       try { await fs.rename(tmp, resolved); } catch (err) { await fs.unlink(tmp).catch(() => undefined); throw err; }
       const newStat = await fs.stat(resolved);
       recordEditStaleness(resolved, newStat.mtimeMs, crypto.createHash('sha256').update(content, 'utf-8').digest('hex'));

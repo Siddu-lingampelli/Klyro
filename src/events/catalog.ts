@@ -1,6 +1,15 @@
 /**
  * 3.1 — KlyroEvent catalog (Appendix C)
  * Every observable action in the harness is a typed event.
+ *
+ * Reserved-future members (declared but intentionally unproduced — no
+ * emitter exists yet, so do not treat their absence as a bug):
+ * `subtask.tool_call`, `subtask.tool_result`.
+ * `subtask.progress` IS emitted (throttled: max 1 per child tool call,
+ * in-process children only; process-isolated children don't run the emitter).
+ * The orchestrator otherwise emits started/completed/failed/cancelled/
+ * timed_out/merged only; grep for emitters before assuming one of the
+ * reserved members fires.
  */
 
 export type KlyroEvent =

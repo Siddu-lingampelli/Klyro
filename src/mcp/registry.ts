@@ -15,7 +15,18 @@
  * write-only metadata today), so we pick the most restrictive class,
  * 'admin' — the same class as `spawn_agent`, since MCP tools execute
  * arbitrary external side effects (read/write/network) outside our control.
+ *
+ * Debug capture: when `KLYRO_MCP_DEBUG=1` is set, every MCP tool success
+ * AND error ALSO writes the UNREDACTED raw JSON payload (pre-redaction,
+ * may contain secrets — handle accordingly) to
+ * `<configDir>/tool-output/mcp-<server>-<ts>.json` (mode 0600) and notes
+ * the path on stderr. `<configDir>` is `$KLYRO_CONFIG_DIR` when set,
+ * otherwise `~/.klyro`. Default off: with the flag unset (or any value
+ * other than `1`) no file is written and behaviour is unchanged.
  */
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { McpClient, McpError, type McpClientLike, type McpToolDef } from './client.js';
 import { loadMcpServers, type McpServerSpec } from './config.js';
 import { evaluateMcpPolicy } from './policy.js';
@@ -68,7 +79,39 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Debug-capture filename disambiguator when Date.now() collides. */
+let mcpDebugCounter = 0;
+
+/**
+ * `KLYRO_MCP_DEBUG=1` capture: write the UNREDACTED raw payload to
+ * `<configDir>/tool-output/mcp-<server>-<ts>.json` (mode 0600) + a stderr
+ * note. Best-effort and synchronous — never throws into the tool path.
+ */
+function captureMcpDebug(server: string, tool: string, payload: unknown): void {
+  if (process.env.KLYRO_MCP_DEBUG !== '1') return;
+  try {
+    const base = process.env.KLYRO_CONFIG_DIR ?? path.join(os.homedir() || process.cwd(), '.klyro');
+    const dir = path.join(base, 'tool-output');
+    fs.mkdirSync(dir, { recursive: true });
+    const safe = server.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 32) || 'server';
+    let file = path.join(dir, `mcp-${safe}-${Date.now()}.json`);
+    if (fs.existsSync(file)) {
+      mcpDebugCounter += 1;
+      file = path.join(dir, `mcp-${safe}-${Date.now()}-${mcpDebugCounter}.json`);
+    }
+    fs.writeFileSync(file, JSON.stringify({ server, tool, payload }, null, 2), { mode: 0o600 });
+    try {
+      process.stderr.write(`klyro: mcp debug captured ${server}/${tool} -> ${file}\n`);
+    } catch {
+      /* ignore */
+    }
+  } catch {
+    /* best-effort only */
+  }
+}
+
 async function executeMcpTool(
+  server: string,
   spec: McpServerSpec,
   toolDef: McpToolDef,
   client: McpClientLike,
@@ -92,16 +135,20 @@ async function executeMcpTool(
       // (3) Typed server failures keep their code; everything else is TOOL_ERROR.
       // Redact BEFORE the message can reach the model/trace.
       if (err instanceof McpError) {
+        captureMcpDebug(server, toolDef.name, { code: err.code, message: err.message, details: err.details });
         return { ok: false, error: { code: err.code, message: redact(err.message) } };
       }
+      captureMcpDebug(server, toolDef.name, { message: errMessage(err) });
       return { ok: false, error: { code: 'TOOL_ERROR', message: redact(errMessage(err)) } };
     }
     // (4) Server-reported error → TOOL_ERROR, redacted, bounded.
     if (res.isError) {
+      captureMcpDebug(server, toolDef.name, res.raw);
       return { ok: false, error: { code: 'TOOL_ERROR', message: redact(res.text).slice(0, 2000) } };
     }
     // (5) Success — redact BEFORE the value reaches the model/trace, then
     // truncate to a bounded size with a marker.
+    captureMcpDebug(server, toolDef.name, res.raw);
     const redacted = redact(res.text);
     if (redacted.length > MCP_SUCCESS_MAX_CHARS) {
       return {
@@ -207,7 +254,7 @@ export async function registerMcpServers(
           // external side effects; nothing in src reads this field yet.
           permission: 'admin',
           execute: (input: unknown, ctx: ToolContext) =>
-            executeMcpTool(boundSpec, boundDef, boundClient, input, ctx),
+            executeMcpTool(server, boundSpec, boundDef, boundClient, input, ctx),
         });
         registry.register(tool);
         registered.push(name);

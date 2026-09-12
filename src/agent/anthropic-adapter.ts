@@ -59,7 +59,7 @@ interface AnthropicRequest {
   model: string;
   system?: string | Array<{ type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }>;
   messages: AnthropicMessage[];
-  tools?: Array<{ name: string; description: string; input_schema: unknown }>;
+  tools?: Array<{ name: string; description: string; input_schema: unknown; cache_control?: { type: 'ephemeral' } }>;
   max_tokens: number;
   temperature?: number;
   stream: true;
@@ -143,12 +143,32 @@ export function buildAnthropicSystem(
   return promptCache ? [{ type: 'text' as const, text: system, ...breakpoint }] : system;
 }
 
+/**
+ * Build the Anthropic `tools` array. When prompt caching is enabled, the
+ * last tool carries a `cache_control: {type:'ephemeral'}` breakpoint so
+ * the (usually stable) tool definitions join the cacheable prefix —
+ * mirroring the system-text breakpoint. OpenAI path untouched.
+ * Exported via _internal for testing.
+ */
+export function buildAnthropicTools(
+  tools: ToolDefinition[],
+  promptCache: boolean,
+): AnthropicRequest['tools'] {
+  if (tools.length === 0) return undefined;
+  const out = tools.map(toAnthropicTool);
+  if (promptCache) {
+    const last = out[out.length - 1]!;
+    last.cache_control = { type: 'ephemeral' };
+  }
+  return out;
+}
+
 async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIterable<StreamEvent> {
   const body: AnthropicRequest = {
     model: req.model,
     system: buildAnthropicSystem(req.system, req.systemSuffix, opts.promptCache),
     messages: toAnthropicMessages(req.messages),
-    tools: req.tools.length > 0 ? req.tools.map(toAnthropicTool) : undefined,
+    tools: buildAnthropicTools(req.tools, opts.promptCache),
     max_tokens: req.maxTokens ?? 4096,
     temperature: req.temperature,
     stream: true,
@@ -489,7 +509,7 @@ function toAnthropicMessages(messages: Message[]): AnthropicMessage[] {
   });
 }
 
-function toAnthropicTool(t: ToolDefinition): { name: string; description: string; input_schema: unknown } {
+function toAnthropicTool(t: ToolDefinition): NonNullable<AnthropicRequest['tools']>[number] {
   return {
     name: t.name,
     description: t.description,
@@ -498,4 +518,4 @@ function toAnthropicTool(t: ToolDefinition): { name: string; description: string
 }
 
 // Re-export for testability.
-export const _internal = { toAnthropicMessages, toAnthropicTool, translateSse, buildAnthropicSystem };
+export const _internal = { toAnthropicMessages, toAnthropicTool, translateSse, buildAnthropicSystem, buildAnthropicTools };

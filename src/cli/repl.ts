@@ -191,6 +191,24 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       },
     );
   let adapter = buildAdapter(currentProvider, currentBaseUrl, currentApiKey);
+  // L15 failover — initial adapter only: extra `providers.failover` entries
+  // become fallback adapters for agent runs in this session. Live
+  // /provider switches rebuild a single adapter (buildAdapter) and bypass
+  // the chain — documented, not a bug.
+  let replFailoverAdapters: ReturnType<typeof buildAdapter>[] = [];
+  try {
+    const { resolveProviderChain } = await import('./config.js');
+    const chain = await resolveProviderChain(cwd);
+    for (const entry of chain.slice(1)) {
+      if (!entry.apiKey) continue;
+      try {
+        replFailoverAdapters.push(buildAdapter(entry.provider, entry.baseURL ?? currentBaseUrl, entry.apiKey));
+      } catch { /* skip unbuildable entries */ }
+    }
+    if (replFailoverAdapters.length > 0) {
+      process.stderr.write(`klyro: failover chain: ${replFailoverAdapters.map((b) => b.id).join(' → ')}\n`);
+    }
+  } catch { /* best-effort — single-provider session proceeds */ }
   const ctxBlock = await buildLevel6Context({ cwd });
   let ctxPrefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
   // 4.4 KLYRO.md hierarchy (mutable — /reload refreshes). Content is gated
@@ -641,6 +659,18 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     if (isMounted && directHooks) directHooks.clearTranscript();
   }
 
+  // Update nudge (best-effort, cached 24h, silent fail): a single stderr
+  // line when a newer version exists. No prompt, no blocking — the check
+  // itself is fire-and-forget.
+  void (async () => {
+    try {
+      const { checkForUpdate } = await import('./update.js');
+      const cur = readVersion();
+      const latest = await checkForUpdate(cur);
+      if (latest) process.stderr.write(`Update available: ${cur} → ${latest} (klyro update)\n`);
+    } catch { /* silent */ }
+  })();
+
   app = render(
     React.createElement(App, {
       initialModel: model,
@@ -862,10 +892,15 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
               });
             } else if (ev.kind === 'aborted') {
               queuedStatus({ status: 'aborted' });
+            } else if (ev.kind === 'model_override') {
+              queuedAppend({ id: `movr-${Date.now()}`, kind: 'text', text: `[model] override: requested ${ev.requested} → effective ${ev.effective}`, role: 'assistant' });
             }
           },
         },
-        { adapter, registry, policy, approval, systemPrompt: systemPromptFn },
+        {
+          adapter, registry, policy, approval, systemPrompt: systemPromptFn,
+          ...(replFailoverAdapters.length > 0 ? { failoverAdapters: replFailoverAdapters } : {}),
+        },
       );
       if (result.finalText) lastAssistantText = result.finalText;
       if (result.verification) {

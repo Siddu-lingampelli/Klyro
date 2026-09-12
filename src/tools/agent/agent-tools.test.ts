@@ -15,7 +15,7 @@ import { taskWaitTool } from './task-wait.js';
 import { taskStopTool } from './task-stop.js';
 import { taskApplyTool } from './task-apply.js';
 import type { ToolContext } from '../types.js';
-import { AgentOrchestrator, type AgentSpawnBridge, type ParentContextRef } from '../../agent/orchestrator.js';
+import { AgentOrchestrator, createSubtaskProgressEmitter, progressNote, type AgentSpawnBridge, type ParentContextRef } from '../../agent/orchestrator.js';
 import { globalBus } from '../../events/bus.js';
 import type { RuntimeDeps } from '../../agent/runtime.js';
 
@@ -51,6 +51,16 @@ describe('agent tools', () => {
     const names = new Set(builtinRegistry().list().map((t) => t.name));
     for (const n of ['spawn_agent', 'task_list', 'task_get', 'task_wait', 'task_stop', 'task_apply']) {
       expect(names.has(n)).toBe(true);
+    }
+  });
+
+  it('every BUILTIN_AGENTS allowedTools entry exists in builtinRegistry', async () => {
+    const { BUILTIN_AGENTS } = await import('../../agent/orchestrator.js');
+    const names = new Set(builtinRegistry().list().map((t) => t.name));
+    for (const agent of BUILTIN_AGENTS) {
+      for (const tool of agent.allowedTools ?? []) {
+        expect(names.has(tool)).toBe(true);
+      }
     }
   });
 
@@ -329,5 +339,176 @@ describe('orchestrator spawn budgets and guards', () => {
     const a = await orch.applyTask('task_9');
     expect(a.ok).toBe(false);
     if (!a.ok) expect(a.error.code).toBe('NOT_FOUND');
+  });
+});
+
+describe('subtask.progress mid-life events', () => {
+  it('progressNote formats step/tool/outcome', () => {
+    expect(progressNote(2, 'read_file', false)).toBe('step 2: read_file ok');
+    expect(progressNote(2, 'read_file', true)).toBe('step 2: read_file ERR');
+  });
+
+  it('emitter mirrors one subtask.progress per finished tool call', () => {
+    const before = globalBus.getHistory().length;
+    const emit = createSubtaskProgressEmitter({ taskId: 'task_9', sessionId: 'sess' });
+    emit({ kind: 'step_start', step: 3 });
+    emit({ kind: 'tool_call_end', id: 'c1', name: 'read_file', input: {} });
+    emit({ kind: 'tool_result', id: 'c1', name: 'read_file', output: 'x', isError: false, latencyMs: 1 });
+    // Duplicate result for the same call id never double-emits.
+    emit({ kind: 'tool_result', id: 'c1', name: 'read_file', output: 'x', isError: false, latencyMs: 1 });
+    // Start without end/result emits nothing.
+    emit({ kind: 'tool_call_start', id: 'c2', name: 'grep' });
+    const evs = globalBus.getHistory().slice(before).filter((e) => e.type === 'subtask.progress');
+    expect(evs).toHaveLength(1);
+    expect(evs[0]?.type).toBe('subtask.progress');
+    if (evs[0]?.type === 'subtask.progress') {
+      expect(evs[0].taskId).toBe('task_9');
+      expect(evs[0].note).toBe('step 3: read_file ok');
+    }
+  });
+
+  it('emitter drops tool_result without a preceding tool_call_end, marks ERR', () => {
+    const before = globalBus.getHistory().length;
+    const emit = createSubtaskProgressEmitter({ taskId: 'task_10', sessionId: 'sess' });
+    emit({ kind: 'step_start', step: 1 });
+    emit({ kind: 'tool_result', id: 'ghost', name: 'grep', output: 'nope', isError: true, latencyMs: 1 });
+    emit({ kind: 'tool_call_end', id: 'c3', name: 'shell_exec', input: {} });
+    emit({ kind: 'tool_result', id: 'c3', name: 'shell_exec', output: 'oops', isError: true, latencyMs: 2 });
+    const evs = globalBus.getHistory().slice(before).filter((e) => e.type === 'subtask.progress');
+    expect(evs).toHaveLength(1);
+    if (evs[0]?.type === 'subtask.progress') {
+      expect(evs[0].note).toBe('step 1: shell_exec ERR');
+    }
+  });
+});
+
+describe('S6 explicit-cwd worktree routing', () => {
+  const stubDepsWithTools = (toolNames: string[] = []): RuntimeDeps =>
+    ({ registry: { list: () => toolNames.map((name) => ({ name })) } }) as unknown as RuntimeDeps;
+
+  const parent = (overrides: Partial<ParentContextRef> = {}): ParentContextRef => ({
+    sessionId: 'sess',
+    cwd: process.cwd(),
+    depth: 0,
+    maxDepth: 2,
+    allowedTools: null,
+    ...overrides,
+  });
+
+  /** Hermetic non-repo dir (drive root: no repo ancestor can claim it). */
+  async function mkNonRepoDir(): Promise<string> {
+    return fs.mkdtemp(path.join(path.parse(process.cwd()).root, 'klyro-norepo-'));
+  }
+
+  async function rmDir(dir: string): Promise<void> {
+    for (let i = 0; i < 5; i++) {
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+        return;
+      } catch {
+        if (i === 4) throw new Error(`cleanup failed for ${dir}`);
+        await new Promise((r) => setTimeout(r, 100 * (i + 1)));
+      }
+    }
+  }
+
+  it('write-capable spawn WITH explicit cwd in a non-repo is denied (no shared-tree fallback)', async () => {
+    const dir = await mkNonRepoDir();
+    try {
+      await fs.mkdir(path.join(dir, 'sub'), { recursive: true });
+      const tools = ['read_file', 'list_directory', 'glob', 'grep', 'search_files', 'write_file', 'edit_file', 'multi_edit', 'apply_patch', 'shell_exec', 'git_status', 'git_log', 'git_diff', 'run_verify', 'todo_write'];
+      const orch = new AgentOrchestrator({ sessionId: 'sess', deps: stubDepsWithTools(tools) });
+      const r = await orch.spawnAgent({ agent: 'implementer', task: 'x', cwd: 'sub' }, parent({ cwd: dir }));
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.code).toBe('WRITES_REQUIRE_GIT');
+      expect(orch.taskManager.list()).toHaveLength(0);
+    } finally {
+      await rmDir(dir);
+    }
+  });
+
+  it('readonly spawn WITH explicit cwd passes through (no worktree, no denial)', async () => {
+    const prevWorker = process.env.KLYRO_WORKER;
+    process.env.KLYRO_WORKER = '0'; // in-process child, no subprocesses
+    const dir = await mkNonRepoDir();
+    try {
+      await fs.mkdir(path.join(dir, 'sub'), { recursive: true });
+      const fakeAdapter = {
+        id: 'fake',
+        stream: async function* () {
+          yield { kind: 'message_end', finishReason: 'stop' };
+        },
+      };
+      const deps = {
+        registry: { list: () => [] },
+        adapter: fakeAdapter,
+        policy: {},
+        approval: {},
+        systemPrompt: () => 'test',
+      } as unknown as RuntimeDeps;
+      const orch = new AgentOrchestrator({ sessionId: 'sess', deps });
+      const r = await orch.spawnAgent({ agent: 'explorer', task: 'x', cwd: 'sub' }, parent({ cwd: dir }));
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const rec = orch.taskManager.get(r.value.taskId);
+      expect(rec).toBeDefined();
+      // Resolved explicit cwd kept as-is (readonly passthrough, no worktree).
+      expect(rec?.cwd).toBe(path.join(dir, 'sub'));
+      await rec!.done;
+    } finally {
+      if (prevWorker === undefined) delete process.env.KLYRO_WORKER;
+      else process.env.KLYRO_WORKER = prevWorker;
+      await rmDir(dir);
+    }
+  });
+
+  it('write-capable spawn WITH explicit cwd in a git repo gets a worktree', async () => {
+    const { execFileSync } = await import('node:child_process');
+    try {
+      execFileSync('git', ['--version'], { stdio: 'ignore' });
+    } catch {
+      return; // git unavailable — nothing to assert
+    }
+    const prevWorker = process.env.KLYRO_WORKER;
+    process.env.KLYRO_WORKER = '0';
+    const dir = await mkNonRepoDir();
+    try {
+      await fs.mkdir(path.join(dir, 'sub'), { recursive: true });
+      const git = (args: string[]): void => {
+        execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd: dir, stdio: 'ignore' });
+      };
+      git(['init']);
+      await fs.writeFile(path.join(dir, 'README.md'), 'hi\n', 'utf-8');
+      git(['add', '.']);
+      git(['commit', '-m', 'init']);
+      const tools = ['read_file', 'list_directory', 'glob', 'grep', 'search_files', 'write_file', 'edit_file', 'multi_edit', 'apply_patch', 'shell_exec', 'git_status', 'git_log', 'git_diff', 'run_verify', 'todo_write'];
+      const fakeAdapter = {
+        id: 'fake',
+        stream: async function* () {
+          yield { kind: 'message_end', finishReason: 'stop' };
+        },
+      };
+      const deps = {
+        registry: { list: () => tools.map((name) => ({ name })) },
+        adapter: fakeAdapter,
+        policy: {},
+        approval: {},
+        systemPrompt: () => 'test',
+      } as unknown as RuntimeDeps;
+      const orch = new AgentOrchestrator({ sessionId: 'sess', deps });
+      const r = await orch.spawnAgent({ agent: 'implementer', task: 'x', cwd: 'sub' }, parent({ cwd: dir }));
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const rec = orch.taskManager.get(r.value.taskId);
+      expect(rec).toBeDefined();
+      // Worktree path differs from the resolved explicit cwd.
+      expect(rec?.cwd).not.toBe(path.join(dir, 'sub'));
+      expect(rec?.cwd).toContain('.klyro');
+      await rec!.done;
+    } finally {
+      if (prevWorker === undefined) delete process.env.KLYRO_WORKER;
+      else process.env.KLYRO_WORKER = prevWorker;
+      await rmDir(dir);
+    }
   });
 });

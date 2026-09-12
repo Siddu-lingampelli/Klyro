@@ -161,6 +161,112 @@ describe('shellExecTool', () => {
     expect(findBlockedReason('curl -O https://example.com/file.tar.gz')).toBeNull();
   });
 
+  it('blocks protected-branch pushes but allows feature pushes', async () => {
+    const { findBlockedReason } = await import('./shell-exec.js');
+    for (const command of [
+      'git push origin main',
+      'git push -f origin master',
+      'git push origin production',
+      'git push -f main',
+    ]) {
+      const reason = findBlockedReason(command);
+      expect(reason).not.toBeNull();
+      expect(reason).toMatch(/KLYRO_ALLOW_MAIN_PUSH/);
+    }
+    expect(findBlockedReason('git push origin feature/x')).toBeNull();
+    expect(findBlockedReason('git push origin hotfix-123')).toBeNull();
+    expect(findBlockedReason('git status')).toBeNull();
+  });
+
+  it('KLYRO_ALLOW_MAIN_PUSH=1 escapes findBlockedReason for protected pushes', async () => {
+    const { findBlockedReason } = await import('./shell-exec.js');
+    process.env.KLYRO_ALLOW_MAIN_PUSH = '1';
+    try {
+      expect(findBlockedReason('git push origin main')).toBeNull();
+    } finally {
+      delete process.env.KLYRO_ALLOW_MAIN_PUSH;
+    }
+    // Escape removed → denied again.
+    expect(findBlockedReason('git push origin main')).not.toBeNull();
+  });
+
+  it('isBareGitPush detects ref-less pushes', async () => {
+    const { isBareGitPush } = await import('./shell-exec.js');
+    expect(isBareGitPush('git push')).toBe(true);
+    expect(isBareGitPush('git push -f')).toBe(true);
+    expect(isBareGitPush('git push --force --tags')).toBe(true);
+    expect(isBareGitPush('git push origin feature/x')).toBe(false);
+    expect(isBareGitPush('git push origin')).toBe(false);
+    expect(isBareGitPush('git push origin main')).toBe(false);
+    expect(isBareGitPush('git status')).toBe(false);
+    expect(isBareGitPush('echo hi')).toBe(false);
+  });
+
+  it('denies bare git push at execute time while on a protected branch', async () => {
+    const { resetPersistentCwd } = await import('./shell-exec.js');
+    const base = await fs.mkdtemp(path.join(tmpdir(), 'klyro-push-exec-'));
+    try {
+      const repo = path.join(base, 'repo');
+      await fs.mkdir(repo, { recursive: true });
+      let gitOk = true;
+      try {
+        const { execFileSync } = await import('node:child_process');
+        try {
+          execFileSync('git', ['-c', 'init.defaultBranch=main', 'init'], { cwd: repo, timeout: 10000, stdio: 'ignore' });
+        } catch {
+          execFileSync('git', ['init'], { cwd: repo, timeout: 10000, stdio: 'ignore' });
+          execFileSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: repo, timeout: 10000, stdio: 'ignore' });
+        }
+      } catch {
+        gitOk = false;
+      }
+      if (!gitOk) return; // git unavailable — skip
+      const ctx = { cwd: base, env: {}, signal: undefined };
+      const r = await shellExecTool.execute({ command: 'git push', cwd: 'repo' }, ctx);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe(TOOL_ERROR_CODES.COMMAND_DENIED);
+        expect(r.error.message).toMatch(/protected branch/);
+      }
+      // Explicit feature push is not hard-blocked (blocked only by policy
+      // allowlist at runtime, not here) — findBlockedReason stays null.
+      const { findBlockedReason } = await import('./shell-exec.js');
+      expect(findBlockedReason('git push origin feature/x')).toBeNull();
+    } finally {
+      resetPersistentCwd();
+      await fs.rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('findBareProtectedPushReason honors the escape env', async () => {
+    const { findBareProtectedPushReason } = await import('./shell-exec.js');
+    expect(findBareProtectedPushReason('git status', tmpdir())).toBeNull();
+    process.env.KLYRO_ALLOW_MAIN_PUSH = '1';
+    try {
+      expect(findBareProtectedPushReason('git push', tmpdir())).toBeNull();
+    } finally {
+      delete process.env.KLYRO_ALLOW_MAIN_PUSH;
+    }
+  });
+  it('blocks shell redirection into dotfiles', async () => {
+    const { findBlockedReason } = await import('./shell-exec.js');
+    for (const command of [
+      'echo x > .mcp.json',
+      'echo x >> .mcp.json',
+      'echo x > ~/.klyro/mcp.json',
+      'echo x >> /home/user/.config/klyro/settings.json',
+    ]) {
+      expect(findBlockedReason(command)).not.toBeNull();
+    }
+  });
+
+  it('allows non-dotfile redirects and ignores 2> stderr', async () => {
+    const { findBlockedReason } = await import('./shell-exec.js');
+    expect(findBlockedReason('echo x > out.txt')).toBeNull();
+    expect(findBlockedReason('echo x > /tmp/x.log')).toBeNull();
+    expect(findBlockedReason('node build.js 2> err.log')).toBeNull();
+  });
+
   it('filteredEnv strips secrets and injection vectors', async () => {
     const { filteredEnv } = await import('./shell-exec.js');
     process.env.KLYRO_TEST_API_KEY = 'secret';

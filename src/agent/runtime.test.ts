@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { run, defaultSystemPrompt, estimateCost } from './runtime.js';
+import { run, defaultSystemPrompt, estimateCost, MAX_PARALLEL_TOOLS } from './runtime.js';
 import { ToolRegistry } from '../tools/registry.js';
 import * as fs from 'node:fs';
 import { readFileTool } from '../tools/fs/read-file.js';
@@ -823,8 +823,24 @@ describe('runtime: level-7 telemetry', () => {
     expect(r.status).toBe('complete');
     expect(r.usage).toMatchObject({ input: 100, output: 20, cacheRead: 50, cacheWrite: 30 });
     expect(usageEvents[0]).toMatchObject({ cacheRead: 50, cacheWrite: 30 });
-    // Cost ignores cache counters (discounted billing, unmodeled).
+    // Cost ignores cache counters for non-Anthropic models (discounted
+    // billing, unmodeled) — 'mock' is not Anthropic-family.
     expect(estimateCost('mock', r.usage)).toBe(estimateCost('mock', { input: 100, output: 20 }));
+  });
+
+  it('bills cacheRead at 0.1x and cacheWrite at 1.25x for Anthropic-family models only', async () => {
+    const { ratesFor } = await import('../providers/model-info.js');
+    const { input: inRate, output: outRate } = ratesFor('claude-3-5-sonnet-20240620');
+    const usage = { input: 1000, output: 500, cacheRead: 1000, cacheWrite: 1000 };
+    const expected = (1000 / 1000) * inRate + (500 / 1000) * outRate + (1000 / 1000) * inRate * 0.1 + (1000 / 1000) * inRate * 1.25;
+    expect(estimateCost('claude-3-5-sonnet-20240620', usage)).toBeCloseTo(expected, 10);
+    // /claude/i matches bare ids too (family fallback path).
+    expect(estimateCost('claude-3-opus-future', usage)).toBeGreaterThan(estimateCost('claude-3-opus-future', { input: 1000, output: 500 }));
+    // Non-Anthropic families keep ignoring cache counters.
+    expect(estimateCost('gpt-4o-mini', usage)).toBe(estimateCost('gpt-4o-mini', { input: 1000, output: 500 }));
+    expect(estimateCost('mock', usage)).toBe(estimateCost('mock', { input: 1000, output: 500 }));
+    // Missing counters behave as zero.
+    expect(estimateCost('claude-3-5-sonnet-20240620', { input: 1000, output: 500 })).toBeCloseTo((1000 / 1000) * inRate + (500 / 1000) * outRate, 10);
   });
 
   it('accepts a legacy string systemPrompt fn (backward compat)', async () => {
@@ -850,5 +866,301 @@ describe('runtime: level-7 telemetry', () => {
     expect(r.status).toBe('complete');
     expect(received?.system).toBe(`legacy prompt cwd=${cwd}`);
     expect(received?.suffix).toBeUndefined();
+  });
+
+  it('fails over to the next adapter on terminal provider error and emits events', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const primary: ProviderAdapter = {
+      id: 'primary',
+      async *stream() {
+        yield { kind: 'message_start' };
+        yield { kind: 'error', code: 'HTTP_500', message: 'boom', retryable: false, status: '500' };
+      },
+    };
+    const fallback: ProviderAdapter = {
+      id: 'fallback',
+      async *stream() {
+        yield { kind: 'message_start' };
+        yield { kind: 'text_delta', text: 'recovered' };
+        yield { kind: 'message_end', finishReason: 'stop' };
+      },
+    };
+    const seen: string[] = [];
+    const r = await run(
+      {
+        task: 'failover me', cwd, model: 'mock', maxSteps: 3, nonInteractive: true,
+        onEvent: (ev) => { seen.push(ev.kind); },
+      },
+      {
+        adapter: primary, failoverAdapters: [fallback], registry: reg, policy,
+        approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt,
+      },
+    );
+    expect(r.status).toBe('complete');
+    expect(r.finalText).toBe('recovered');
+    expect(r.steps).toBe(1);
+    expect(seen).toContain('provider_failover');
+    expect(seen).toContain('status');
+  });
+
+  it('returns no_final when the failover chain is exhausted', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const failing = (id: string): ProviderAdapter => ({
+      id,
+      async *stream() {
+        yield { kind: 'message_start' };
+        yield { kind: 'error', code: 'HTTP_503', message: `${id} down`, retryable: false, status: '503' };
+      },
+    });
+    const seen: Array<{ kind: string }> = [];
+    const r = await run(
+      {
+        task: 'all down', cwd, model: 'mock', maxSteps: 3, nonInteractive: true,
+        onEvent: (ev) => { if (ev.kind === 'provider_failover') seen.push({ kind: `${(ev as { from: string }).from}->${(ev as { to: string }).to}` }); },
+      },
+      {
+        adapter: failing('a'), failoverAdapters: [failing('b')], registry: reg, policy,
+        approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt,
+      },
+    );
+    expect(r.status).toBe('no_final');
+    // One swap (a→b), then the exhausted chain surfaces no_final.
+    expect(seen).toEqual([{ kind: 'a->b' }]);
+  });
+
+  it('caps parallel fan-out at MAX_PARALLEL_TOOLS and preserves commit order', async () => {
+    expect(MAX_PARALLEL_TOOLS).toBe(8);
+    const { z } = await import('zod');
+    const { defineTool } = await import('../tools/types.js');
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const order: string[] = [];
+    const N = 10;
+    const reg = new ToolRegistry();
+    for (let i = 0; i < N; i++) {
+      const name = `cap_probe_${i}`;
+      reg.register(defineTool({
+        name,
+        description: 'fan-out cap probe',
+        inputSchema: z.object({}),
+        permission: 'read' as const,
+        isConcurrencySafe: true,
+        execute: async () => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((r) => setTimeout(r, 20));
+          order.push(name);
+          inFlight--;
+          return { ok: true as const, value: { name } };
+        },
+      }));
+    }
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const step: StreamEvent[] = [{ kind: 'message_start' }];
+    for (let i = 0; i < N; i++) {
+      step.push(
+        { kind: 'tool_call_start', id: `k${i}`, name: `cap_probe_${i}` },
+        { kind: 'tool_call_delta', id: `k${i}`, argsJson: '{}' },
+        { kind: 'tool_call_end', id: `k${i}` },
+      );
+    }
+    step.push({ kind: 'message_end', finishReason: 'tool_calls' });
+    const adapter = scriptedAdapter([
+      step,
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'all ran' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const committed: string[] = [];
+    const r = await run(
+      {
+        task: 'fan out', cwd, model: 'mock', maxSteps: 3, nonInteractive: true,
+        onEvent: (ev) => { if (ev.kind === 'tool_result') committed.push(ev.name); },
+      },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('complete');
+    expect(r.toolCalls).toBe(N);
+    expect(order).toHaveLength(N);
+    // Cap respected: never more than MAX_PARALLEL_TOOLS in flight...
+    expect(maxInFlight).toBeLessThanOrEqual(MAX_PARALLEL_TOOLS);
+    // ...and commits land in original call order.
+    expect(committed).toEqual(Array.from({ length: N }, (_, i) => `cap_probe_${i}`));
+  });
+
+  it('fires one budget_warning per threshold per run', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'pricey' },
+        // gpt-4o-mini: 0.00015/0.0006 per 1k → 10000 in = $0.0015 ≥ maxCost $0.001.
+        { kind: 'message_end', finishReason: 'stop', usage: { input: 10000, output: 0 } },
+      ],
+    ]);
+    const warnings: Array<{ ratio: number; threshold: number }> = [];
+    const r = await run(
+      {
+        task: 'spend', cwd, model: 'gpt-4o-mini', maxSteps: 2, maxCost: 0.001, nonInteractive: true,
+        onEvent: (ev) => { if (ev.kind === 'budget_warning') warnings.push({ ratio: ev.ratio, threshold: ev.threshold }); },
+      },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    // All three thresholds fire exactly once when the ratio jumps past them.
+    expect(warnings.map((w) => w.threshold)).toEqual([0.4, 0.7, 0.9]);
+    for (const w of warnings) expect(w.ratio).toBeGreaterThanOrEqual(w.threshold);
+    expect(r.status).toBe('complete');
+  });
+});
+
+describe('hooks engine + model_override', () => {
+  const nodeOk = `"${process.execPath}" -e "process.exit(0)"`;
+
+  function isolateHome(): () => void {
+    const savedHome = process.env.HOME;
+    const savedProfile = process.env.USERPROFILE;
+    const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-rt-home-'));
+    process.env.HOME = fake;
+    process.env.USERPROFILE = fake;
+    return () => {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = savedProfile;
+      fs.rmSync(fake, { recursive: true, force: true });
+    };
+  }
+
+  function hookCwd(hooks: unknown): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-rt-hooks-'));
+    fs.mkdirSync(path.join(dir, '.klyro'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.klyro', 'hooks.json'), JSON.stringify(hooks), 'utf-8');
+    return dir;
+  }
+
+  async function probeRegistry(executed: { ran: boolean }) {
+    const { z } = await import('zod');
+    const { defineTool } = await import('../tools/types.js');
+    const reg = new ToolRegistry().register(defineTool({
+      name: 'hook_probe',
+      description: 'hooks probe',
+      inputSchema: z.object({}),
+      permission: 'read' as const,
+      execute: async () => {
+        executed.ran = true;
+        return { ok: true as const, value: { ran: true } };
+      },
+    }));
+    return reg;
+  }
+
+  function probeAdapter(): ProviderAdapter {
+    return scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'hook_probe' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'done' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+  }
+
+  it('preToolUse hook exit 0 passes and the tool executes', async () => {
+    const restore = isolateHome();
+    const dir = hookCwd({ hooks: [{ name: 'allow', event: 'preToolUse', command: nodeOk }] });
+    try {
+      const executed = { ran: false };
+      const reg = await probeRegistry(executed);
+      const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+      const r = await run(
+        { task: 'probe', cwd: dir, model: 'mock', maxSteps: 3, nonInteractive: true },
+        { adapter: probeAdapter(), registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+      );
+      expect(r.status).toBe('complete');
+      expect(executed.ran).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      restore();
+    }
+  });
+
+  it('deny hook exit 1 blocks the tool with POLICY_DENIED message', async () => {
+    const restore = isolateHome();
+    const denyCmd = `"${process.execPath}" -e "console.error('blocked-by-test-hook'); process.exit(1)"`;
+    const dir = hookCwd({ hooks: [{ name: 'gate', event: 'preToolUse', command: denyCmd }] });
+    try {
+      const executed = { ran: false };
+      const reg = await probeRegistry(executed);
+      const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+      const r = await run(
+        { task: 'probe', cwd: dir, model: 'mock', maxSteps: 3, nonInteractive: true },
+        { adapter: probeAdapter(), registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+      );
+      expect(r.status).toBe('complete');
+      expect(executed.ran).toBe(false);
+      const toolMsg = r.transcript.find((m) => m.role === 'tool');
+      expect(toolMsg).toBeDefined();
+      const body = JSON.stringify(toolMsg!.content);
+      expect(body).toContain('POLICY_DENIED');
+      expect(body).toContain('gate');
+      expect(body).toContain('blocked-by-test-hook');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      restore();
+    }
+  });
+
+  it('postToolUse hook failure does not fail the turn', async () => {
+    const restore = isolateHome();
+    const failCmd = `"${process.execPath}" -e "process.exit(1)"`;
+    const dir = hookCwd({ hooks: [{ name: 'flaky-post', event: 'postToolUse', command: failCmd }] });
+    try {
+      const executed = { ran: false };
+      const reg = await probeRegistry(executed);
+      const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+      const r = await run(
+        { task: 'probe', cwd: dir, model: 'mock', maxSteps: 3, nonInteractive: true },
+        { adapter: probeAdapter(), registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+      );
+      expect(r.status).toBe('complete');
+      expect(r.finalText).toBe('done');
+      expect(executed.ran).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      restore();
+    }
+  });
+
+  it('emits model_override when parentContext.model is present', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'hi' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const seen: Array<{ requested: string; effective: string }> = [];
+    await run(
+      {
+        task: 'hi', cwd, model: 'mock', maxSteps: 2, nonInteractive: true,
+        parentContext: { sessionId: 's', depth: 0, maxDepth: 1, model: 'other-model' },
+        onEvent: (ev) => { if (ev.kind === 'model_override') seen.push({ requested: ev.requested, effective: ev.effective }); },
+      },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(seen).toEqual([{ requested: 'mock', effective: 'other-model' }]);
   });
 });

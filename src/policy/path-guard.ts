@@ -12,6 +12,8 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
+import type { Stats } from 'node:fs';
 import { TOOL_ERROR_CODES, type ToolErrorCode } from '../tools/normalize.js';
 
 export interface PathGuardResult {
@@ -111,4 +113,52 @@ export async function resolveAndFollowSymlinks(cwd: string, requested: string): 
     }
   }
   return { resolved: real };
+}
+
+/**
+ * Symlink-swap guard: refuse when the FINAL path itself is a symlink.
+ *
+ * File tools resolve symlinks up front, but a racing swap between that
+ * check and the final write/rename could redirect an open-with-O_TRUNC /
+ * O_CREAT (or rename) through a freshly-planted symlink. Calling this
+ * immediately before the final write/rename shrinks that window to ~0:
+ * `lstat` never follows the final component, so a swapped-in link is
+ * caught. (POSIX `rename(2)` onto a symlink replaces the LINK itself, so
+ * the vulnerable op is opening/truncating through the link — which this
+ * denies first.) Supported on POSIX and Windows (both implement lstat).
+ * Missing paths (ENOENT) are fine — a nonexistent path is not a symlink.
+ */
+export async function assertNotSymlink(p: string): Promise<void> {
+  let st: Stats;
+  try {
+    st = await fs.lstat(p);
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+    throw e;
+  }
+  if (st.isSymbolicLink()) {
+    throw new PathGuardError(
+      TOOL_ERROR_CODES.PATH_ESCAPE,
+      `Refusing to write through symlink: ${p}`,
+    );
+  }
+}
+
+/**
+ * Open a file for writing without following a trailing symlink (POSIX).
+ *
+ * Uses O_WRONLY | O_CREAT | O_NOFOLLOW so the open itself fails (ELOOP)
+ * when the final component is a symlink, instead of truncating through
+ * it. On Windows there is no O_NOFOLLOW, so this falls back to a plain
+ * `'w'` open — symlink-swap protection there comes from
+ * `assertNotSymlink` (lstat) immediately before the write/rename instead.
+ */
+export function openNoFollowForWrite(dir: string, file: string): number {
+  const target = path.resolve(dir, file);
+  if (process.platform === 'win32') {
+    // Windows fallback: no O_NOFOLLOW — plain open; see comment above.
+    return fsSync.openSync(target, 'w');
+  }
+  const flags = fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_NOFOLLOW;
+  return fsSync.openSync(target, flags, 0o666);
 }
