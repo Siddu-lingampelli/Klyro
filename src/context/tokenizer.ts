@@ -7,6 +7,14 @@
  * never overflows the model's true window because the heuristic
  * overestimates mixed text.
  *
+ * R3 — accuracy improvement: the heuristic is *calibrated* against the
+ * provider's reported usage when available. The runtime calls
+ * `calibrateEstimate` after each message_end that carries usage, which
+ * adjusts the per-character ratio toward the real value observed for this
+ * model. The calibration is bounded (0.1–0.6 chars/token) so a bad sample
+ * can't make the budget non-conservative. Until the first sample arrives,
+ * the safe chars/4 default is used.
+ *
  * Strategy:
  *   1. Always preserve the system prompt, the latest user task, and the
  *      latest assistant message.
@@ -32,8 +40,34 @@ export interface BudgetCheck {
   cap: number;
 }
 
+/** Calibration ratio: chars per token. Starts at 4.0 (the classic heuristic)
+ *  and self-corrects toward the provider's reported usage. Bounded to
+ *  [MIN_RATIO, MAX_RATIO] = [2.0, 6.0] so a pathological sample (a tool dump
+ *  that tokenizes densely, or a sparse prompt) can't drive the budget into a
+ *  non-conservative regime. Real tokenizers sit around 3.5–4.5 chars/token. */
+const MIN_RATIO = 2.0;
+const MAX_RATIO = 6.0;
+let charsPerToken = 4.0;
+
+/**
+ * Calibrate the heuristic against provider-reported usage. Pass the actual
+ * input token count and the char length of the transcript that was sent.
+ * The ratio self-corrects toward the model's true tokenizer behavior.
+ */
+export function calibrateEstimate(usedChars: number, reportedInputTokens: number): number {
+  if (reportedInputTokens <= 0 || usedChars <= 0) return charsPerToken;
+  const newRatio = usedChars / reportedInputTokens;
+  charsPerToken = Math.max(MIN_RATIO, Math.min(MAX_RATIO, newRatio));
+  return charsPerToken;
+}
+
+/** Current chars/token ratio (after calibration, if any). */
+export function charsPerTokenRatio(): number {
+  return charsPerToken;
+}
+
 export function estimateTokens(s: string): number {
-  return Math.ceil(s.length / 4);
+  return Math.ceil(s.length / charsPerToken);
 }
 
 export function estimateMessage(m: Message): number {
@@ -56,6 +90,22 @@ function estimateBlock(b: ContentBlock): number {
 export function totalTokens(system: string | undefined, messages: Message[]): number {
   let n = system ? estimateTokens(system) : 0;
   for (const m of messages) n += estimateMessage(m);
+  return n;
+}
+
+/** Count the raw character length of a transcript for calibration. */
+export function transcriptCharLength(system: string | undefined, messages: Message[]): number {
+  let n = system ? system.length : 0;
+  for (const m of messages) {
+    for (const b of m.content) {
+      if (b.kind === 'text') n += b.text.length;
+      else if (b.kind === 'tool_use') n += b.name.length + JSON.stringify(b.input).length;
+      else if (b.kind === 'tool_result') {
+        const out = typeof b.output === 'string' ? b.output : JSON.stringify(b.output ?? '');
+        n += out.length + (b.name?.length ?? 0);
+      }
+    }
+  }
   return n;
 }
 

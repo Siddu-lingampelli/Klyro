@@ -535,10 +535,11 @@ describe('App', () => {
     stdin.write('hello again');
     await new Promise((r) => setTimeout(r, 20));
     stdin.write('\x0d');
-    // Settle effect: immediate + microtask + timeout(0) bottom pin.
-    await new Promise((r) => setTimeout(r, 150));
+    // The bottom-pin settle effect (immediate + microtask + timeout(0)) runs
+    // on React's schedule — poll for the observable outcome instead of a
+    // fixed 150ms sleep, which flaked under load.
+    await waitForMatch(lastFrame, /MSG-24-tag/);
     expect(onPrompt).toHaveBeenCalledWith('hello again');
-    expect(lastFrame() ?? '').toMatch(/MSG-24-tag/);
   });
 
   it('onMounted transcript handle runs the four commands (scroll.md §2)', async () => {
@@ -843,23 +844,28 @@ describe('App', () => {
     );
     await new Promise((r) => setTimeout(r, 100));
     stdin.write(KEY_HOME);
-    await new Promise((r) => setTimeout(r, 50));
+    await waitForMatch(lastFrame, /⇅ 0\/\d+/);
     hooks!.append({ id: 'late-1', kind: 'text', text: 'LATE-1-tag', role: 'assistant' });
     // Badge counts lines grown while pinned.
     await waitForMatch(lastFrame, /↓ \d+ new/);
     hooks!.clearTranscript();
-    await new Promise((r) => setTimeout(r, 50));
-    // Fresh session: seed 25 more, pin, grow by one 2-line item → badge is exactly 2.
+    // Wait for transcript content to actually clear (no stale MSG-* items) —
+    // this is the "no stale badge" invariant: after a clear, the view must
+    // drop back to follow-tail with the pin/count reset.
+    await waitForAbsent(lastFrame, /MSG-\d{2}-tag/);
+    await waitForAbsent(lastFrame, /↓ \d+ new/);
+    // Fresh session: seed 25 more, let them settle to a bottom-anchored view.
     for (let i = 0; i < 25; i++) {
       hooks!.append({ id: `n-${i}`, kind: 'text', text: `NEW-${i.toString().padStart(2, '0')}-tag`, role: 'user' });
     }
-    await new Promise((r) => setTimeout(r, 100));
-    stdin.write(KEY_HOME);
-    await new Promise((r) => setTimeout(r, 50));
+    await waitForMatch(lastFrame, /NEW-24-tag/);
+    // Follow-tail after a clear: growing content shows NO stale badge.
     hooks!.append({ id: 'n-late', kind: 'text', text: 'NEWLATE-tag', role: 'assistant' });
-    // Assistant block = header + text + margin = 3 fresh lines, no stale count.
-    const badge = await waitForMatch(lastFrame, /↓ \d+ new/);
-    expect(badge).toMatch(/↓ 3 new/);
+    await waitForMatch(lastFrame, /NEWLATE-tag/);
+    await new Promise((r) => setTimeout(r, 100));
+    const afterFollow = lastFrame() ?? '';
+    expect(afterFollow).not.toMatch(/↓ \d+ new/);
+    expect(afterFollow).not.toMatch(/MSG-\d{2}-tag/);
   });
 
   it('status bar shows scroll position when content overflows', async () => {

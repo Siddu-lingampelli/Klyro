@@ -192,9 +192,11 @@ export interface OrchestratorOpts {
   taskManager?: TaskManager;
   workerSpawner?: WorkerSpawner;
   /**
-   * True when the parent is the interactive TUI. TUI children stay in-process
-   * (V1 limitation — the Ink approval bridge is tied to the parent terminal),
-   * while headless/CLI children run process-isolated. Defaults to false.
+   * True when the parent is the interactive TUI. TUI children run
+   * process-isolated *unless* they may need to surface an approval prompt to
+   * the operator (see childCanIsolate) — the Ink bridge is tied to the parent
+   * terminal, so a prompting child must stay in-process. Headless/CLI children
+   * always isolate. Defaults to false.
    */
   isTui?: boolean;
 }
@@ -307,6 +309,46 @@ export class AgentOrchestrator {
       cancelTask: (taskId) => this.cancelTask(taskId),
       applyTask: (taskId) => this.applyTask(taskId),
     };
+  }
+
+  /**
+   * R2 — decide whether a child may run process-isolated.
+   *
+   * The only thing that forces a child to stay in-process is the possibility
+   * of an interactive approval prompt: the Ink bridge lives in the parent
+   * terminal, so a subprocess could never ask. A child that cannot prompt is
+   * therefore free to isolate.
+   *
+   * A child cannot prompt when any of these hold:
+   *   - it is readonly (no write/execute tools → no `ask` on those),
+   *   - the parent is not a TUI (no bridge to reach in the first place), or
+   *   - the child's toolset contains no tool the policy can put in `ask`.
+   *
+   * Isolation is deliberately conservative here: when in doubt we keep the
+   * child in-process, because a stranded prompt is a hang and a hang is worse
+   * than lost isolation. Public for direct unit testing.
+   */
+  childCanIsolate(
+    resolved: { allowed: ReadonlySet<string>; readonly: boolean },
+    def: AgentDefinition,
+    childOptions: RunOptions,
+  ): boolean {
+    // Headless parents have no approval bridge — isolation is always safe.
+    if (!this.isTui) return true;
+    // Readonly agents never write/execute, so never prompt.
+    if (resolved.readonly) return true;
+    // A child with an inherited bridge (grandchildren possible) must stay
+    // in-process: its own children need the bridge chain.
+    if (childOptions.agentBridge) return false;
+    // Any tool in the child's set that the policy can escalate to `ask`
+    // pins it in-process. `execute` is the class that most commonly prompts
+    // (shell_exec), so its presence is the deciding signal alongside writes.
+    const prompting = new Set(['shell_exec', 'write_file', 'edit_file', 'multi_edit', 'apply_patch', 'run_verify']);
+    for (const t of resolved.allowed) {
+      if (prompting.has(t)) return false;
+    }
+    void def;
+    return true;
   }
 
   /** Compute a child's effective capabilities from the parent's own. */
@@ -508,10 +550,18 @@ export class AgentOrchestrator {
       ...(typeof childModel === 'string' ? { model: childModel } : {}),
     });
 
-    // G2 — process isolation for headless sub-agents. In-process is the
-    // fallback (and mandatory for TUI children — see OrchestratorOpts.isTui),
-    // and opt-out via KLYRO_WORKER=0 for tests/dev.
-    const useProcessIsolation = !this.isTui && process.env.KLYRO_WORKER !== '0';
+    // G2/R2 — process isolation for sub-agents. A child can be spawned as a
+    // real OS process whenever it will never need to surface an interactive
+    // approval prompt to the operator. Every child that might prompt must stay
+    // in-process so the TUI approval bridge (tied to the parent terminal) can
+    // reach the operator. Headless/readonly/DenyAll children — which is the
+    // ordinary case — isolate into a subprocess. The blanket exclusion of ALL
+    // TUI children (V1) is replaced by this capability-aware rule, so a TUI
+    // session with readonly or non-interactive children gets real isolation
+    // too. Explicitly opt out with KLYRO_WORKER=0.
+    // See orchestratorOpts.isTui, capabilities.resolveCapabilities, and
+    // child-worker.buildChildDeps (DenyAll approval).
+    const useProcessIsolation = process.env.KLYRO_WORKER !== '0' && this.childCanIsolate(resolved, def, childOptions);
 
     this.workerSpawner.spawn(async (signal) => {
       // Both the in-process path and the forked child resolve to the same

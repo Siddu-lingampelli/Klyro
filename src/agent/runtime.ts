@@ -30,7 +30,7 @@ import { verify, diagnosticForModel, type VerifyResult } from '../verification/e
 import { detectVerifyCommand } from '../verification/auto.js';
 import { detectVerifiers } from '../verification/registry.js';
 import { ensureBaseline, getBaseline } from '../verification/baseline.js';
-import { compressTranscript, totalTokens } from '../context/tokenizer.js';
+import { compressTranscript, totalTokens, calibrateEstimate, transcriptCharLength } from '../context/tokenizer.js';
 import { ratesFor, isAnthropicModel } from '../providers/model-info.js';
 import { classifyFailure, rerunOnce, gatherRepairContext, guardRepair } from '../verification/classify.js';
 import { findRelatedTests, buildScopedCommand, runScopedVerify, syntaxCheck, checkImports } from '../verification/scoped.js';
@@ -550,6 +550,10 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           if (ev.usage.cacheRead !== undefined) usage.cacheRead = (usage.cacheRead ?? 0) + ev.usage.cacheRead;
           if (ev.usage.cacheWrite !== undefined) usage.cacheWrite = (usage.cacheWrite ?? 0) + ev.usage.cacheWrite;
           telemetry.recordUsage(ev.usage.input, ev.usage.output);
+          // R3 — calibrate the local chars/4 heuristic toward the real
+          // per-character ratio this provider/model reports, so future budget
+          // checks (and overflow recovery) estimate accurately.
+          calibrateEstimate(transcriptCharLength(systemForBudget, reqMessages), ev.usage.input);
           emit?.({
             kind: 'usage', input: usage.input, output: usage.output,
             ...(usage.cacheRead !== undefined ? { cacheRead: usage.cacheRead } : {}),

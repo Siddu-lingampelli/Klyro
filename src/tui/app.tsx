@@ -130,15 +130,24 @@ function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width
       {lines.map((l, i) => (
         <React.Fragment key={i}>
           {i > 0 ? '\n' : null}
-          {l.parts.map((p, j) => (
-            <Text
-              key={j}
-              bold={p.bold || undefined}
-              color={p.bold ? (dim ? undefined : softColor) : p.dim ? dimColor : p.code ? softColor : undefined}
-            >
-              {p.text}
-            </Text>
-          ))}
+          {l.parts.map((p, j) => {
+            // R4: syntax-highlight color wins; otherwise dim for code/comment,
+            // soft for bold, plain otherwise. file:line links surface as a
+            // distinct accent (href is carried for tooling/terminal emit).
+            // Inside dimmed (thinking) blocks the dim tone always wins.
+            let color: string | undefined;
+            if (dim) color = p.dim ? dimColor : undefined;
+            else if (p.color) color = p.color;
+            else if (p.href) color = 'blue';
+            else if (p.dim) color = dimColor;
+            else if (p.code) color = softColor;
+            else if (p.bold) color = softColor;
+            return (
+              <Text key={j} bold={p.bold || undefined} color={color}>
+                {p.text}
+              </Text>
+            );
+          })}
         </React.Fragment>
       ))}
     </Text>

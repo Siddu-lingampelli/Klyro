@@ -15,9 +15,9 @@ import { taskWaitTool } from './task-wait.js';
 import { taskStopTool } from './task-stop.js';
 import { taskApplyTool } from './task-apply.js';
 import type { ToolContext } from '../types.js';
-import { AgentOrchestrator, createSubtaskProgressEmitter, progressNote, type AgentSpawnBridge, type ParentContextRef } from '../../agent/orchestrator.js';
+import { AgentOrchestrator, createSubtaskProgressEmitter, progressNote, type AgentSpawnBridge, type ParentContextRef, type AgentDefinition } from '../../agent/orchestrator.js';
 import { globalBus } from '../../events/bus.js';
-import type { RuntimeDeps } from '../../agent/runtime.js';
+import type { RuntimeDeps, RunOptions } from '../../agent/runtime.js';
 
 const baseCtx: ToolContext = { cwd: process.cwd(), env: {} };
 
@@ -222,6 +222,76 @@ describe('task_wait / task_stop / task_apply tools', () => {
     const r = await taskApplyTool.execute({ taskId: 'task_1' }, { ...baseCtx, agentBridge: bridge });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe('UNSUPPORTED');
+  });
+});
+
+describe('R2 — child process-isolation decision', () => {
+  const stubDeps = (): RuntimeDeps => ({ registry: { list: () => [] } }) as unknown as RuntimeDeps;
+  const opts = (over: Partial<RunOptions> = {}): RunOptions =>
+    ({ task: 't', cwd: process.cwd(), model: 'm', nonInteractive: true, ...over } as RunOptions);
+  const def = (id: string, over: Partial<AgentDefinition> = {}): AgentDefinition =>
+    ({ id, description: id, ...over });
+
+  it('headless parents always isolate', () => {
+    const orch = new AgentOrchestrator({ sessionId: 's', deps: stubDeps() }); // isTui=false
+    expect(
+      orch.childCanIsolate(
+        { allowed: new Set(['shell_exec', 'write_file']), readonly: false },
+        def('implementer'),
+        opts(),
+      ),
+    ).toBe(true);
+  });
+
+  it('TUI readonly children isolate', () => {
+    const orch = new AgentOrchestrator({ sessionId: 's', deps: stubDeps(), isTui: true });
+    expect(
+      orch.childCanIsolate(
+        { allowed: new Set(['read_file', 'grep', 'glob']), readonly: true },
+        def('explorer'),
+        opts(),
+      ),
+    ).toBe(true);
+  });
+
+  it('TUI children with a write/execute tool stay in-process', () => {
+    const orch = new AgentOrchestrator({ sessionId: 's', deps: stubDeps(), isTui: true });
+    expect(
+      orch.childCanIsolate(
+        { allowed: new Set(['read_file', 'write_file']), readonly: false },
+        def('implementer'),
+        opts(),
+      ),
+    ).toBe(false);
+    expect(
+      orch.childCanIsolate(
+        { allowed: new Set(['shell_exec']), readonly: false },
+        def('tester'),
+        opts(),
+      ),
+    ).toBe(false);
+  });
+
+  it('TUI children with a grandchild bridge stay in-process', () => {
+    const orch = new AgentOrchestrator({ sessionId: 's', deps: stubDeps(), isTui: true });
+    expect(
+      orch.childCanIsolate(
+        { allowed: new Set(['read_file']), readonly: false },
+        def('coordinator', { canSpawn: true }),
+        opts({ agentBridge: {} as AgentSpawnBridge }),
+      ),
+    ).toBe(false);
+  });
+
+  it('TUI children with only read-only prompting-free tools isolate', () => {
+    const orch = new AgentOrchestrator({ sessionId: 's', deps: stubDeps(), isTui: true });
+    expect(
+      orch.childCanIsolate(
+        { allowed: new Set(['read_file', 'glob', 'grep', 'search_files']), readonly: false },
+        def('debugger'),
+        opts(),
+      ),
+    ).toBe(true);
   });
 });
 

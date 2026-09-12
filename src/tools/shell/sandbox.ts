@@ -8,8 +8,9 @@
  * Backend strategy (defense-in-depth, cheapest-first):
  *   - `bwrap` (bubblewrap) — rootless, cross-distro, the same primitive Claude
  *     Code's sandbox docs reference. Primary backend when present.
- *   - landlock — kernel LSM, no helper binary needed, but requires a native
- *     syscall helper Node can't invoke directly. Tracked for the next step.
+ *   - landlock — kernel LSM (Linux 5.13+), no namespaces needed. Node can't
+ *     issue the syscalls directly, so we drive it through the `llkr` helper
+ *     (from the ll_start project). Fallback backend when bwrap is absent.
  *
  * Detection is done once at startup and cached. When no backend is present we
  * *degrade cleanly* to `undefined` — an empty sandbox command and a clearly
@@ -20,7 +21,7 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-export type SandboxBackend = 'bwrap' | 'none';
+export type SandboxBackend = 'bwrap' | 'landlock' | 'none';
 
 export interface SandboxStatus {
   backend: SandboxBackend;
@@ -80,11 +81,19 @@ export function detectSandbox(): SandboxStatus {
     return cachedStatus;
   }
 
+  // Landlock: the helper binary (`llkr` from the ll_start project) exposes the
+  // kernel LSM without a subprocess namespace. Requires Linux 5.13+.
+  const llkr = findOnPath('llkr');
+  if (process.platform === 'linux' && llkr && bwrapUsable(llkr)) {
+    cachedStatus = { backend: 'landlock', active: true, reason: `landlock via llkr at ${llkr}` };
+    return cachedStatus;
+  }
+
   cachedStatus = {
     backend: 'none',
     active: false,
     reason:
-      'bwrap not found on $PATH — install bubblewrap (e.g. `apt install bubblewrap`) or run unsandboxed; policy+path guards remain active',
+      'no sandbox backend (bwrap or llkr) on $PATH — install bubblewrap (apt install bubblewrap) or run unsandboxed; policy+path guards remain active',
   };
   return cachedStatus;
 }
@@ -107,6 +116,17 @@ export function sandboxCommand(
 ): { cmd: string; args: string[] } | undefined {
   const status = detectSandbox();
   if (!status.active) return undefined;
+
+  // Landlock backend: the helper confines filesystem access to the read-write
+  // set and then execs the command. Kernel-enforced (LSM), no namespaces.
+  if (status.backend === 'landlock') {
+    const rw = [opts.cwd, ...(opts.readWriteDirs ?? [])];
+    const llArgs: string[] = [];
+    for (const d of rw) llArgs.push('--rw', d);
+    if (!opts.allowNetwork) llArgs.push('--no-net');
+    llArgs.push('--', cmd, ...args);
+    return { cmd: 'llkr', args: llArgs };
+  }
 
   const roDirs = ['/usr', '/bin', '/etc', '/lib', '/lib64', '/opt'];
   const bwrapArgs: string[] = [

@@ -39,6 +39,25 @@ describe('ApprovalModal', () => {
     return { bridge, lastFrame, stdin };
   }
 
+  /** Poll the rendered frame instead of sleeping a fixed interval — Ink
+   *  flushes on React's schedule, so fixed sleeps flake under load. */
+  async function waitForFrame(
+    getFrame: () => string | undefined,
+    re: RegExp,
+    timeout = 4000,
+  ): Promise<string> {
+    const start = Date.now();
+    let frame = '';
+    for (;;) {
+      frame = getFrame() ?? '';
+      if (re.test(frame)) return frame;
+      if (Date.now() - start > timeout) {
+        throw new Error(`timed out waiting for ${re}\nlast frame:\n${frame.slice(0, 2000)}`);
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
   it('renders nothing when no prompt is pending', () => {
     const { lastFrame } = setup();
     expect(lastFrame()).toBe('');
@@ -60,11 +79,13 @@ describe('ApprovalModal', () => {
   });
 
   it('"y" resolves to allow', async () => {
-    const { bridge, stdin } = setup();
+    const { bridge, stdin, lastFrame } = setup();
     const promise = bridge.ask({ toolName: 'x', reason: 'r', summary: 's' });
-    await new Promise((r) => setTimeout(r, 50));
+    // Poll until the modal is actually rendered: the useInput handler reads
+    // `pending` from a closure, so typing before React flushes the pending
+    // state silently drops the key. A blind 50ms sleep is the flake source.
+    await waitForFrame(lastFrame, /approval needed/i);
     stdin.write('y');
-    await new Promise((r) => setTimeout(r, 50));
     await expect(promise).resolves.toBe('allow');
   });
 

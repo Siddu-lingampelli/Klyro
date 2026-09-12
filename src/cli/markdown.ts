@@ -3,6 +3,32 @@
  * Minimal: handles headers, code blocks, lists, tables, width-aware wrap, plain-text for non-TTY.
  */
 
+import { highlightCodeLine } from '../tui/markdown.js';
+
+/** ANSI color code per MdPart color name (R4 shared highlighter). */
+const ANSI: Record<string, string> = {
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  gray: '\x1b[90m',
+};
+const RESET = '\x1b[0m';
+
+function renderHighlightedCode(line: string, lang: string): string {
+  const parts = highlightCodeLine(line, lang);
+  let out = '';
+  for (const p of parts) {
+    let s = p.text;
+    if (p.dim) s = `\x1b[2m${s}\x1b[22m`;
+    if (p.color && ANSI[p.color]) s = `${ANSI[p.color]}${s}${RESET}`;
+    out += s;
+  }
+  return out;
+}
+
 export function renderMarkdown(md: string, opts: { width?: number; isTTY?: boolean } = {}): string {
   const width = opts.width ?? (process.stdout.columns || 80);
   const isTTY = opts.isTTY ?? !!process.stdout.isTTY;
@@ -13,14 +39,16 @@ export function renderMarkdown(md: string, opts: { width?: number; isTTY?: boole
   let out = '';
   const lines = md.split('\n');
   let inCodeBlock = false;
+  let fenceLang = '';
   for (let line of lines) {
     if (line.startsWith('```')) {
+      if (!inCodeBlock) fenceLang = line.replace(/^```/, '').trim().toLowerCase();
       inCodeBlock = !inCodeBlock;
       out += (inCodeBlock ? '┌ code ──\n' : '└──────\n');
       continue;
     }
     if (inCodeBlock) {
-      out += '│ ' + line + '\n';
+      out += '│ ' + renderHighlightedCode(line, fenceLang) + '\n';
       continue;
     }
     if (line.startsWith('# ')) {

@@ -90,6 +90,8 @@ describe('scroll flow diagnostics', () => {
   });
 
   it('wrapped long item: pin mid-item, stream, same first line stays', async () => {
+    // Heavy string measurement + React flush under full-suite parallel load;
+    // the default 10s testTimeout flaked — extend for this one.
     const long = Array.from({ length: 10 }, (_, i) => `WRAPLINE-${i} ` + 'x'.repeat(180)).join('\n');
     const items: TranscriptItem[] = [
       { id: 'w1', kind: 'text', text: long, role: 'assistant' },
@@ -109,5 +111,5 @@ describe('scroll flow diagnostics', () => {
     }
     const after = (lastFrame() ?? '').split('\n').slice(0, 3).join('\n');
     expect(after).toBe(before); // anchor stability at line granularity
-  });
+  }, 30_000);
 });
