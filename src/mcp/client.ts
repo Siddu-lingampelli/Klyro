@@ -2,7 +2,8 @@
  * P1 — MCP stdio client (r-11-17.md §3.1).
  *
  * Minimal JSON-RPC 2.0 over newline-delimited stdio: `initialize`,
- * `tools/list`, `tools/call`, `resources/list`, `resources/read`, `ping`.
+ * `tools/list`, `tools/call`, `resources/list`, `resources/read`,
+ * `prompts/list`, `prompts/get`, `ping`.
  * Every call is bound to an `AbortSignal` and a per-call timeout; spawn
  * failures and server errors surface as typed `McpError`s — never throws
  * raw across the boundary.
@@ -22,6 +23,12 @@ export interface McpResource {
   mimeType?: string;
 }
 
+export interface McpPromptDef {
+  name: string;
+  description?: string;
+  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
+}
+
 export interface McpCallResult {
   /** Normalized text payload (content blocks joined). */
   text: string;
@@ -33,6 +40,8 @@ export interface McpClientLike {
   listTools(signal?: AbortSignal): Promise<McpToolDef[]>;
   callTool(name: string, args: unknown, signal?: AbortSignal): Promise<McpCallResult>;
   listResources(signal?: AbortSignal): Promise<McpResource[]>;
+  promptsList?(signal?: AbortSignal): Promise<McpPromptDef[]>;
+  promptsGet?(name: string, args?: Record<string, string>, signal?: AbortSignal): Promise<string>;
   close(): Promise<void>;
 }
 
@@ -75,15 +84,21 @@ export class McpClient implements McpClientLike {
   constructor(
     readonly name: string,
     private readonly spec: McpServerSpec,
-  ) {}
+  ) {
+    // URL specs route to RemoteMcpClient via makeMcpClient — direct
+    // construction without a command is a programming error, fail fast.
+    if (!spec.command) throw new McpError(`mcp server "${name}" has no command (use url for remote servers)`, 'INVALID_SPEC');
+  }
 
   async connect(): Promise<void> {
     if (this.child) return;
+    const command = this.spec.command;
+    if (!command) throw new McpError(`mcp server "${this.name}" has no command (use url for remote servers)`, 'INVALID_SPEC');
     const timeoutMs = this.spec.policy?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     await new Promise<void>((resolve, reject) => {
       let child: ChildProcess;
       try {
-        child = spawn(this.spec.command, this.spec.args ?? [], {
+        child = spawn(command, this.spec.args ?? [], {
           stdio: ['pipe', 'pipe', 'pipe'],
           env: { ...process.env, ...(this.spec.env ?? {}) },
           shell: false,
@@ -177,6 +192,39 @@ export class McpClient implements McpClientLike {
     };
     const contents = Array.isArray(res.contents) ? res.contents : [];
     return contents.map((c) => (typeof c.text === 'string' ? c.text : JSON.stringify(c))).join('\n');
+  }
+
+  /** List prompts; servers without prompts support yield [] (not an error). */
+  async promptsList(signal?: AbortSignal): Promise<McpPromptDef[]> {
+    this.assertLive();
+    let res: { prompts?: McpPromptDef[] };
+    try {
+      res = (await this.request('prompts/list', {}, this.timeout(), signal)) as { prompts?: McpPromptDef[] };
+    } catch (err) {
+      if (err instanceof McpError && err.code === 'SERVER_ERROR' && (err.details as { code?: number } | undefined)?.code === -32601) {
+        return [];
+      }
+      throw err;
+    }
+    return Array.isArray(res.prompts) ? res.prompts : [];
+  }
+
+  /** Get a prompt's messages as text. Throws McpError when unsupported/unknown. */
+  async promptsGet(name: string, args?: Record<string, string>, signal?: AbortSignal): Promise<string> {
+    this.assertLive();
+    const res = (await this.request('prompts/get', { name, arguments: args ?? {} }, this.timeout(), signal)) as {
+      messages?: Array<{ content?: { type?: string; text?: string } | unknown }>;
+      description?: string;
+    };
+    const messages = Array.isArray(res.messages) ? res.messages : [];
+    const parts: string[] = [];
+    if (typeof res.description === 'string' && res.description) parts.push(res.description);
+    for (const m of messages) {
+      const c = (m as { content?: { text?: string } }).content;
+      if (c && typeof c.text === 'string') parts.push(c.text);
+      else if (c !== undefined) parts.push(JSON.stringify(c));
+    }
+    return parts.join('\n\n');
   }
 
   async close(): Promise<void> {

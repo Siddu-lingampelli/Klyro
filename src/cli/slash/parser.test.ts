@@ -179,6 +179,19 @@ describe('slash command parser', () => {
     expect(parse('/diff')).toEqual({ kind: 'diff' });
   });
 
+  it('parses /rewind variants and /checkpoints', () => {
+    expect(parse('/rewind')).toEqual({ kind: 'rewind', n: 1 });
+    expect(parse('/rewind 3')).toEqual({ kind: 'rewind', n: 3 });
+    expect(parse('/rewind 2 summary')).toEqual({ kind: 'rewind', n: 2, summary: true });
+    expect(parse('/rewind 0')).toEqual({ kind: 'rewind', n: 1 });
+    expect(parse('/checkpoints').kind).toBe('checkpoints');
+  });
+
+  it('parses /memory show vs append', () => {
+    expect(parse('/memory')).toEqual({ kind: 'memory' });
+    expect(parse('/memory append ship it Friday')).toEqual({ kind: 'memory-append', text: 'ship it Friday' });
+  });
+
   it('parses /status', () => {
     expect(parse('/status')).toEqual({ kind: 'status' });
   });

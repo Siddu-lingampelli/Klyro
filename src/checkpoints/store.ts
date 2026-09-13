@@ -139,6 +139,32 @@ export async function listCheckpoints(cwd: string): Promise<string[]> {
   } catch { return []; }
 }
 
+export interface CheckpointInfo {
+  /** 1-based index from the latest (1 = newest, like `undo(n)`). */
+  index: number;
+  id: string;
+  ts: number;
+  files: number;
+}
+
+/** Numbered snapshot list for `/checkpoints` and the `/rewind` menu. */
+export async function listCheckpointInfo(cwd: string): Promise<CheckpointInfo[]> {
+  const ids = await listCheckpoints(cwd);
+  const out: CheckpointInfo[] = [];
+  for (let i = ids.length - 1; i >= 0; i--) {
+    const id = ids[i]!;
+    let ts = 0;
+    let files = 0;
+    try {
+      const meta = JSON.parse(await fs.readFile(path.join(ckptDir(cwd), id, '.meta.json'), 'utf-8')) as { ts?: number; files?: string[] };
+      if (typeof meta.ts === 'number') ts = meta.ts;
+      if (Array.isArray(meta.files)) files = meta.files.length;
+    } catch { /* best-effort */ }
+    out.push({ index: ids.length - i, id, ts, files });
+  }
+  return out;
+}
+
 export async function diff(cwd: string, id?: string): Promise<string> {
   const ckpts = await listCheckpoints(cwd);
   const target = id ?? ckpts[ckpts.length - 1];

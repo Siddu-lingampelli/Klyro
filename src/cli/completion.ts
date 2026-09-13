@@ -3,12 +3,12 @@
  * Generates shell completion scripts for bash/zsh/fish/powershell.
  */
 
-const COMMANDS = ['tui', 'run', 'chat', 'config', 'doctor', 'completion', 'update', 'eval', 'session', 'resume', 'help', 'version', 'scan', 'project', 'mcp', 'hooks', 'agents', 'commit', 'audit', 'benchmark', 'sessions', 'login', 'logout'];
+const COMMANDS = ['tui', 'run', 'chat', 'config', 'doctor', 'init', 'completion', 'update', 'eval', 'session', 'resume', 'help', 'version', 'scan', 'project', 'mcp', 'hooks', 'agents', 'commit', 'audit', 'benchmark', 'sessions', 'login', 'logout'];
 
 /** Second-level completion: global flags + per-command flags. */
 const GLOBAL_FLAGS = ['--cwd', '--config', '--debug', '--verbose', '--quiet', '--json', '--yes', '--no-color', '--print', '--output-format', '--no-stream', '--show-thinking', '--tui', '--chat', '--continue', '--resume', '--help', '--version'];
 const COMMAND_FLAGS: Record<string, string[]> = {
-  run: ['-m', '--model', '--max-steps', '--max-tokens', '--temperature', '--timeout', '--base-url', '--api-key', '--output', '--provider', '--dry-run', '--resume', '--resume-session', '--verify', '--verify-command', '--verify-mode', '--max-repairs', '--persist', '--require-verify', '--agent', '--max-depth'],
+  run: ['-m', '--model', '--max-steps', '--max-tokens', '--temperature', '--timeout', '--base-url', '--api-key', '--output', '--provider', '--dry-run', '--resume', '--resume-session', '--verify', '--verify-command', '--verify-mode', '--max-repairs', '--persist', '--require-verify', '--agent', '--max-depth', '--bare'],
   chat: ['-s', '--system', '-m', '--model', '-t', '--timeout'],
   eval: ['--output', '--suite', '--filter', '--runs', '--parallel', '--model'],
   tui: ['-m', '--model', '--max-steps'],

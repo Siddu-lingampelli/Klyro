@@ -30,6 +30,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { McpClient, McpError, type McpClientLike, type McpToolDef } from './client.js';
+import { RemoteMcpClient } from './remote.js';
 import { loadMcpServers, type McpServerSpec } from './config.js';
 import { evaluateMcpPolicy } from './policy.js';
 import { jsonSchemaToZod } from './schema.js';
@@ -167,12 +168,22 @@ async function executeMcpTool(
   }
 }
 
+/**
+ * Construct the right client for a spec: remote HTTP when `url` is set,
+ * else stdio. Used by registration, probe, and prompt runs.
+ */
+export function makeMcpClient(name: string, spec: McpServerSpec): McpClientLike {
+  if (spec.url) return new RemoteMcpClient(name, spec);
+  if (!spec.command) throw new McpError(`mcp server "${name}" has neither command nor url`, 'INVALID_SPEC');
+  return new McpClient(name, spec);
+}
+
 export async function registerMcpServers(
   cfg: { servers: Record<string, McpServerSpec> },
   opts: RegisterMcpOpts,
 ): Promise<McpRegisterResult> {
   const { registry, policy } = opts;
-  const factory = opts.clientFactory ?? ((name: string, spec: McpServerSpec) => new McpClient(name, spec));
+  const factory = opts.clientFactory ?? makeMcpClient;
   const registered: string[] = [];
   const errors: { server: string; message: string }[] = [];
   const skipped: { name: string; reason: string }[] = [];
@@ -280,8 +291,7 @@ export async function registerMcpServers(
   };
 }
 
-export async function loadAndRegisterMcp(opts: {
-  cwd: string;
+export async function loadAndRegisterMcp(opts: {  cwd: string;
   registry: ToolRegistry;
   policy?: PolicyEngine;
   clientFactory?: (name: string, spec: McpServerSpec) => McpClientLike;
@@ -333,5 +343,34 @@ export async function loadAndRegisterMcp(opts: {
       skipped: [],
       closeAll: async () => {},
     };
+  }
+}
+
+/**
+ * Run one MCP prompt (`/mcp__<server>__<prompt>`) on demand: fresh stdio
+ * connection per invocation (no client lifecycle to manage), redacted
+ * output. Typing the prompt name is explicit consent, so project servers
+ * connect without the registration-time approval gate. Throws McpError /
+ * Error on unknown server, disabled server, or prompt failure.
+ */
+export async function runMcpPrompt(
+  cwd: string,
+  server: string,
+  prompt: string,
+  args: Record<string, string>,
+): Promise<string> {
+  const cfg = loadMcpServers(cwd);
+  const spec = cfg.servers[server];
+  if (!spec) throw new Error(`mcp server not found: ${server}`);
+  if (spec.disabled) throw new Error(`mcp server disabled: ${server}`);
+  const client = makeMcpClient(server, spec);
+  if (!client.promptsGet) throw new Error(`mcp server "${server}" does not support prompts`);
+  try {
+    const withConnect = client as Partial<{ connect: () => Promise<void> }>;
+    if (typeof withConnect.connect === 'function') await withConnect.connect();
+    const text = await client.promptsGet(prompt, args);
+    return redact(text).slice(0, 8000);
+  } finally {
+    await client.close().catch(() => undefined);
   }
 }

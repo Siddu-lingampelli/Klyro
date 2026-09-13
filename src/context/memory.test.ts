@@ -32,6 +32,19 @@ describe('memoryWrite', () => {
     expect(loaded).toContain('b'.repeat(10));
   });
 
+  it('rotates the dropped head to a dated archive instead of losing it', async () => {
+    await memoryWrite(cwd, 'FIRST-' + 'a'.repeat(3000));
+    await memoryWrite(cwd, 'b'.repeat(3000));
+    const dir = path.join(cwd, '.klyro', 'memory');
+    const entries = await fs.readdir(dir);
+    const archives = entries.filter((e) => e.startsWith('archive-'));
+    expect(archives.length).toBeGreaterThanOrEqual(1);
+    const archived = await fs.readFile(path.join(dir, archives[0]!), 'utf-8');
+    expect(archived).toContain('FIRST-');
+    // Live notes still capped.
+    expect((await loadMemory(cwd)).length).toBeLessThanOrEqual(MEMORY_STEADY_STATE_CHARS);
+  });
+
   it('write is atomic (no tmp files left behind)', async () => {
     await memoryWrite(cwd, 'hello');
     const entries = await fs.readdir(path.join(cwd, '.klyro', 'memory'));

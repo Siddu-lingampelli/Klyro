@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { loadHooks, runHook } from './hooks.js';
+import { loadHooks, runHook, hooksForEvent } from './hooks.js';
 
 // Isolate HOME so the global ~/.klyro/hooks.json never leaks into tests.
 let savedHome: string | undefined;
@@ -106,5 +106,48 @@ describe('runHook', () => {
     expect(r.ok).toBe(false);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain('nope-from-hook');
+  });
+
+  it('delivers the stdin JSON contract to the child', async () => {
+    const echo = `"${process.execPath}" -e "let b=''; process.stdin.on('data', (c) => { b += c; }).on('end', () => { const p = JSON.parse(b); console.log(p.event + ':' + p.tool); });"`;
+    const r = await runHook(
+      { name: 'echo', event: 'preToolUse', command: echo },
+      { toolName: 'write_file', input: {} },
+      { event: 'preToolUse', tool: 'write_file', input: {} },
+    );
+    expect(r.ok).toBe(true);
+    expect(r.stdout).toContain('preToolUse:write_file');
+  });
+});
+
+describe('hooksForEvent (v2 matchers)', () => {
+  const hooks = [
+    { name: 'all-pre', event: 'preToolUse' as const, command: 'x' },
+    { name: 'edit-only', event: 'preToolUse' as const, command: 'x', matcher: 'edit|write' },
+    { name: 'on-stop', event: 'stop' as const, command: 'x' },
+  ];
+  it('unmatched hooks run for every tool; matched filter per tool', () => {
+    expect(hooksForEvent(hooks, 'preToolUse', 'read_file').map((h) => h.name)).toEqual(['all-pre']);
+    expect(hooksForEvent(hooks, 'preToolUse', 'edit_file').map((h) => h.name).sort()).toEqual(['all-pre', 'edit-only']);
+  });
+  it('lifecycle events always match; invalid regex never matches', () => {
+    expect(hooksForEvent(hooks, 'stop').map((h) => h.name)).toEqual(['on-stop']);
+    const bad = [{ name: 'bad', event: 'preToolUse' as const, command: 'x', matcher: '([' }];
+    expect(hooksForEvent(bad, 'preToolUse', 'read_file')).toEqual([]);
+  });
+  it('loads v2 hooks.json with matcher + lifecycle events', () => {
+    const dir = mkCwd({
+      '.klyro/hooks.json': JSON.stringify({ hooks: [
+        { name: 'scoped', event: 'preToolUse', command: 'x', matcher: 'shell_exec' },
+        { name: 'bye', event: 'sessionEnd', command: 'y' },
+      ] }),
+    });
+    try {
+      const loaded = loadHooks(dir);
+      expect(loaded).toHaveLength(2);
+      expect(loaded[0]).toMatchObject({ matcher: 'shell_exec' });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

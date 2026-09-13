@@ -32,6 +32,7 @@ import { detectVerifiers } from '../verification/registry.js';
 import { ensureBaseline, getBaseline } from '../verification/baseline.js';
 import { compressTranscript, totalTokens, calibrateEstimate, transcriptCharLength } from '../context/tokenizer.js';
 import { capForModel } from '../context/accounting.js';
+import { shouldRemind, reminderForTodos } from '../context/memory.js';
 import { ratesFor, isAnthropicModel } from '../providers/model-info.js';
 import { classifyFailure, rerunOnce, gatherRepairContext, guardRepair } from '../verification/classify.js';
 import { findRelatedTests, buildScopedCommand, runScopedVerify, syntaxCheck, checkImports } from '../verification/scoped.js';
@@ -39,7 +40,7 @@ import { EventBus, globalBus } from '../events/bus.js';
 import type { KlyroEvent } from '../events/catalog.js';
 import { TraceWriter } from '../trace/writer.js';
 import { killAllJobs } from '../tools/shell/background.js';
-import { loadHooks, runHook, type Hook } from '../cli/hooks.js';
+import { loadHooks, runHook, hooksForEvent, type Hook } from '../cli/hooks.js';
 
 /**
  * Verification mode. The canonical definition lives in verification/engine.ts
@@ -108,6 +109,11 @@ export interface RunOptions {
   temperature?: number;
   signal?: AbortSignal;
   nonInteractive: boolean;
+  /**
+   * Bare mode: skip all hooks (load + sessionStart/stop). The caller is
+   * responsible for skipping MCP/persistence/context (see runOnce `bare`).
+   */
+  bare?: boolean;
   /**
    * Optional pre-existing transcript to seed the conversation. When set,
    * the runtime skips the initial `[{role:'user', content:[text(task)]}]`
@@ -314,6 +320,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     }
   };
   let steps = 0;
+  let lastRemindTurn = 0;
   let toolCallCount = 0;
   let finalText = '';
   let repairs = 0;
@@ -354,15 +361,20 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   }
 
   // Hooks engine: loaded once per run. Zero-cost fast path — when no hooks
-  // file exists, both lists are empty and every hook call site is skipped.
+  // file exists, the list is empty and every hook call site is skipped.
+  // --bare skips hooks entirely (deterministic runs).
+  // Tool-event hooks are matched per tool at the call sites below
+  // (hooksForEvent over runHooks); lifecycle events run at their own points.
   let runHooks: Hook[] = [];
-  try {
-    runHooks = loadHooks(opts.cwd);
-  } catch {
-    runHooks = [];
+  if (!opts.bare) {
+    try {
+      runHooks = loadHooks(opts.cwd);
+    } catch {
+      runHooks = [];
+    }
   }
-  const preHooks = runHooks.filter((h) => h.event === 'preToolUse');
-  const postHooks = runHooks.filter((h) => h.event === 'postToolUse');
+  // Tool-event hooks are matched per tool at the call sites below
+  // (hooksForEvent over runHooks); lifecycle events run at their own points.
 
   // L15 failover chain: the active adapter starts as deps.adapter; each
   // terminal provider error consumes one fallback. Bounded — never loops.
@@ -442,6 +454,24 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     void checkpoint(transcript[transcript.length - 1]);
   }
 
+  // sessionStart: prerequisite gate. A non-zero exit aborts the run before
+  // step 1 with status 'blocked' (e.g. missing toolchain, dirty tree).
+  {
+    const starters = hooksForEvent(runHooks, 'sessionStart');
+    for (const hook of starters) {
+      let r: Awaited<ReturnType<typeof runHook>> | null = null;
+      try {
+        r = await runHook(hook, { toolName: '', input: {} }, { event: 'sessionStart', sessionId, cwd: opts.cwd, task: opts.task });
+      } catch { r = null; }
+      if (r && !r.ok) {
+        const reason = (r.stderr || r.stdout || 'sessionStart hook failed').slice(0, 500);
+        emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'session_blocked', message: reason });
+        await closeTracer();
+        return { status: 'blocked', steps, toolCalls: toolCallCount, finalText: `Blocked by sessionStart hook ${hook.name}: ${reason}`, transcript, hasEdits, usage, repairs, phase: 'blocked' };
+      }
+    }
+  }
+
   // 5.2 — stuck detection state
   const callHistory: string[] = [];
   const fileEditCounts = new Map<string, number>();
@@ -475,6 +505,32 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined, phase: 'blocked' };
     }
     steps++;
+    // 8.4 — stale-todo reminder: every 20 turns, re-inject pending plan
+    // items from `.klyro/plans/todos.json` (written by todo_write) so a
+    // long run cannot silently drop its checklist. Best-effort + tiny.
+    if (shouldRemind(steps, lastRemindTurn)) {
+      lastRemindTurn = steps;
+      try {
+        const { readFileSync } = await import('node:fs');
+        const { join } = await import('node:path');
+        const rawTodos = JSON.parse(readFileSync(join(opts.cwd, '.klyro', 'plans', 'todos.json'), 'utf-8')) as Array<{ title?: unknown; status?: unknown }>;
+        if (Array.isArray(rawTodos)) {
+          const planSteps: PlanStep[] = rawTodos
+            .filter((t) => typeof t.title === 'string')
+            .map((t, i) => ({
+              id: `todo-${i}`,
+              title: t.title as string,
+              status: (['pending', 'in_progress', 'done', 'failed', 'skipped'] as const).includes(t.status as PlanStep['status']) ? (t.status as PlanStep['status']) : 'pending',
+            }));
+          const reminder = reminderForTodos(planSteps);
+          if (reminder) {
+            const note: Message = { role: 'user', content: [text(`[system note] ${reminder}`)] };
+            transcript.push(note);
+            await checkpoint(note);
+          }
+        }
+      } catch { /* no todos file — nothing to remind */ }
+    }
     // 5.1 phase transitions (model-narrated)
     if (steps === 1) setPhase('understanding');
     else if (steps === 2) setPhase('exploring');
@@ -984,43 +1040,53 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     // results immediately — gate runs in call order so these stay ordered.
     // Returns true when the call is approved for execution.
     const gateCall = async (call: typeof finalizedCalls[number]): Promise<boolean> => {
-      const decision = await deps.policy.evaluate(
-        { name: call.name, input: call.input, permission: deps.registry.get(call.name)?.permission },
-        { cwd: opts.cwd, nonInteractive: opts.nonInteractive },
-      );
-      emit?.({ kind: 'policy_decision', id: call.id, name: call.name, action: decision.action, ...(decision.action !== 'allow' ? { reason: (decision as { reason?: string }).reason } : {}) });
-      // Mirror to KlyroEvent bus
-      if (decision.action === 'allow') {
-        emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: 'allow' });
-      } else {
-        emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: decision.action, reason: (decision as { reason?: string }).reason });
-      }
+      // Edit-and-retry loop: an `e`dit choice re-validates + re-evaluates
+      // policy on the edited input (bounded to 3 rounds so a user can't be
+      // re-prompted forever). `call.input` is updated in place so the
+      // executed + checkpointed call reflects what was approved.
+      let effectiveInput = call.input;
+      for (let round = 0; round < 3; round++) {
+        const decision = await deps.policy.evaluate(
+          { name: call.name, input: effectiveInput, permission: deps.registry.get(call.name)?.permission },
+          { cwd: opts.cwd, nonInteractive: opts.nonInteractive },
+        );
+        emit?.({ kind: 'policy_decision', id: call.id, name: call.name, action: decision.action, ...(decision.action !== 'allow' ? { reason: (decision as { reason?: string }).reason } : {}) });
+        // Mirror to KlyroEvent bus
+        if (decision.action === 'allow') {
+          emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: 'allow' });
+        } else {
+          emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: decision.action, reason: (decision as { reason?: string }).reason });
+        }
 
-      if (decision.action === 'deny') {
-        const denyMsg: Message = {
-          role: 'tool',
-          content: [
-            mkToolResult(call.id, call.name, { error: 'POLICY_DENIED', reason: decision.reason }, true),
-          ],
-        };
-        transcript.push(denyMsg);
-        await checkpoint(denyMsg, { toolCallId: call.id, toolName: call.name, input: call.input, output: { error: 'POLICY_DENIED', reason: decision.reason }, isError: true });
-        emitKlyro({ type: 'tool.result', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, output: { error: 'POLICY_DENIED' }, isError: true, latencyMs: 0 });
-        telemetry.recordToolError(call, 'policy_denied');
-        emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: decision.reason }, isError: true, latencyMs: 0 });
-        return false;
-      }
+        if (decision.action === 'deny') {
+          const denyMsg: Message = {
+            role: 'tool',
+            content: [
+              mkToolResult(call.id, call.name, { error: 'POLICY_DENIED', reason: decision.reason }, true),
+            ],
+          };
+          transcript.push(denyMsg);
+          await checkpoint(denyMsg, { toolCallId: call.id, toolName: call.name, input: effectiveInput, output: { error: 'POLICY_DENIED', reason: decision.reason }, isError: true });
+          emitKlyro({ type: 'tool.result', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, output: { error: 'POLICY_DENIED' }, isError: true, latencyMs: 0 });
+          telemetry.recordToolError(call, 'policy_denied');
+          emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: decision.reason }, isError: true, latencyMs: 0 });
+          return false;
+        }
 
-      if (decision.action === 'ask') {
+        if (decision.action === 'allow') {
+          call.input = effectiveInput;
+          return true;
+        }
+
+        // decision.action === 'ask'
         emitKlyro({ type: 'permission.ask', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, reason: decision.reason });
         const choice = await deps.approval.ask({
           toolName: call.name,
           reason: decision.reason,
-          summary: summarizeToolCall(call),
-          input: call.input,
-          pattern: patternForCall(call.name, call.input),
+          summary: summarizeToolCall({ ...call, input: effectiveInput }),
+          input: effectiveInput,
+          pattern: patternForCall(call.name, effectiveInput),
         });
-        // Approval UI in TUI handles y/a/A/n/e/? — e edits input, ? explains
         if (choice === 'deny') {
           const denyMsg2: Message = {
             role: 'tool',
@@ -1029,15 +1095,49 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             ],
           };
           transcript.push(denyMsg2);
-          await checkpoint(denyMsg2, { toolCallId: call.id, toolName: call.name, input: call.input, output: { error: 'POLICY_DENIED', reason: 'user denied' }, isError: true });
+          await checkpoint(denyMsg2, { toolCallId: call.id, toolName: call.name, input: effectiveInput, output: { error: 'POLICY_DENIED', reason: 'user denied' }, isError: true });
           telemetry.recordToolError(call, 'user_denied');
           emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: 'user denied' }, isError: true, latencyMs: 0 });
           return false;
         }
-        // Handle 'edit' choice: for now treat as allow with edited input (future: re-prompt)
+        if (typeof choice === 'object' && choice.kind === 'edit') {
+          // Re-validate the edited input against the tool schema before it
+          // goes anywhere — a malformed edit denies instead of executing.
+          const tool = deps.registry.get(call.name);
+          const parsed = tool?.inputSchema.safeParse(choice.editedInput);
+          if (!parsed || !parsed.success) {
+            const denyMsg3: Message = {
+              role: 'tool',
+              content: [
+                mkToolResult(call.id, call.name, { error: 'POLICY_DENIED', reason: 'edited input failed tool schema validation' }, true),
+              ],
+            };
+            transcript.push(denyMsg3);
+            await checkpoint(denyMsg3, { toolCallId: call.id, toolName: call.name, input: effectiveInput, output: { error: 'POLICY_DENIED', reason: 'edited input invalid' }, isError: true });
+            telemetry.recordToolError(call, 'edit_invalid');
+            emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: 'edited input invalid' }, isError: true, latencyMs: 0 });
+            return false;
+          }
+          effectiveInput = parsed.data as Record<string, unknown>;
+          continue; // re-evaluate policy on the edited input
+        }
+        // allow / always / always-persist — approved with (possibly edited) input.
         repairs++;
+        call.input = effectiveInput;
+        return true;
       }
-      return true;
+      // Edit rounds exhausted without approval — deny rather than loop forever.
+      const denyMsg4: Message = {
+        role: 'tool',
+        content: [
+          mkToolResult(call.id, call.name, { error: 'POLICY_DENIED', reason: 'approval rounds exhausted' }, true),
+        ],
+      };
+      transcript.push(denyMsg4);
+      await checkpoint(denyMsg4, { toolCallId: call.id, toolName: call.name, input: effectiveInput, output: { error: 'POLICY_DENIED', reason: 'approval rounds exhausted' }, isError: true });
+      telemetry.recordToolError(call, 'approval_exhausted');
+      emit?.({ kind: 'tool_result', id: call.id, name: call.name, output: { error: 'POLICY_DENIED', reason: 'approval rounds exhausted' }, isError: true, latencyMs: 0 });
+      return false;
     };
 
     // Execute phase: run the tool with no transcript writes, so concurrent
@@ -1048,14 +1148,16 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     ): Promise<{ obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number }> => {
       const t0 = Date.now();
       emitKlyro({ type: 'tool.call', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, input: call.input });
-      // Hooks: every preToolUse hook runs before execution. A non-zero exit
-      // denies the tool with POLICY_DENIED — the real tool never runs.
-      if (preHooks.length > 0) {
-        for (const hook of preHooks) {
+      // Hooks: matching preToolUse hooks run before execution. A non-zero
+      // exit denies the tool with POLICY_DENIED — the real tool never runs.
+      // Matchers scope hooks per tool; stdin carries the structured payload.
+      const matchingPre = hooksForEvent(runHooks, 'preToolUse', call.name);
+      if (matchingPre.length > 0) {
+        for (const hook of matchingPre) {
           let exitCode: number | null = -1;
           let detail = '';
           try {
-            const r = await runHook(hook, { toolName: call.name, input: call.input });
+            const r = await runHook(hook, { toolName: call.name, input: call.input }, { event: 'preToolUse', tool: call.name, input: call.input, sessionId, cwd: opts.cwd });
             exitCode = r.exitCode;
             detail = (r.stderr || r.stdout || '').slice(0, 300);
           } catch (err) {
@@ -1158,12 +1260,13 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       if (last3.length === 3 && last3[0] === last3[1] && last3[1] === last3[2]) {
         await markStuck(`identical call ×3: ${sig}`);
       }
-      // Hooks: postToolUse hooks are best-effort — failures warn on stderr
-      // plus a bus event, and never fail the turn.
-      if (postHooks.length > 0) {
-        for (const hook of postHooks) {
+      // Hooks: matching postToolUse hooks are best-effort — failures warn
+      // on stderr plus a bus event, and never fail the turn.
+      const matchingPost = hooksForEvent(runHooks, 'postToolUse', call.name);
+      if (matchingPost.length > 0) {
+        for (const hook of matchingPost) {
           try {
-            const r = await runHook(hook, { toolName: call.name, input: call.input });
+            const r = await runHook(hook, { toolName: call.name, input: call.input }, { event: 'postToolUse', tool: call.name, input: call.input, sessionId, cwd: opts.cwd });
             if (!r.ok || r.exitCode !== 0) {
               const msg = `klyro: hooks: postToolUse ${hook.name} failed (exit ${String(r.exitCode)}): ${(r.stderr || r.stdout || '').slice(0, 200)}\n`;
               try { process.stderr.write(msg); } catch { /* ignore */ }
@@ -1239,6 +1342,16 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         await checkpoint(msg);
       }
     } catch { /* ignore — completions are best-effort visibility */ }
+    // stop hooks: run once per completed step (blocking, side effects only —
+    // output is logged, never injected into the transcript).
+    for (const hook of hooksForEvent(runHooks, 'stop')) {
+      try {
+        const r = await runHook(hook, { toolName: '', input: {} }, { event: 'stop', sessionId, cwd: opts.cwd, step: steps, status: 'open' });
+        if (!r.ok) {
+          try { process.stderr.write(`klyro: hooks: stop ${hook.name} failed (exit ${String(r.exitCode)})\n`); } catch { /* ignore */ }
+        }
+      } catch { /* ignore — stop hooks never fail the turn */ }
+    }
     emit?.({ kind: 'step_end', step: steps });
     emitKlyro({ type: 'turn.end', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', turn: steps });
     // Level 9 — checkpoint status after each step

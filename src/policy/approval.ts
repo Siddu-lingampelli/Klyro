@@ -17,7 +17,14 @@ export type ApprovalChoice =
   /** Yes, and auto-allow this pattern for the rest of the session. */
   | 'always'
   /** Yes, session-allow AND persist the pattern to settings (survives restarts). */
-  | 'always-persist';
+  | 'always-persist'
+  /**
+   * Yes, but with edited input. Produced by the TUI modal (`e`): the
+   * runtime re-validates + re-evaluates policy on `editedInput` (bounded
+   * re-prompt loop) instead of running the original call. The stdin prompt
+   * has no editor — `e` there stays `deny`.
+   */
+  | { kind: 'edit'; editedInput: Record<string, unknown> };
 
 export interface ApprovalRequest {
   toolName: string;
@@ -57,6 +64,10 @@ export function sanitizeForPrompt(s: string): string {
  * so stdin stays consistent): lowercase `a` = session-only, UPPERCASE `A` =
  * persist to settings. Case MUST be checked before lowercasing — the old TUI
  * code lowercased first, so `A` silently became session-only `always`.
+ *
+ * NOTE: `e` maps to `deny` here, but the TUI modal intercepts `e` BEFORE
+ * this mapper to open inline edit mode (edit-and-retry). Only callers
+ * without an editor (stdin prompt) should rely on the `e`→`deny` mapping.
  */
 export function approvalChoiceForKey(inputStr: string): ApprovalChoice | 'expand' | 'explain' | null {
   if (inputStr === 'A') return 'always-persist';
@@ -118,6 +129,9 @@ export class PatternApprovalCache implements ApprovalPrompt {
     const key = req.pattern ?? patternFromRequest(req);
     if (key && this.session.has(key)) return 'allow';
     const choice = await this.inner.ask(req);
+    // Edited input is a new call, not an approval of the pattern — pass
+    // through without caching so the re-evaluated call prompts on its own.
+    if (typeof choice === 'object') return choice;
     if ((choice === 'always' || choice === 'always-persist') && key) {
       this.session.add(key);
     }

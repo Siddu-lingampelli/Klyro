@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { snapshot, listCheckpoints, undo } from './store.js';
+import { snapshot, listCheckpoints, listCheckpointInfo, undo } from './store.js';
 
 describe('checkpoints', () => {
   let tmp: string;
@@ -18,6 +18,20 @@ describe('checkpoints', () => {
     expect((await listCheckpoints(tmp)).length).toBe(2);
     await undo(tmp, 1);
     expect(await fs.readFile(p, 'utf-8')).toBe('v2');
+  });
+
+  it('listCheckpointInfo numbers newest-first with file counts', async () => {
+    const p = path.join(tmp, 'a.txt');
+    await fs.writeFile(p, 'v1', 'utf-8');
+    await snapshot(tmp, ['a.txt']);
+    await fs.writeFile(p, 'v2', 'utf-8');
+    await snapshot(tmp, ['a.txt']);
+    const infos = await listCheckpointInfo(tmp);
+    expect(infos).toHaveLength(2);
+    expect(infos[0]!.index).toBe(1);
+    expect(infos[1]!.index).toBe(2);
+    expect(infos[0]!.files).toBe(1);
+    expect(typeof infos[0]!.ts).toBe('number');
   });
 
   it('undo restores deletions (missing-file tracking)', async () => {

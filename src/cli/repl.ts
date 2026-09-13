@@ -308,6 +308,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   let isMounted = false;
   // Live vim input mode for the TUI (toggled by /vim, persisted to config).
   let vimLive: 'insert' | 'normal' = 'insert';
+  // Custom-command recursion guard (a command body may invoke /commands).
+  const customDepthRef: { current: number } = { current: 0 };
   let directHooks:
     | {
         append: (i: import('../tui/transcript.js').TranscriptItem) => void;
@@ -815,6 +817,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     let activeCallId: string | null = null;
     let activeCallName: string | null = null;
     let activeCallArgs = '';
+    let runEndStatus = 'error';
     try {
       const result = await run(
         {
@@ -930,6 +933,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         },
       );
       if (result.finalText) lastAssistantText = result.finalText;
+      runEndStatus = result.status;
       if (result.verification) {
         const v = result.verification;
         queuedAppend({
@@ -965,6 +969,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       queuedAppend({ id: `err-${Date.now()}`, kind: 'error', message });
       queuedStatus({ status: 'error', errorMessage: message });
     }
+    // sessionEnd hooks: best-effort end-of-run side effects. Never throws.
+    try {
+      const { runSessionEndHooks } = await import('./hooks.js');
+      await runSessionEndHooks(cwd, sessionId, runEndStatus);
+    } catch { /* ignore */ }
   }
 
   async function handleSlash(cmd: SlashCommand): Promise<void> {
@@ -1043,6 +1052,21 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         });
         return;
       }
+      case 'memory-append': {
+        // Human write path: same redaction + atomicity as memory_write.
+        if (!cmd.text) {
+          queuedAppend({ id: `mem-${Date.now()}`, kind: 'text', text: 'usage: /memory append <text>', role: 'assistant' });
+          return;
+        }
+        try {
+          const { memoryWrite } = await import('../context/memory.js');
+          const p = await memoryWrite(cwd, cmd.text);
+          queuedAppend({ id: `mem-${Date.now()}`, kind: 'text', text: `Noted → ${p}`, role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `mem-err-${Date.now()}`, kind: 'error', message: `memory append failed: ${err instanceof Error ? err.message : String(err)}` });
+        }
+        return;
+      }
       case 'jobs': {
         const { listJobs } = await import('../tools/shell/background.js');
         const jobs = listJobs();
@@ -1095,8 +1119,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       case 'undo': {
         try {
           const { undo } = await import('../checkpoints/store.js');
-          await undo(cwd);
-          queuedAppend({ id: `undo-${Date.now()}`, kind: 'text', text: 'Undone last checkpoint', role: 'assistant' });
+          await undo(cwd, cmd.n ?? 1);
+          queuedAppend({ id: `undo-${Date.now()}`, kind: 'text', text: `Undone ${cmd.n ?? 1} checkpoint(s)`, role: 'assistant' });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           queuedAppend({ id: `undo-err-${Date.now()}`, kind: 'error', message: `undo failed: ${msg}` });
@@ -1104,13 +1128,66 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'rewind': {
+        // Numbered rewind menu: bare /rewind lists snapshots (1 = latest),
+        // /rewind <n> restores, /rewind <n> summary also reports reverted files.
+        const { listCheckpointInfo, undo } = await import('../checkpoints/store.js');
+        const infos = await listCheckpointInfo(cwd);
+        if (infos.length === 0) {
+          queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text: 'No checkpoints yet — snapshots are taken after each file mutation.', role: 'assistant' });
+          return;
+        }
+        const n = cmd.n ?? 1;
+        if (cmd.n === undefined && !cmd.summary) {
+          const rows = infos.slice(0, 10).map((c) => {
+            const age = c.ts > 0 ? ` (${Math.max(1, Math.round((Date.now() - c.ts) / 60000))}m ago)` : '';
+            return `  ${c.index}. ${c.id.slice(0, 12)} · ${c.files} file(s)${age}`;
+          });
+          queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text: `Checkpoints (1 = latest):\n${rows.join('\n')}\nrun /rewind <n> to restore, /rewind <n> summary for a revert report`, role: 'assistant' });
+          return;
+        }
+        if (n < 1 || n > infos.length) {
+          queuedAppend({ id: `rewind-err-${Date.now()}`, kind: 'error', message: `rewind failed: only ${infos.length} checkpoint(s), got n=${n}` });
+          return;
+        }
         try {
-          const { rewind } = await import('../checkpoints/store.js');
-          await rewind(cwd);
-          queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text: 'Rewound to last checkpoint', role: 'assistant' });
+          // Capture the pre-restore dirty state so `summary` can report it.
+          let before = '';
+          if (cmd.summary) {
+            try {
+              const { execFileSync } = await import('node:child_process');
+              before = execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf-8', timeout: 5000 }) as string;
+            } catch { before = ''; }
+          }
+          await undo(cwd, n);
+          const target = infos[n - 1]!;
+          let text = `Rewound to checkpoint ${n} (${target.id.slice(0, 12)}, ${target.files} file(s))`;
+          if (cmd.summary) {
+            const files = before.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 20);
+            text += files.length > 0 ? `\nReverted working-tree changes:\n${files.map((f) => `  ${f}`).join('\n')}` : '\nWorking tree was clean before restore.';
+          }
+          queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text, role: 'assistant' });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           queuedAppend({ id: `rewind-err-${Date.now()}`, kind: 'error', message: `rewind failed: ${msg}` });
+        }
+        return;
+      }
+      case 'checkpoints': {
+        try {
+          const { listCheckpointInfo } = await import('../checkpoints/store.js');
+          const infos = await listCheckpointInfo(cwd);
+          if (infos.length === 0) {
+            queuedAppend({ id: `ckpt-${Date.now()}`, kind: 'text', text: 'No checkpoints yet.', role: 'assistant' });
+          } else {
+            const rows = infos.slice(0, 15).map((c) => {
+              const age = c.ts > 0 ? ` (${Math.max(1, Math.round((Date.now() - c.ts) / 60000))}m ago)` : '';
+              return `  ${c.index}. ${c.id.slice(0, 12)} · ${c.files} file(s)${age}`;
+            });
+            queuedAppend({ id: `ckpt-${Date.now()}`, kind: 'text', text: `Checkpoints (1 = latest):\n${rows.join('\n')}`, role: 'assistant' });
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          queuedAppend({ id: `ckpt-err-${Date.now()}`, kind: 'error', message: `checkpoints failed: ${msg}` });
         }
         return;
       }
@@ -1275,24 +1352,17 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'init': {
-        const { writeFileSync, existsSync } = await import('node:fs');
-        const { join } = await import('node:path');
-        const target = join(cwd, 'KLYRO.md');
-        if (existsSync(target)) {
-          queuedAppend({ id: `init-${Date.now()}`, kind: 'text', text: `KLYRO.md already exists at ${target}`, role: 'assistant' });
-        } else {
-          try {
-            const { runScan } = await import('./scan.js');
-            let out = '';
-            const orig = process.stdout.write.bind(process.stdout);
-            (process.stdout as unknown as { write: (s: string) => boolean }).write = ((c: string) => { out += String(c); return true; }) as typeof process.stdout.write;
-            await runScan({ cwd, json: false });
-            (process.stdout as unknown as { write: typeof orig }).write = orig;
-            writeFileSync(target, `# KLYRO.md\n\nProject: ${cwd}\n\n## Stack\n\n${out.slice(0, 2000)}\n\n## Conventions\n\n- Prefer smallest change that solves the task.\n- Run verification after edits.\n`);
-            queuedAppend({ id: `init2-${Date.now()}`, kind: 'text', text: `created ${target}`, role: 'assistant' });
-          } catch (err) {
-            queuedAppend({ id: `init-err-${Date.now()}`, kind: 'error', message: `init failed: ${err instanceof Error ? err.message : String(err)}` });
-          }
+        try {
+          const { initProject, nextStepsText } = await import('./init.js');
+          const { created, skipped } = await initProject(cwd);
+          const lines = [
+            ...created.map((f) => `created ${f}`),
+            ...skipped.map((f) => `kept ${f}`),
+            nextStepsText(),
+          ];
+          queuedAppend({ id: `init-${Date.now()}`, kind: 'text', text: lines.join('\n'), role: 'assistant' });
+        } catch (err) {
+          queuedAppend({ id: `init-err-${Date.now()}`, kind: 'error', message: `init failed: ${err instanceof Error ? err.message : String(err)}` });
         }
         return;
       }
@@ -2364,7 +2434,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           try { await runConfig(['set', 'klyro.vim', next]); } finally { (process.stdout as unknown as { write: typeof orig }).write = orig; }
         } catch { /* persist best-effort */ }
         if (isMounted && directHooks) directHooks.setVimMode(next);
-        queuedAppend({ id: `vim-${Date.now()}`, kind: 'text', text: `vim mode: ${next}${next === 'normal' ? ' (h/l move · i/a insert · x delete · 0/$ ends · j/k scroll)' : ''}`, role: 'assistant' });
+        queuedAppend({ id: `vim-${Date.now()}`, kind: 'text', text: `vim mode: ${next}${next === 'normal' ? ' (h/l/0/$ move · 3h counts · w/b words · x/D/dd delete · i/a insert · j/k scroll)' : ''}`, role: 'assistant' });
         return;
       }
       case 'theme':
@@ -2585,6 +2655,47 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           const extra = m[2] ? ` ${m[2]}` : '';
           await handleSlash(parse(target + extra));
           return;
+        }
+        // Custom command files: .klyro/commands/*.md (project wins).
+        // Body expands $1..$9/$@ and runs as a prompt (recursion-guarded).
+        if (m) {
+          const { loadCustomCommands, expandArgs } = await import('./slash/custom.js');
+          const custom = loadCustomCommands(cwd).find((c) => c.name === m[1]!.toLowerCase());
+          if (custom) {
+            const depth = (customDepthRef.current ?? 0) + 1;
+            if (depth > 3) {
+              queuedAppend({ id: `cust-${Date.now()}`, kind: 'error', message: `custom command recursion limit: /${custom.name}` });
+              return;
+            }
+            const argList = m[2] ? m[2].split(/\s+/) : [];
+            const expanded = expandArgs(custom.body, argList);
+            customDepthRef.current = depth;
+            try {
+              if (expanded.trimStart().startsWith('/')) await handleSlash(parse(expanded));
+              else await runWithBridge(expanded);
+            } finally {
+              customDepthRef.current = depth - 1;
+            }
+            return;
+          }
+        }
+        // MCP prompt-commands: /mcp__<server>__<prompt> [args...]
+        if (m) {
+          const pm = /^mcp__([A-Za-z0-9_-]{1,20})__([A-Za-z0-9_-]+)$/.exec(m[1]!.toLowerCase());
+          if (pm) {
+            const { runMcpPrompt } = await import('../mcp/registry.js');
+            const argList = m[2] ? m[2].split(/\s+/) : [];
+            const args: Record<string, string> = {};
+            argList.forEach((a, i) => { args[`arg${i + 1}`] = a; });
+            args['input'] = m[2] ?? '';
+            try {
+              const text = await runMcpPrompt(cwd, pm[1]!, pm[2]!, args);
+              await runWithBridge(text);
+            } catch (err) {
+              queuedAppend({ id: `mcp-p-${Date.now()}`, kind: 'error', message: `mcp prompt failed: ${err instanceof Error ? err.message : String(err)}` });
+            }
+            return;
+          }
         }
         queuedAppend({
           id: `unk-${Date.now()}`,

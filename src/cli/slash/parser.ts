@@ -25,8 +25,9 @@ export type SlashCommand =
   | { kind: 'effort'; level: string }
   | { kind: 'fast'; state: string }
   | { kind: 'diff' }
-  | { kind: 'undo' }
-  | { kind: 'rewind' }
+  | { kind: 'undo'; n?: number }
+  | { kind: 'rewind'; n?: number; summary?: boolean }
+  | { kind: 'checkpoints' }
   | { kind: 'plan'; task?: string }
   | { kind: 'todos' }
   | { kind: 'status' }
@@ -40,6 +41,7 @@ export type SlashCommand =
   | { kind: 'cost' }
   | { kind: 'thinking' }
   | { kind: 'memory' }
+  | { kind: 'memory-append'; text: string }
   | { kind: 'jobs' }
   | { kind: 'verify' }
   | { kind: 'project' }
@@ -136,7 +138,7 @@ export type SlashCommand =
   | { kind: 'prompt'; text: string }
   | { kind: 'unknown'; raw: string };
 
-const KNOWN = ['help', 'clear', 'new', 'exit', 'quit', 'q', 'compact', 'resume', 'sessions', 'rename', 'fork', 'branch', 'export', 'copy', 'model', 'm', 'models', 'provider', 'p', 'effort', 'e', 'fast', 'init', 'status', 'context', 'diff', 'plan', 'todos', 'memory', 'permissions', 'mode', 'sandbox', 'approve', 'deny', 'login', 'logout', 'auth', 'version', 'update', 'cancel', 'shell', 'mention', 'tools', 'config', 'settings', 'doctor', 'cost', 'thinking', 'jobs', 'verify', 'project', 'undo', 'rewind', 'review', 'code-review', 'security-review', 'simplify', 'test', 'lint', 'build', 'run', 'fix', 'explain', 'format', 'ask', 'redo', 'checkpoint', 'accept', 'reject', 'details', 'verbose', 'raw', 'activity', 'tasks', 'ps', 'stop', 'queue', 'retry', 'kill', 'mcp', 'agents', 'agent', 'subagents', 'subtask', 'background', 'add-dir', 'cd', 'attach', 'drop', 'image', 'paste', 'files', 'ls', 'tree', 'search', 'web', 'read', 'map', 'tokens', 'commit', 'push', 'pull', 'pr', 'issue', 'editor', 'keymap', 'vim', 'theme', 'statusline', 'output-style', 'debug', 'whoami', 'reload', 'reset', 'bug', 'changelog', 'prompt', 'alias', 'commands', 'env', 'deps', 'install'] as const;
+const KNOWN = ['help', 'clear', 'new', 'exit', 'quit', 'q', 'compact', 'resume', 'sessions', 'rename', 'fork', 'branch', 'export', 'copy', 'model', 'm', 'models', 'provider', 'p', 'effort', 'e', 'fast', 'init', 'status', 'context', 'diff', 'plan', 'todos', 'memory', 'permissions', 'mode', 'sandbox', 'approve', 'deny', 'login', 'logout', 'auth', 'version', 'update', 'cancel', 'shell', 'mention', 'tools', 'config', 'settings', 'doctor', 'cost', 'thinking', 'jobs', 'verify', 'project', 'undo', 'rewind', 'checkpoints', 'review', 'code-review', 'security-review', 'simplify', 'test', 'lint', 'build', 'run', 'fix', 'explain', 'format', 'ask', 'redo', 'checkpoint', 'accept', 'reject', 'details', 'verbose', 'raw', 'activity', 'tasks', 'ps', 'stop', 'queue', 'retry', 'kill', 'mcp', 'agents', 'agent', 'subagents', 'subtask', 'background', 'add-dir', 'cd', 'attach', 'drop', 'image', 'paste', 'files', 'ls', 'tree', 'search', 'web', 'read', 'map', 'tokens', 'commit', 'push', 'pull', 'pr', 'issue', 'editor', 'keymap', 'vim', 'theme', 'statusline', 'output-style', 'debug', 'whoami', 'reload', 'reset', 'bug', 'changelog', 'prompt', 'alias', 'commands', 'env', 'deps', 'install'] as const;
 
 export function parse(input: string): SlashCommand {
   const trimmed = input.trim();
@@ -158,14 +160,34 @@ export function parse(input: string): SlashCommand {
     case 'new':     return { kind: 'new' };
     case 'compact': return { kind: 'compact', focus: rest || undefined };
     case 'diff':    return { kind: 'diff' };
-    case 'undo':    return { kind: 'undo' };
-    case 'rewind':  return { kind: 'rewind' };
+    case 'undo': {
+      const un = Number(rest.split(/\s+/).filter(Boolean)[0] ?? '1');
+      return { kind: 'undo', n: Number.isInteger(un) && un > 0 ? un : 1 };
+    }
+    case 'rewind': {
+      // /rewind [n] [summary] — nth-back snapshot (1 = latest), optional
+      // post-restore summary of the reverted changes.
+      const parts = rest.split(/\s+/).filter(Boolean);
+      const n = parts.length > 0 ? Number(parts[0]) : 1;
+      return {
+        kind: 'rewind',
+        n: Number.isInteger(n) && (n as number) > 0 ? (n as number) : 1,
+        ...(parts.slice(1).join(' ').toLowerCase() === 'summary' ? { summary: true as const } : {}),
+      };
+    }
+    case 'checkpoints': return { kind: 'checkpoints' };
     case 'plan':    return { kind: 'plan', task: rest || undefined };
     case 'todos':   return { kind: 'todos' };
     case 'status':  return { kind: 'status' };
     case 'cost':    return { kind: 'cost' };
     case 'thinking': return { kind: 'thinking' };
-    case 'memory':  return { kind: 'memory' };
+    case 'memory': {
+      // /memory shows notes; /memory append <text> writes one (human path,
+      // same redaction + atomicity as the memory_write tool).
+      const mm = /^append\s+([\s\S]+)$/.exec(rest);
+      if (mm) return { kind: 'memory-append', text: mm[1]!.trim() };
+      return { kind: 'memory' };
+    }
     case 'jobs':    return { kind: 'jobs' };
     case 'verify':  return { kind: 'verify' };
     case 'project': return { kind: 'project' };
@@ -360,9 +382,9 @@ export const COMMAND_DEFS: CommandDef[] = [
   { name: 'explain', hint: 'explain code' },
   { name: 'format', hint: 'format code' },
   { name: 'ask', hint: 'read-only Q&A' },
-  { name: 'undo', hint: 'undo change' },
-  { name: 'redo', hint: 'redo change' },
+  { name: 'undo', hint: 'undo change' },  { name: 'redo', hint: 'redo change' },
   { name: 'rewind', hint: 'rewind code' },
+  { name: 'checkpoints', hint: 'list snapshots' },
   { name: 'checkpoint', hint: 'create checkpoint' },
   { name: 'accept', hint: 'accept edits' },
   { name: 'reject', hint: 'reject edits' },
@@ -448,10 +470,11 @@ export function fuzzyScore(name: string, query: string): number {
 }
 
 /** Fuzzy-match command names for TUI autocomplete — top `limit` (default 6). */
-export function suggestCommands(prefix: string, limit = 6): CommandDef[] {
+export function suggestCommands(prefix: string, limit = 6, extra: CommandDef[] = []): CommandDef[] {
   const p = prefix.toLowerCase().replace(/^\//, '');
-  if (!p) return COMMAND_DEFS.slice(0, limit);
-  return COMMAND_DEFS.map((d) => ({ d, s: fuzzyScore(d.name, p) + fuzzyScore(d.hint, p) * 0.25 }))
+  const pool = extra.length > 0 ? [...extra, ...COMMAND_DEFS] : COMMAND_DEFS;
+  if (!p) return pool.slice(0, limit);
+  return pool.map((d) => ({ d, s: fuzzyScore(d.name, p) + fuzzyScore(d.hint, p) * 0.25 }))
     .filter((x) => x.s > -Infinity)
     .sort((a, b) => b.s - a.s)
     .slice(0, limit)

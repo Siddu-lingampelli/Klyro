@@ -43,6 +43,11 @@ export interface ScriptedTask {
   expectStatus: 'complete' | 'max_steps' | 'aborted' | 'verify_failed' | 'no_final';
   /** Expected tool-call count. */
   expectToolCalls?: number;
+  /**
+   * Semantic rubric graded by a model judge (see judge.ts). Only runs when
+   * the caller supplies a judge adapter; otherwise recorded as skipped.
+   */
+  judge?: { rubric: string[] };
 }
 
 export interface TaskResult {
@@ -52,6 +57,7 @@ export interface TaskResult {
   observedStatus?: string;
   observedToolCalls?: number;
   durationMs: number;
+  judge?: { pass: boolean; notes: string; skipped: boolean };
 }
 
 function scriptedAdapter(script: StreamEvent[][]): ProviderAdapter {
@@ -67,7 +73,10 @@ function scriptedAdapter(script: StreamEvent[][]): ProviderAdapter {
   };
 }
 
-export async function runTask(t: ScriptedTask): Promise<TaskResult> {
+export async function runTask(
+  t: ScriptedTask,
+  opts: { judgeAdapter?: ProviderAdapter; judgeModel?: string } = {},
+): Promise<TaskResult> {
   const start = Date.now();
   const cwd = path.join(os.tmpdir(), 'klyro-eval-' + t.id + '-' + Math.random().toString(36).slice(2));
   await fs.mkdir(cwd, { recursive: true });
@@ -105,6 +114,33 @@ export async function runTask(t: ScriptedTask): Promise<TaskResult> {
       details += ` verifyFailure=${verifyFailure};`;
     }
 
+    // Model-graded semantic check (opt-in: needs a live judge adapter).
+    let judge: TaskResult['judge'];
+    if (t.judge && t.judge.rubric.length > 0) {
+      if (opts.judgeAdapter) {
+        const { runJudge } = await import('./judge.js');
+        const texts = result.transcript
+          .filter((m) => m.role === 'assistant')
+          .flatMap((m) => m.content)
+          .filter((b): b is { kind: 'text'; text: string } => (b as { kind?: string }).kind === 'text')
+          .map((b) => b.text)
+          .join('\n');
+        const v = await runJudge(opts.judgeAdapter, opts.judgeModel ?? 'mock-judge', {
+          task: t.task,
+          finalText: result.finalText,
+          toolCalls: result.toolCalls,
+          extra: `assistant transcript:\n${texts.slice(0, 3000)}`,
+        }, t.judge.rubric);
+        judge = { pass: v.pass, notes: v.notes, skipped: v.skipped };
+        if (!v.pass) {
+          details += ` judge=fail (${v.notes || 'rubric unmet'});`;
+          pass = false;
+        }
+      } else {
+        judge = { pass: true, notes: 'no judge adapter — skipped', skipped: true };
+      }
+    }
+
     return {
       id: t.id,
       status: pass ? 'pass' : 'fail',
@@ -112,6 +148,7 @@ export async function runTask(t: ScriptedTask): Promise<TaskResult> {
       observedStatus,
       observedToolCalls: result.toolCalls,
       durationMs: Date.now() - start,
+      ...(judge ? { judge } : {}),
     };
   } finally {
     try { await fs.rm(cwd, { recursive: true, force: true }); } catch {}
@@ -127,10 +164,13 @@ export interface HarnessSummary {
   durationMs: number;
 }
 
-export async function runHarness(tasks: ScriptedTask[]): Promise<HarnessSummary> {
+export async function runHarness(
+  tasks: ScriptedTask[],
+  opts: { judgeAdapter?: ProviderAdapter; judgeModel?: string } = {},
+): Promise<HarnessSummary> {
   const start = Date.now();
   const results: TaskResult[] = [];
-  for (const t of tasks) results.push(await runTask(t));
+  for (const t of tasks) results.push(await runTask(t, opts));
   const passed = results.filter((r) => r.status === 'pass').length;
   return {
     total: results.length,

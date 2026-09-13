@@ -25,6 +25,7 @@ import { DenyAllApprovalPrompt } from '../policy/approval.js';
 import { redact } from '../policy/secret-redactor.js';
 import { buildLevel6Context } from '../context/level6.js';
 import { memoryBlock } from '../context/memory.js';
+import { estimateCost } from '../providers/model-info.js';
 import { getDefaultSessionStore, resolveSessionId } from '../persistence/session.js';
 import * as fs from 'node:fs';
 
@@ -84,6 +85,12 @@ export interface RunCliOptions {
   persist?: boolean;
   sessionId?: string;
   sessionsDir?: string;
+  /**
+   * Bare mode (`--bare`): skip MCP servers, all hooks, memory/KLYRO.md/L6
+   * context, and session persistence for fast deterministic runs. The model
+   * gets the base system prompt + tools only.
+   */
+  bare?: boolean;
   /** P1.4 — run the task under a named child-capable orchestrator context. */
   agent?: string;
   maxDepth?: number;
@@ -124,7 +131,8 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
 
   // P1.4 — validate --agent early so typos fail fast (exit 2) even without API keys.
   if (opts.agent) {
-    const { BUILTIN_AGENTS: _known } = await import('../agent/orchestrator.js');
+    const { listAllAgents } = await import('../agent/orchestrator.js');
+    const _known = listAllAgents(opts.cwd);
     if (!_known.some((a) => a.id === opts.agent)) {
       stderr.write(`klyro: unknown agent: ${opts.agent} (known: ${_known.map((a) => a.id).join(', ')})\n`);
       return 2;
@@ -208,7 +216,9 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   // approve). Project-sourced servers auto-connect ONLY when their exact
   // spec hash is already in the McpTrust store (e.g. approved in a prior
   // REPL session); unknown specs are skipped with a warning.
+  // --bare skips MCP entirely (deterministic, no subprocesses).
   let closeMcp: (() => Promise<void>) | undefined;
+  if (!opts.bare) {
   try {
     const { loadAndRegisterMcp } = await import('../mcp/registry.js');
     const { McpTrust, hashSpec } = await import('../mcp/trust.js');
@@ -232,10 +242,11 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     }
     closeMcp = mcp.closeAll;
   } catch { /* ignore — MCP is optional */ }
-  const systemPrompt = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt);
+  }
+  const systemPrompt = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt, opts.bare);
 
-  // Level 9 — session setup (create or resume)
-  const persistEnabled = opts.persist !== false;
+  // Level 9 — session setup (create or resume). --bare skips persistence.
+  const persistEnabled = opts.persist !== false && !opts.bare;
   let store: import('../persistence/store.js').SessionStore | undefined;
   let sessionId: string | undefined;
   let initialTranscript: Message[] | undefined;
@@ -319,17 +330,18 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       };
 
   let result: Awaited<ReturnType<typeof run>>;
+  let endStatus = 'error';
   // P1.4 — if --agent is requested, stand up a parent orchestrator so the
   // model can call spawn_agent / task_list / task_get. The root run keeps
   // depth 0; children are capped at maxDepth (default 1 per r-6-10.fix.md).
   let agentBridge: import('../agent/orchestrator.js').AgentSpawnBridge | undefined;
   let parentContext: import('../agent/runtime.js').RunOptions['parentContext'];
   if (opts.agent) {
-    const { AgentOrchestrator, BUILTIN_AGENTS } = await import('../agent/orchestrator.js');
-    const def = BUILTIN_AGENTS.find((a) => a.id === opts.agent)!; // validated above
+    const { AgentOrchestrator, findAgent } = await import('../agent/orchestrator.js');
+    const def = findAgent(opts.agent, opts.cwd)!; // validated above
     const maxDepth = opts.maxDepth ?? 1;
     const rootDeps = { adapter, registry, policy, approval: new DenyAllApprovalPrompt(), systemPrompt };
-    const orchestrator = new AgentOrchestrator({ sessionId: sessionId ?? 'ephemeral', deps: rootDeps });
+    const orchestrator = new AgentOrchestrator({ sessionId: sessionId ?? 'ephemeral', deps: rootDeps, cwd: opts.cwd });
     const allowedTools = new Set(registry.list().map((t) => t.name));
     parentContext = {
       sessionId: sessionId ?? 'ephemeral',
@@ -367,6 +379,7 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       task: opts.task,
       cwd: opts.cwd,
       model: opts.model,
+      ...(opts.bare ? { bare: true as const } : {}),
       maxSteps: opts.maxSteps,
       maxTokens: opts.maxTokens,
       temperature: opts.temperature,
@@ -422,9 +435,21 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
         ...(failoverAdapters ? { failoverAdapters } : {}),
       },
     );
+    endStatus = result.status;
   } finally {
     doneSigint();
     try { await closeMcp?.(); } catch { /* ignore */ }
+    // sessionEnd hooks: best-effort end-of-run side effects (logging,
+    // notifications, cleanup). Skipped in --bare. Never affects exit code.
+    if (!opts.bare) {
+    try {
+      const { runSessionEndHooks } = await import('./hooks.js');
+      const outs = await runSessionEndHooks(opts.cwd, sessionId, endStatus);
+      for (const o of outs) {
+        if (output !== 'silent' && o.output) stderr.write(`[hook ${o.name}] ${o.output.slice(0, 300)}\n`);
+      }
+    } catch { /* ignore */ }
+    }
   }
 
   if (store && sessionId) {
@@ -452,57 +477,75 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   // Final cost line: headless runs previously surfaced cost only through
   // [budget] warnings. Human/silent → stderr one-liner; json → additive
   // cost_usd/usage fields on the final object (purely additive, no shape break).
-  {
-    const { estimateCost } = await import('../providers/model-info.js');
-    const cost = estimateCost(opts.model, result.usage.input, result.usage.output);
-    const costLine = `$${cost.toFixed(4)} · ${result.usage.input} in / ${result.usage.output} out${result.usage.estimated ? ' (estimated)' : ''}`;
-    if (output === 'json') {
-      stdout.write(JSON.stringify({ kind: 'cost', cost_usd: cost, usage: result.usage }) + '\n');
-    } else {
-      stderr.write(`klyro: cost ${costLine}\n`);
-    }
+  const finalCost = estimateCost(opts.model, result.usage.input, result.usage.output);
+  const costLine = `$${finalCost.toFixed(4)} · ${result.usage.input} in / ${result.usage.output} out${result.usage.estimated ? ' (estimated)' : ''}`;
+  if (output === 'json') {
+    stdout.write(JSON.stringify({ kind: 'cost', cost_usd: finalCost, usage: result.usage }) + '\n');
+  } else {
+    stderr.write(`klyro: cost ${costLine}\n`);
   }
+  // Stable result envelope (machine contract): exactly one `kind:result`
+  // line per run in json mode, after all legacy per-status lines. Parsers
+  // should read the LAST line; legacy `kind:final` lines are kept for compat.
+  const emitEnvelope = (exitCode: number, extra: Record<string, unknown> = {}): number => {
+    if (output === 'json') {
+      stdout.write(JSON.stringify({
+        kind: 'result',
+        status: result.status,
+        exit_code: exitCode,
+        text: result.finalText,
+        steps: result.steps,
+        toolCalls: result.toolCalls,
+        cost_usd: finalCost,
+        usage: result.usage,
+        ...(result.verification ? { verification: result.verification } : {}),
+        ...(sessionId ? { session_id: sessionId } : {}),
+        ...extra,
+      }) + '\n');
+    }
+    return exitCode;
+  };
   if (result.status === 'max_steps') {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: result.status, steps: result.steps }) + '\n');
     else stderr.write(`klyro: hit max steps (${result.steps}); consider raising --max-steps\n`);
-    return 7;
+    return emitEnvelope(7);
   }
   if (result.status === 'limit') {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: result.status, steps: result.steps, text: result.finalText }) + '\n');
     else stderr.write(`klyro: stopped early: ${result.finalText || result.status} (after ${result.steps} steps)\n`);
-    return 7;
+    return emitEnvelope(7);
   }
   if (result.status === 'stuck') {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: result.status, steps: result.steps }) + '\n');
     else stderr.write(`klyro: stuck — repeated the same action with no progress; aborting after ${result.steps} steps\n`);
-    return 7;
+    return emitEnvelope(7);
   }
   if (result.status === 'aborted') {
-    return 130;
+    return emitEnvelope(130);
   }
   if (result.status === 'no_final') {
     if (output !== 'json') stderr.write('klyro: provider error — no final answer\n');
-    return 5;
+    return emitEnvelope(5);
   }
   if (result.status === 'verify_failed') {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'verify_failed', failureType: result.verification?.failureType }) + '\n');
     else stderr.write(`klyro: verification failed after ${result.verification?.attempts ?? 3} repairs — see output above\n`);
-    return 8;
+    return emitEnvelope(8);
   }
   // 6.5 — --require-verify: if edits were made but verification never passed, exit 8
   if (opts.requireVerify && result.verification && !result.verification.ok) {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'require_verify_failed' }) + '\n');
     else stderr.write('klyro: --require-verify: verification required but not passed\n');
-    return 8;
+    return emitEnvelope(8);
   }
   if (opts.requireVerify && !result.verification && result.hasEdits) {
     // Edits were made but no verification command found
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'require_verify_missing' }) + '\n');
     else stderr.write('klyro: --require-verify: no verification command found and edits were made\n');
-    return 8;
+    return emitEnvelope(8);
   }
   if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: 'ok', text: result.finalText }) + '\n');
-  return 0;
+  return emitEnvelope(0);
 }
 
 interface DryRunReport {
@@ -560,7 +603,10 @@ function defaultRunSystemPrompt(_ctx: { cwd: string; telemetry?: string }): { sy
 export async function makeRunSystemPrompt(
   cwd: string,
   base: SystemPromptFn,
+  bare = false,
 ): Promise<SystemPromptFn> {
+  // --bare: base prompt only — no L6 scan, memory, or KLYRO.md (fast + deterministic).
+  if (bare) return base;
   const ctxBlock = await buildLevel6Context({ cwd });
   const prefix = ctxBlock.formatted ? `\n\n<context>\n${ctxBlock.formatted}\n</context>` : '';
   // Session memory: .klyro/memory/session-notes.md injected so memory_write

@@ -11,6 +11,7 @@ import type { TranscriptItem, ToolResultPatch } from './transcript.js';
 import { TuiApprovalBridge, ApprovalModal } from './approval.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash, suggestCommands } from '../cli/slash/parser.js';
+import { loadCustomCommands, listCompletableFiles } from '../cli/slash/custom.js';
 import { tokens, g } from './tokens.js';
 import {
   initialScroll,
@@ -325,8 +326,14 @@ export function App(props: AppProps): React.JSX.Element {
   // is an explicit index (null = end); rendering clamps it.
   const [vimMode, setVimMode] = useState<'insert' | 'normal'>('insert');
   const [vimCursor, setVimCursor] = useState<number | null>(null);
+  // Count prefix (3h) and pending operator (d for dd) — refs, not state:
+  // they never render on their own, only through the next command.
+  const vimCountRef = useRef(0);
+  const vimPendingOp = useRef<'d' | null>(null);
   const setVimModeLive = useCallback((m: 'insert' | 'normal') => {
     setVimMode(m);
+    vimCountRef.current = 0;
+    vimPendingOp.current = null;
     if (m === 'insert') setVimCursor(null);
   }, []);
   // Cursor-aware editing: mirrors for synchronous use inside key handlers.
@@ -692,17 +699,44 @@ export function App(props: AppProps): React.JSX.Element {
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
-  // `/` autocomplete — top 6 prefix matches while completing a command name (no space yet)
+  // `/` autocomplete — fuzzy top 6 over builtins + custom command files
+  // while completing a command name (no space yet)
+  const customCmds = useMemo(() => {
+    try {
+      return loadCustomCommands(props.cwd).map((c) => ({ name: c.name, hint: c.description || 'custom command' }));
+    } catch {
+      return [];
+    }
+  }, [props.cwd]);
   const slashSuggest = input.startsWith('/') && !input.slice(1).includes(' ') && !awaitingApproval
-    ? suggestCommands(input, 6)
+    ? suggestCommands(input, 6, customCmds)
+    : [];
+  // `@` file completion — fuzzy over the workspace file index while typing
+  // a mention token (no space yet). Directories carry trailing `/`.
+  const fileIndex = useMemo(() => {
+    try {
+      return listCompletableFiles(props.cwd);
+    } catch {
+      return [];
+    }
+  }, [props.cwd]);
+  const atToken = /^@(\S*)$/.exec(input);
+  const pathSuggest = atToken && !awaitingApproval
+    ? suggestCommands(`/${atToken[1] ?? ''}`, 6, fileIndex.map((f) => ({ name: f, hint: 'file' }))).map((d) => ({ ...d, name: `@${d.name}` }))
     : [];
 
   useInput((inputStr, key) => {
     if (key.escape && queuedInputs.length > 0) { setQueuedInputs((prev) => prev.slice(1)); disarmEsc(); return; }
-    // Tab completes the top slash suggestion (e.g. `/c` → `/clear `)
+    // Tab completes the top slash or @-path suggestion
     if ((key.tab || inputStr === '\t') && slashSuggest.length > 0) {
       const top = slashSuggest[0]!;
       setInput(`/${top.name} `);
+      setVimCursor(null);
+      return;
+    }
+    if ((key.tab || inputStr === '\t') && pathSuggest.length > 0) {
+      const top = pathSuggest[0]!;
+      setInput(`${top.name} `);
       setVimCursor(null);
       return;
     }
@@ -740,7 +774,8 @@ export function App(props: AppProps): React.JSX.Element {
     }
     // Vim normal mode: motion/editing keys act on the input buffer instead
     // of typing. Return/arrows/tab/ctrl fall through to the shared logic
-    // below; every other printable key is swallowed.
+    // below; every other printable key is swallowed. Supports counts
+    // (3h/2x), word motions (w/b), line ops (dd/D) — no operators/visual.
     if (vimMode === 'normal' && !awaitingApproval) {
       // Legacy Shift+Enter partner: an Esc that just switched modes followed
       // by Return within 75ms still means newline, not submit.
@@ -751,19 +786,71 @@ export function App(props: AppProps): React.JSX.Element {
       }
       const cur = vimCursor === null ? input.length : Math.max(0, Math.min(vimCursor, input.length));
       const move = (d: number): boolean => { setVimCursor(Math.max(0, Math.min(cur + d, input.length))); return true; };
+      const isWord = (c: string): boolean => /[A-Za-z0-9_]/.test(c);
+      const wordFwd = (pos: number, n: number): number => {
+        let p = pos;
+        for (let k = 0; k < n && p < input.length; k++) {
+          while (p < input.length && isWord(input[p]!)) p++;
+          while (p < input.length && !isWord(input[p]!)) p++;
+        }
+        return Math.min(p, input.length);
+      };
+      const wordBack = (pos: number, n: number): number => {
+        let p = pos;
+        for (let k = 0; k < n && p > 0; k++) {
+          while (p > 0 && !isWord(input[p - 1]!)) p--;
+          while (p > 0 && isWord(input[p - 1]!)) p--;
+        }
+        return Math.max(0, p);
+      };
+      const takeCount = (): number => {
+        const n = vimCountRef.current <= 1 ? 1 : vimCountRef.current;
+        vimCountRef.current = 0;
+        return n;
+      };
       if (!key.ctrl && !key.meta && !key.return && !key.tab && !key.upArrow && !key.downArrow && !key.leftArrow && !key.rightArrow) {
-        if (inputStr === 'i') { setVimMode('insert'); setVimCursor(null); return; }
-        if (inputStr === 'a') { setVimCursor(Math.min(cur + 1, input.length)); setVimMode('insert'); return; }
-        if (inputStr === 'h') { move(-1); return; }
-        if (inputStr === 'l') { move(1); return; }
-        if (inputStr === '0') { setVimCursor(0); return; }
-        if (inputStr === '$') { setVimCursor(input.length); return; }
-        if (inputStr === 'x') { if (cur < input.length) setInput(input.slice(0, cur) + input.slice(cur + 1)); setHistIdx(null); return; }
-        if (inputStr === 'j') { if (isFullscreen && maxTop > 0) commands.lineDown(); return; }
-        if (inputStr === 'k') { if (isFullscreen && maxTop > 0) commands.lineUp(); return; }
-        if (key.backspace || key.delete) { move(-1); return; }
-        if (key.escape) return; // already normal
-        if (inputStr) return; // swallow everything else printable
+        // Pending `d` operator: second `d` deletes the current line.
+        if (vimPendingOp.current === 'd') {
+          vimPendingOp.current = null;
+          if (inputStr === 'd') {
+            const start = input.lastIndexOf('\n', cur - 1) + 1;
+            const nl = input.indexOf('\n', cur);
+            const end = nl === -1 ? input.length : nl + 1;
+            setInput(input.slice(0, start) + input.slice(end));
+            setVimCursor(Math.min(start, Math.max(0, input.slice(0, start).length)));
+            setHistIdx(null);
+            vimCountRef.current = 0;
+            return;
+          }
+          // Only dd is supported — anything else cancels the operator.
+          vimCountRef.current = 0;
+        }
+        if (inputStr === 'i') { setVimMode('insert'); setVimCursor(null); vimCountRef.current = 0; return; }
+        if (inputStr === 'a') { setVimCursor(Math.min(cur + 1, input.length)); setVimMode('insert'); vimCountRef.current = 0; return; }
+        if (/^[1-9]$/.test(inputStr)) { vimCountRef.current = vimCountRef.current * 10 + Number(inputStr); return; }
+        if (inputStr === 'h') { const n = takeCount(); move(-n); return; }
+        if (inputStr === 'l') { const n = takeCount(); move(n); return; }
+        if (inputStr === '0' && vimCountRef.current === 0) { setVimCursor(0); return; }
+        if (inputStr === '0') { const n = takeCount(); move(-n); return; }
+        if (inputStr === '$') { takeCount(); setVimCursor(input.length); return; }
+        if (inputStr === 'x') { const n = takeCount(); if (cur < input.length) setInput(input.slice(0, cur) + input.slice(cur + n)); setHistIdx(null); return; }
+        if (inputStr === 'w') { const n = takeCount(); setVimCursor(wordFwd(cur, n)); return; }
+        if (inputStr === 'b') { const n = takeCount(); setVimCursor(wordBack(cur, n)); return; }
+        if (inputStr === 'd') { vimPendingOp.current = 'd'; vimCountRef.current = 0; return; }
+        if (inputStr === 'D') {
+          // Delete to end of current line (keep the newline).
+          const nl = input.indexOf('\n', cur);
+          const end = nl === -1 ? input.length : nl;
+          setInput(input.slice(0, cur) + input.slice(end));
+          setHistIdx(null);
+          vimCountRef.current = 0;
+          return;
+        }
+        if (inputStr === 'j') { if (isFullscreen && maxTop > 0) commands.lineDown(); vimCountRef.current = 0; return; }
+        if (inputStr === 'k') { if (isFullscreen && maxTop > 0) commands.lineUp(); vimCountRef.current = 0; return; }
+        if (key.backspace || key.delete) { move(-1); vimCountRef.current = 0; return; }
+        if (key.escape) { vimCountRef.current = 0; vimPendingOp.current = null; return; } // already normal
+        if (inputStr) { vimCountRef.current = 0; vimPendingOp.current = null; return; } // swallow everything else printable
       } else if (key.backspace || key.delete) {
         move(-1);
         return;
@@ -976,6 +1063,14 @@ export function App(props: AppProps): React.JSX.Element {
         <Box flexDirection="column" paddingLeft={2} flexShrink={0}>
           {slashSuggest.map((s, i) => (
             <Text key={s.name} color={i === 0 ? (tokens.colors.accent as string) : (tokens.colors.dim as string)}>{i === 0 ? '▸' : ' '} /{s.name}  — {s.hint}</Text>
+          ))}
+          <Text color={tokens.colors.dim as string}>  tab to complete</Text>
+        </Box>
+      ) : null}
+      {slashSuggest.length === 0 && pathSuggest.length > 0 ? (
+        <Box flexDirection="column" paddingLeft={2} flexShrink={0}>
+          {pathSuggest.map((s, i) => (
+            <Text key={s.name} color={i === 0 ? (tokens.colors.accent as string) : (tokens.colors.dim as string)}>{i === 0 ? '▸' : ' '} {s.name}</Text>
           ))}
           <Text color={tokens.colors.dim as string}>  tab to complete</Text>
         </Box>

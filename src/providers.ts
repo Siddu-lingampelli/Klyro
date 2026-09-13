@@ -13,6 +13,7 @@
  */
 
 import { assertSafeBaseURL, normalizeBaseURL } from './chat.js';
+import { localProbeEndpoints } from './providers/endpoints.js';
 
 export interface ProviderConfig {
   baseURL: string;
@@ -21,12 +22,14 @@ export interface ProviderConfig {
   source: 'env' | 'config' | 'local-probe' | 'manual';
 }
 
-const LOCAL_ENDPOINTS: Array<{ name: string; baseURL: string; defaultModel: string }> = [
-  { name: 'Ollama', baseURL: 'http://localhost:11434/v1', defaultModel: 'llama3.2' },
-  { name: 'LM Studio', baseURL: 'http://localhost:1234/v1', defaultModel: 'local-model' },
-  { name: 'vLLM', baseURL: 'http://localhost:8000/v1', defaultModel: 'meta-llama/Llama-3-8B-Instruct' },
-  { name: 'llama.cpp', baseURL: 'http://localhost:8080/v1', defaultModel: 'local-model' },
-];
+/**
+ * Local probe candidates, derived from the single provider registry
+ * (`providers/endpoints.ts`) — adding a local server there automatically
+ * extends probing here.
+ */
+function localProbeList(): Array<{ name: string; baseURL: string; defaultModel: string; probePath: string }> {
+  return localProbeEndpoints().map((d) => ({ name: d.label, baseURL: d.baseURL, defaultModel: d.defaultModel, probePath: d.probePath ?? '/models' }));
+}
 
 /**
  * Resolve which provider to use. Does not throw; returns `null` if nothing
@@ -160,8 +163,8 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
   }
 
   // Probe local endpoints
-  for (const ep of LOCAL_ENDPOINTS) {
-    if (await probeLocal(ep.baseURL)) {
+  for (const ep of localProbeList()) {
+    if (await probeLocal(ep.baseURL, ep.probePath)) {
       return {
         baseURL: ep.baseURL,
         apiKey: '',
@@ -174,13 +177,13 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
 }
 
 /** Hit a cheap endpoint to check if a local server is up. */
-async function probeLocal(baseURL: string): Promise<boolean> {
+async function probeLocal(baseURL: string, probePath = '/models'): Promise<boolean> {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 600);
   try {
     // Try the OpenAI-style /models endpoint; some servers (Ollama before load)
     // answer /, others only /v1/models.
-    const res = await fetch(`${baseURL.replace(/\/+$/, '')}/models`, {
+    const res = await fetch(`${baseURL.replace(/\/+$/, '')}${probePath}`, {
       method: 'GET',
       signal: ctrl.signal,
     });

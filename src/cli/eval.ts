@@ -59,6 +59,8 @@ export interface EvalScenario {
   verify?: { mode?: VerifyMode; command?: string };
   /** Adapter events to script, as [eventKind, ...args] tuples. */
   scripted_events?: Array<Array<unknown[]>>;
+  /** Semantic rubric graded by a model judge (needs --judge-model). */
+  judge?: { rubric: string[] };
   expect?: {
     status?: RunResult['status'];
     textContains?: string;
@@ -76,6 +78,7 @@ export interface EvalResult {
   toolCalls: number;
   text: string;
   durationMs: number;
+  judge?: { pass: boolean; notes: string; skipped: boolean };
 }
 
 export interface RunEvalOptions {
@@ -86,6 +89,8 @@ export interface RunEvalOptions {
   runs?: number;
   parallel?: number;
   model?: string;
+  /** Live model id for grading `judge.rubric` (env endpoint + key required). */
+  judgeModel?: string;
 }
 
 export async function runEval(opts: RunEvalOptions): Promise<number> {
@@ -162,10 +167,24 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
     return 2;
   }
 
+  // Live judge adapter for `judge.rubric` (env endpoint + key; mock otherwise).
+  let judgeAdapter: ProviderAdapter | undefined;
+  if (opts.judgeModel) {
+    const { httpChatAdapter } = await import('../agent/provider-adapter.js');
+    const { getStoredKey } = await import('./auth.js');
+    const baseUrl = process.env.KLYRO_BASE_URL;
+    const apiKey = process.env.KLYRO_API_KEY ?? getStoredKey('openai') ?? getStoredKey('anthropic');
+    if (!baseUrl || !apiKey) {
+      stderr.write('klyro eval: --judge-model needs KLYRO_BASE_URL and KLYRO_API_KEY (or a stored key)\n');
+      return 2;
+    }
+    judgeAdapter = httpChatAdapter({ baseURL: baseUrl, apiKey });
+  }
+
   const results: EvalResult[] = [];
   for (const sc of scenarios) {
     const start = Date.now();
-    const r = await runScenario(sc);
+    const r = await runScenario(sc, judgeAdapter && opts.judgeModel ? { adapter: judgeAdapter, model: opts.judgeModel } : undefined);
     r.durationMs = Date.now() - start;
     results.push(r);
     if (opts.output === 'json') {
@@ -253,7 +272,10 @@ function tupleToEvent(tuple: unknown[]): StreamEvent {
   }
 }
 
-export async function runScenario(sc: EvalScenario): Promise<EvalResult> {
+export async function runScenario(
+  sc: EvalScenario,
+  judgeOpts?: { adapter: ProviderAdapter; model: string },
+): Promise<EvalResult> {
   const failures: string[] = [];
   const model = sc.model ?? 'mock';
   const adapter = scriptedAdapterFromSpec(sc.scripted_events);
@@ -300,6 +322,23 @@ export async function runScenario(sc: EvalScenario): Promise<EvalResult> {
     failures.push(`toolCalls: expected <= ${exp.toolCallsAtMost}, got ${result.toolCalls}`);
   }
 
+  // Model-graded semantic check (opt-in: needs a live judge adapter).
+  let judge: EvalResult['judge'];
+  if (sc.judge && sc.judge.rubric.length > 0) {
+    if (judgeOpts) {
+      const { runJudge } = await import('../eval/judge.js');
+      const v = await runJudge(judgeOpts.adapter, judgeOpts.model, {
+        task: sc.task,
+        finalText: result.finalText,
+        toolCalls: result.toolCalls,
+      }, sc.judge.rubric);
+      judge = { pass: v.pass, notes: v.notes, skipped: v.skipped };
+      if (!v.pass) failures.push(`judge: ${v.notes || 'rubric unmet'}`);
+    } else {
+      judge = { pass: true, notes: 'no judge adapter — skipped', skipped: true };
+    }
+  }
+
   return {
     name: sc.name,
     passed: failures.length === 0,
@@ -309,5 +348,6 @@ export async function runScenario(sc: EvalScenario): Promise<EvalResult> {
     toolCalls: result.toolCalls,
     text: result.finalText,
     durationMs: 0,
+    ...(judge ? { judge } : {}),
   };
 }

@@ -215,9 +215,36 @@ describe('runOnce', () => {
       const textDeltas = parsed.filter((e) => e.kind === 'text_delta');
       expect(textDeltas.length).toBeGreaterThan(0);
       expect(textDeltas[0].text).toBe('hi');
-      // Should end with a final marker
-      const final = parsed[parsed.length - 1];
-      expect(final.kind).toBe('final');
+      // Legacy final marker still present, then the stable result envelope last.
+      expect(parsed.some((e) => e.kind === 'final')).toBe(true);
+      const last = parsed[parsed.length - 1];
+      expect(last.kind).toBe('result');
+      expect(last.status).toBe('complete');
+      expect(last.text).toBe('hi');
+      expect(typeof last.cost_usd).toBe('number');
+      expect(last.usage).toMatchObject({ input: expect.any(Number), output: expect.any(Number) });
+      expect(typeof last.exit_code).toBe('number');
+    });
+
+    it('emits a stable result envelope with cost and usage', async () => {
+      const adapter = scriptedAdapter([
+        [
+          { kind: 'message_start' },
+          { kind: 'text_delta', text: 'done' },
+          { kind: 'message_end', finishReason: 'stop' },
+        ],
+      ]);
+      const { out } = await captureStdout(() => runOnce({
+        task: 'test',
+        cwd: process.cwd(),
+        model: 'mock',
+        adapter,
+        output: 'json',
+        abortOnSigint: false,
+      }));
+      const parsed = out.split('\n').filter((l) => l.length > 0).map((l) => JSON.parse(l));
+      const last = parsed[parsed.length - 1];
+      expect(last).toMatchObject({ kind: 'result', status: 'complete', steps: 1 });
     });
 
     it('emits no human-readable text in json mode', async () => {
@@ -310,6 +337,34 @@ describe('runOnce', () => {
       expect(report.task).toContain('[REDACTED');
       expect(report.task).not.toContain(rawKey);
       expect(out).not.toContain(rawKey);
+    });
+  });
+
+  describe('--bare', () => {
+    it('skips MCP, hooks, context, and persistence for deterministic runs', async () => {
+      let sawSystem: string | undefined;
+      const adapter: ProviderAdapter = {
+        id: 'mock',
+        async *stream(req) {
+          sawSystem = req.system;
+          yield { kind: 'message_start' };
+          yield { kind: 'text_delta', text: 'bare ok' };
+          yield { kind: 'message_end', finishReason: 'stop' };
+        },
+      };
+      const code = await runOnce({
+        task: 'bare test',
+        cwd: process.cwd(),
+        model: 'mock',
+        adapter,
+        bare: true,
+        abortOnSigint: false,
+      });
+      expect(code).toBe(0);
+      // Base prompt only: no L6 context block, no memory block, no KLYRO.md.
+      expect(sawSystem ?? '').not.toContain('<context>');
+      expect(sawSystem ?? '').not.toContain('<memory>');
+      expect(sawSystem ?? '').not.toContain('<KLYRO.md>');
     });
   });
 

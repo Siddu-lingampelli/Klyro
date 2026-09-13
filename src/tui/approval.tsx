@@ -86,10 +86,59 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
 
   const [explain, setExplain] = useState(false);
   const [full, setFull] = useState(false);
+  // Inline edit mode (`e`): buffer holds the JSON input being edited.
+  // Enter submits (re-validated + re-prompted by the runtime), Esc cancels
+  // back to the choice keys. Reset whenever a new prompt arrives.
+  const [editing, setEditing] = useState<string | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
+  useEffect(() => {
+    setEditing(null);
+    setEditError(null);
+  }, [pending]);
   useInput((inputStr, key) => {
     if (!pending) return;
+    if (editing !== null) {
+      if (key.return) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(editing);
+        } catch (err) {
+          setEditError(`invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+          return;
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          setEditError('edited input must be a JSON object');
+          return;
+        }
+        bridge.resolve({ kind: 'edit', editedInput: parsed as Record<string, unknown> });
+        return;
+      }
+      if (key.escape) {
+        setEditing(null);
+        setEditError(null);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setEditing((v) => (v ?? '').slice(0, -1));
+        return;
+      }
+      if (!key.ctrl && !key.meta) setEditing((v) => (v ?? '') + inputStr.replace(/\r/g, '\n'));
+      return;
+    }
     if (key.return) {
       bridge.resolve('deny');
+      return;
+    }
+    // `e` enters inline edit mode (real edit-and-retry); the stdin prompt
+    // keeps `e` as deny since it has no editor. Case-sensitive mapping for
+    // the rest lives in approvalChoiceForKey.
+    if (inputStr === 'e') {
+      try {
+        setEditing(JSON.stringify(pending.input ?? {}, null, 2));
+      } catch {
+        setEditing('{}');
+      }
+      setEditError(null);
       return;
     }
     // Case-sensitive mapping lives in approvalChoiceForKey: 'A' persists,
@@ -129,6 +178,13 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
       <Text color="yellow" bold>⚠ approval needed — {pending.toolName}</Text>
       <Text color="gray">  reason: &quot;{trunc(pending.reason)}&quot;</Text>
       {pending.summary ? <Text>  &quot;{trunc(pending.summary)}&quot;</Text> : null}
+      {editing !== null ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color="yellow" bold>  editing input JSON (Enter = submit, Esc = back):</Text>
+          <Text wrap="wrap">  {(editing.length > 1500 ? editing.slice(0, 1500) + '…' : editing) + '▌'}</Text>
+          {editError ? <Text color="red">  {editError}</Text> : null}
+        </Box>
+      ) : null}
       {explain ? <Text color="cyan">  Explain: This tool will {pending.toolName} with the shown args. [y] once, [a] session, [A] always→settings, [n] deny, [e] edit, [f] full text, [?] toggle help.</Text> : null}
       <Box marginTop={1}>
         <Text color="green">[y] once</Text>

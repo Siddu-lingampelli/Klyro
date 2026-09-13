@@ -29,7 +29,23 @@ export async function memoryWrite(cwd: string, content: string): Promise<string>
   const prev = await fs.readFile(p, 'utf-8').catch(() => '');
   // S4-at-rest: redact before appending — redact() only fires on secret
   // shapes (key/token/password with [:=-]), so normal prose survives.
-  const next = (prev + '\n' + redact(content)).slice(-MEMORY_STEADY_STATE_CHARS); // ≤1k tokens ~4k chars
+  const full = prev + '\n' + redact(content);
+  let next = full;
+  if (full.length > MEMORY_STEADY_STATE_CHARS) {
+    // Rotation, not silent loss: the dropped head is archived to a dated
+    // file (pruned to the latest 20) instead of vanishing. Summarization
+    // of archives is left to an explicit future pass.
+    const head = full.slice(0, full.length - MEMORY_STEADY_STATE_CHARS);
+    next = full.slice(-MEMORY_STEADY_STATE_CHARS);
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      await fs.writeFile(path.join(dir, `archive-${stamp}.md`), head, 'utf-8');
+      const entries = (await fs.readdir(dir)).filter((e) => e.startsWith('archive-')).sort();
+      for (const old of entries.slice(0, Math.max(0, entries.length - 20))) {
+        await fs.unlink(path.join(dir, old)).catch(() => undefined);
+      }
+    } catch { /* archive is best-effort; the live notes still persist */ }
+  }
   const tmp = path.join(dir, `.session-notes.md.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   await fs.writeFile(tmp, next, 'utf-8');
   try {

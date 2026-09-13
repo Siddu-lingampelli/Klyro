@@ -23,11 +23,23 @@ export const McpServerPolicySchema = z.object({
 export type McpServerPolicy = z.infer<typeof McpServerPolicySchema>;
 
 export const McpServerSpecSchema = z.object({
-  command: z.string().min(1),
+  /** stdio transport: command to spawn. Required unless `url` is set. */
+  command: z.string().min(1).optional(),
   args: z.array(z.string()).optional(),
   env: z.record(z.string(), z.string()).optional(),
+  /** Remote transport: Streamable-HTTP JSON-RPC endpoint. Required unless `command` is set. */
+  url: z.string().url().optional(),
+  /** Extra HTTP headers for remote transport (`${env:VAR}` expanded). */
+  headers: z.record(z.string(), z.string()).optional(),
   disabled: z.boolean().optional(),
   policy: McpServerPolicySchema.optional(),
+}).superRefine((s, ctx) => {
+  if (!s.command && !s.url) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'MCP server needs either "command" (stdio) or "url" (remote HTTP)' });
+  }
+  if (s.command && s.url) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'MCP server takes either "command" or "url", not both' });
+  }
 });
 
 export type McpServerSpec = z.infer<typeof McpServerSpecSchema>;
@@ -93,6 +105,11 @@ export function loadMcpServers(cwd: string): McpServersConfig {
         const env: Record<string, string> = {};
         for (const [k, v] of Object.entries(spec.env)) env[k] = expandEnv(v);
         spec.env = env;
+      }
+      if (spec.headers) {
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(spec.headers)) headers[k] = expandEnv(v);
+        spec.headers = headers;
       }
       servers[name] = spec;
       sources[name] = label;

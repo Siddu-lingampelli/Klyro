@@ -67,8 +67,10 @@ async function main(): Promise<void> {
     .option('--no-color', 'Disable colored output')
     .option('-p, --print <prompt>', 'Headless one-shot prompt (alias for run, --output json for machine)')
     .option('--output-format <fmt>', 'Headless output format: text|json|stream-json (default text)')
-    .option('--no-stream', 'Disable streaming (buffer full response)')
-    .option('--show-thinking', 'Show thinking blocks');
+    .option('--temperature <n>', 'Sampling temperature 0-2 (headless -p / run)', parseTemperature)
+    .option('--max-tokens <n>', 'Max output tokens per step (headless -p / run)', (v) => parsePositiveInt('--max-tokens', v))
+    .option('--no-stream', 'Disable streaming (TUI only; headless json always streams events)')
+    .option('--show-thinking', 'Show thinking blocks (TUI only)');
 
   // Unknown commands / unknown options are usage errors (exit 2 per PRD).
   // Help and version still exit 0; anything else rethrows to the last-resort
@@ -203,13 +205,29 @@ async function main(): Promise<void> {
       process.exit(code);
     });
 
+  program
+    .command('init')
+    .description('Bootstrap this project: scan + KLYRO.md draft + .mcp.json skeleton (never overwrites)')
+    .action(async () => {
+      const { initProject, nextStepsText } = await import('./cli/init.js');
+      try {
+        const { created, skipped } = await initProject(process.cwd());
+        for (const f of created) process.stdout.write(`created ${f}\n`);
+        for (const f of skipped) process.stdout.write(`kept ${f}\n`);
+        process.stdout.write(nextStepsText() + '\n');
+        process.exit(0);
+      } catch (err) {
+        process.stderr.write(`klyro: init failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        process.exit(1);
+      }
+    });
+
   // Support `klyro "prompt"` positional headless (2.5)
   program.argument('[prompt]', 'Headless one-shot prompt (same as -p)');
 
   program
     .action(async (promptArg?: string) => {
-      const opts = program.opts<{ tui?: boolean; chat?: boolean; print?: string; outputFormat?: string; json?: boolean; maxTokens?: number; stream?: boolean; continue?: boolean; resume?: string | boolean }>();
-      // 9.2 — --continue / --resume handling
+            const opts = program.opts<{ tui?: boolean; chat?: boolean; print?: string; outputFormat?: string; json?: boolean; maxTokens?: number; temperature?: number; stream?: boolean; continue?: boolean; resume?: string | boolean }>();      // 9.2 — --continue / --resume handling
       if (opts.continue || typeof opts.resume === 'string') {
         const { getDefaultSessionStore } = await import('./persistence/session.js');
         const store = getDefaultSessionStore();
@@ -242,6 +260,7 @@ async function main(): Promise<void> {
           cwd: process.cwd(),
           model: process.env.KLYRO_MODEL ?? 'gpt-4o-mini',
           maxTokens: opts.maxTokens,
+          temperature: opts.temperature,
           output: output as 'human' | 'json' | 'silent',
           provider: (process.env.KLYRO_PROVIDER as 'openai' | 'anthropic' | undefined),
         });
@@ -299,12 +318,13 @@ async function main(): Promise<void> {
     .option('--require-verify', 'Fail with exit 8 if no verification passed after edits (6.5)')
     .option('--agent <name>', 'Run under an orchestrator context enabling spawn_agent/task_list/task_get (explorer|implementer|tester|reviewer)')
     .option('--max-depth <n>', 'Max spawn depth for child agents (default 1)', (v) => parsePositiveInt('--max-depth', v))
+    .option('--bare', 'Deterministic runs: skip MCP, hooks, memory/KLYRO.md/context, persistence')
     .action(async (prompt: string, opts: {
       model?: string; maxSteps?: number; maxTokens?: number; temperature?: number;
       timeout?: number; baseUrl?: string; apiKey?: string;
       output?: string; dryRun?: boolean; provider?: string; resume?: string;
       resumeSession?: string; verify?: boolean; verifyCommand?: string; verifyMode?: string; maxRepairs?: number; persist?: boolean; requireVerify?: boolean;
-      agent?: string; maxDepth?: number;
+      agent?: string; maxDepth?: number; bare?: boolean;
     }) => {
       const model = opts.model ?? process.env.KLYRO_MODEL;
       if (!model) {
@@ -346,6 +366,7 @@ async function main(): Promise<void> {
           requireVerify: !!opts.requireVerify,
           agent: opts.agent,
           maxDepth: opts.maxDepth,
+          bare: !!opts.bare,
         });
         process.exit(code);
       } catch (err) {
@@ -377,17 +398,18 @@ async function main(): Promise<void> {
     .option('--runs <n>', 'Runs per fixture (default 1)', (v) => parsePositiveInt('--runs', v))
     .option('--parallel <n>', 'Parallelism (default 1)', (v) => parsePositiveInt('--parallel', v))
     .option('--model <id>', 'Model for eval')
-    .action(async (input: string | undefined, opts: { output?: string; suite?: string; filter?: string; runs?: number; parallel?: number; model?: string }) => {
+    .option('--judge-model <id>', 'Live model id for grading judge.rubric (needs endpoint + key)')
+    .action(async (input: string | undefined, opts: { output?: string; suite?: string; filter?: string; runs?: number; parallel?: number; model?: string; judgeModel?: string }) => {
       const output = (opts.output ?? 'human') as 'human' | 'json' | 'silent';
       if (opts.suite) {
-        const code = await runEval({ inputPath: input ?? '-', output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model });
+        const code = await runEval({ inputPath: input ?? '-', output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel });
         process.exit(code);
       }
       if (!input) {
         process.stderr.write('klyro eval: missing input (provide <input> or --suite)\n');
         process.exit(2);
       }
-      const code = await runEval({ inputPath: input, output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model });
+      const code = await runEval({ inputPath: input, output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel });
       process.exit(code);
     });
 
@@ -404,156 +426,89 @@ async function main(): Promise<void> {
       process.exit(0);
     });
 
-  // Level 9 — Session management
-  const session = program.command('session').description('Session persistence (Level 9)');
-  session
-    .command('list')
-    .description('List persisted sessions')
-    .option('--status <s>', 'Filter by status: open|complete|verify_failed|aborted|max_steps')
-    .option('--json', 'Output JSON')
-    .action(async (opts: { status?: string; json?: boolean }) => {
-      const { getDefaultSessionStore, formatSession } = await import('./persistence/session.js');
-      const store = getDefaultSessionStore();
-      const all = await store.list(opts.status ? { status: opts.status as never } : undefined);
-      if (opts.json) {
-        process.stdout.write(JSON.stringify(all, null, 2) + '\n');
+  // Level 9 — Session management.
+  // One namespace: `session` and `sessions` accept the SAME subcommands
+  // (list/show/resume/export/import/fork/delete). Handlers live here once
+  // and both command groups delegate to them.
+  async function sessionList(opts: { status?: string; json?: boolean }): Promise<void> {
+    const { getDefaultSessionStore, formatSession } = await import('./persistence/session.js');
+    const store = getDefaultSessionStore();
+    const all = await store.list(opts.status ? { status: opts.status as never } : undefined);
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(all, null, 2) + '\n');
+    } else {
+      if (all.length === 0) {
+        process.stdout.write('No sessions\n');
       } else {
-        if (all.length === 0) {
-          process.stdout.write('No sessions\n');
-        } else {
-          for (const r of all.sort((a, b) => b.updatedAt - a.updatedAt)) {
-            process.stdout.write(formatSession(r) + '\n');
-          }
+        for (const r of all.sort((a, b) => b.updatedAt - a.updatedAt)) {
+          process.stdout.write(formatSession(r) + '\n');
         }
       }
+    }
+  }
+  async function resolveOrExit(id: string): Promise<string> {
+    const { getDefaultSessionStore, resolveSessionId, matchSessionIds } = await import('./persistence/session.js');
+    const store = getDefaultSessionStore();
+    const full = await resolveSessionId(store, id);
+    if (full) return full;
+    const matches = await matchSessionIds(store, id);
+    if (matches.length > 1) {
+      process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`);
+    } else {
+      process.stderr.write(`session not found: ${id}\n`);
+    }
+    process.exit(2);
+  }
+  async function sessionShow(id: string, opts: { json?: boolean }): Promise<void> {
+    const { getDefaultSessionStore } = await import('./persistence/session.js');
+    const store = getDefaultSessionStore();
+    const full = await resolveOrExit(id);
+    const rec = await store.get(full);
+    const msgs = await store.loadMessages(full);
+    const obs = await store.loadObservations(full);
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ record: rec, messages: msgs, observations: obs }, null, 2) + '\n');
+    } else {
+      process.stdout.write(`Session ${rec?.id}\n  task: ${rec?.task}\n  status: ${rec?.status}\n  cwd: ${rec?.cwd}\n  created: ${new Date(rec?.createdAt ?? 0).toISOString()}\n`);
+      process.stdout.write(`\nMessages (${msgs.length}):\n`);
+      for (const m of msgs) process.stdout.write(`  [${m.role}] ${JSON.stringify(m.content).slice(0, 200)}\n`);
+      process.stdout.write(`\nObservations (${obs.length}):\n`);
+      for (const o of obs) process.stdout.write(`  ${o.toolName} -> ${o.isError ? 'ERR' : 'ok'} ${JSON.stringify(o.output).slice(0, 120)}\n`);
+    }
+  }
+  async function sessionResume(id: string, opts: { model?: string; maxSteps?: number; verifyCommand?: string; verify?: boolean }): Promise<void> {
+    const { getDefaultSessionStore } = await import('./persistence/session.js');
+    const store = getDefaultSessionStore();
+    const full = await resolveOrExit(id);
+    const rec = await store.get(full);
+    if (!rec) {
+      process.stderr.write(`session not found: ${id}\n`);
+      process.exit(2);
+    }
+    const model = opts.model ?? rec.config.model ?? process.env.KLYRO_MODEL;
+    if (!model) {
+      process.stderr.write('klyro: KLYRO_MODEL is not set (or pass --model)\n');
+      process.exit(2);
+    }
+    const code = await runOnce({
+      task: rec.task,
+      cwd: rec.cwd,
+      model,
+      maxSteps: opts.maxSteps ?? rec.config.maxSteps,
+      sessionId: full,
+      verify: opts.verify,
+      verifyCommand: opts.verifyCommand,
     });
-  session
-    .command('show <id>')
-    .description('Show session transcript and observations')
-    .option('--json', 'Output JSON')
-    .action(async (id: string, opts: { json?: boolean }) => {
-      const { getDefaultSessionStore, resolveSessionId, matchSessionIds } = await import('./persistence/session.js');
-      const store = getDefaultSessionStore();
-      const full = await resolveSessionId(store, id);
-      if (!full) {
-        const matches = await matchSessionIds(store, id);
-        if (matches.length > 1) {
-          process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`);
-        } else {
-          process.stderr.write(`session not found: ${id}\n`);
-        }
-        process.exit(2);
-      }
-      const rec = await store.get(full);
-      const msgs = await store.loadMessages(full);
-      const obs = await store.loadObservations(full);
-      if (opts.json) {
-        process.stdout.write(JSON.stringify({ record: rec, messages: msgs, observations: obs }, null, 2) + '\n');
-      } else {
-        process.stdout.write(`Session ${rec?.id}\n  task: ${rec?.task}\n  status: ${rec?.status}\n  cwd: ${rec?.cwd}\n  created: ${new Date(rec?.createdAt ?? 0).toISOString()}\n`);
-        process.stdout.write(`\nMessages (${msgs.length}):\n`);
-        for (const m of msgs) process.stdout.write(`  [${m.role}] ${JSON.stringify(m.content).slice(0, 200)}\n`);
-        process.stdout.write(`\nObservations (${obs.length}):\n`);
-        for (const o of obs) process.stdout.write(`  ${o.toolName} -> ${o.isError ? 'ERR' : 'ok'} ${JSON.stringify(o.output).slice(0, 120)}\n`);
-      }
-    });
-  session
-    .command('resume <id>')
-    .description('Resume a persisted session (requires KLYRO_MODEL etc.)')
-    .option('-m, --model <id>', 'Model (default: from session or env)')
-    .option('--max-steps <n>', 'Max steps (default 30)', (v) => parsePositiveInt('--max-steps', v))
-    .option('--verify-command <cmd>', 'Override verification command')
-    .option('--verify', 'Enable verification (default: enabled)')
-    .action(async (id: string, opts: { model?: string; maxSteps?: number; verifyCommand?: string; verify?: boolean }) => {
-      const { getDefaultSessionStore, resolveSessionId, matchSessionIds } = await import('./persistence/session.js');
-      const store = getDefaultSessionStore();
-      const full = await resolveSessionId(store, id);
-      if (!full) {
-        const matches = await matchSessionIds(store, id);
-        if (matches.length > 1) {
-          process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`);
-        } else {
-          process.stderr.write(`session not found: ${id}\n`);
-        }
-        process.exit(2);
-      }
-      const rec = await store.get(full);
-      if (!rec) {
-        process.stderr.write(`session not found: ${id}\n`);
-        process.exit(2);
-      }
-      const model = opts.model ?? rec.config.model ?? process.env.KLYRO_MODEL;
-      if (!model) {
-        process.stderr.write('klyro: KLYRO_MODEL is not set (or pass --model)\n');
-        process.exit(2);
-      }
-      const code = await runOnce({
-        task: rec.task,
-        cwd: rec.cwd,
-        model,
-        maxSteps: opts.maxSteps ?? rec.config.maxSteps,
-        sessionId: full,
-        verify: opts.verify,
-        verifyCommand: opts.verifyCommand,
-      });
-      process.exit(code);
-    });
-
-  // Alias: klyro resume <id> → klyro session resume <id>
-  program
-    .command('resume <id>')
-    .description('Alias for `klyro session resume <id>`')
-    .option('-m, --model <id>', 'Model')
-    .option('--max-steps <n>', 'Max steps', (v) => parsePositiveInt('--max-steps', v))
-    .action(async (id: string, opts: { model?: string; maxSteps?: number }) => {
-      const { getDefaultSessionStore, resolveSessionId, matchSessionIds } = await import('./persistence/session.js');
-      const store = getDefaultSessionStore();
-      const full = await resolveSessionId(store, id);
-      if (!full) {
-        const matches = await matchSessionIds(store, id);
-        if (matches.length > 1) {
-          process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`);
-        } else {
-          process.stderr.write(`session not found: ${id}\n`);
-        }
-        process.exit(2);
-      }
-      const rec = await store.get(full);
-      if (!rec) {
-        process.stderr.write(`session not found: ${id}\n`);
-        process.exit(2);
-      }
-      const model = opts.model ?? rec.config.model ?? process.env.KLYRO_MODEL;
-      if (!model) {
-        process.stderr.write('klyro: KLYRO_MODEL is not set (or pass --model)\n');
-        process.exit(2);
-      }
-      const code = await runOnce({
-        task: rec.task,
-        cwd: rec.cwd,
-        model,
-        maxSteps: opts.maxSteps ?? rec.config.maxSteps,
-        sessionId: full,
-      });
-      process.exit(code);
-    });
-
-  program.command('scan').description('Scan project (7.1) — languages, frameworks, commands, 300ms cached').option('--json', 'JSON output').action(async (opts: { json?: boolean }) => { const { runScan } = await import('./cli/scan.js'); process.exit(await runScan({ cwd: process.cwd(), json: !!opts.json })); });
-  program.command('project').description('Alias for scan').option('--json', 'JSON output').action(async (opts: { json?: boolean }) => { const { runProject } = await import('./cli/scan.js'); process.exit(await runProject({ cwd: process.cwd(), json: !!opts.json })); });
-
-  // 9.2 — Continue / resume top-level flags (also handled via session resume)
-  program.option('-c, --continue', 'Continue most recent session in cwd (9.2)');
-  program.option('-r, --resume [id]', 'Resume session by id or pick most recent');
-
-  // 9.4 — Sessions extended: fork/rename/export/import/prune/history + locks
-  const sessions = program.command('sessions').description('Alias for session');
-  sessions.command('export <id> [file]').description('Export session to file (9.4)').action(async (id: string, file?: string) => {
-    const { getDefaultSessionStore, resolveSessionId } = await import('./persistence/session.js');
-    const store = getDefaultSessionStore(); const full = await resolveSessionId(store, id); if (!full) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
+    process.exit(code);
+  }
+  async function sessionExport(id: string, file?: string): Promise<void> {
+    const { getDefaultSessionStore } = await import('./persistence/session.js');
+    const store = getDefaultSessionStore();
+    const full = await resolveOrExit(id);
     const rec = await store.get(full); const msgs = await store.loadMessages(full); const obs = await store.loadObservations(full);
     const out = file ?? `${full}.export.json`; await (await import('node:fs/promises')).writeFile(out, JSON.stringify({ record: rec, messages: msgs, observations: obs }, null, 2)); process.stdout.write(`exported ${full} → ${out}\n`);
-  });
-  sessions.command('import <file>').description('Import session from file (restores record + messages + observations)').action(async (file: string) => {
+  }
+  async function sessionImport(file: string): Promise<void> {
     let data: unknown;
     try {
       data = JSON.parse(await (await import('node:fs/promises')).readFile(file, 'utf-8'));
@@ -588,8 +543,8 @@ async function main(): Promise<void> {
       }
     }
     process.stdout.write(`imported → ${created.id} (${restored} messages restored)\n`);
-  });
-  sessions.command('fork <id>').description('Fork session with full context (9.4)').action(async (id: string) => {
+  }
+  async function sessionFork(id: string): Promise<void> {
     const { getDefaultSessionStore, matchSessionIds } = await import('./persistence/session.js'); const store = getDefaultSessionStore(); const matches = await matchSessionIds(store, id);
     if (matches.length === 0) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
     if (matches.length > 1) { process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`); process.exit(2); }
@@ -597,15 +552,76 @@ async function main(): Promise<void> {
     const forked = await store.fork(full);
     const msgs = await store.loadMessages(forked.id);
     process.stdout.write(`forked ${full.slice(0, 8)} → ${forked.id.slice(0, 8)} (${msgs.length} messages carried over)\n`);
-  });
-  sessions.command('delete <id>').description('Delete a session and its artifacts').action(async (id: string) => {
+  }
+  async function sessionDelete(id: string): Promise<void> {
     const { getDefaultSessionStore, matchSessionIds } = await import('./persistence/session.js'); const store = getDefaultSessionStore(); const matches = await matchSessionIds(store, id);
     if (matches.length === 0) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
     if (matches.length > 1) { process.stderr.write(`ambiguous id "${id}" matches:\n${matches.map((r) => `  ${r.id.slice(0, 8)}  ${r.task.slice(0, 50)}`).join('\n')}\n`); process.exit(2); }
     const full = matches[0]!.id;
     await store.delete(full);
     process.stdout.write(`deleted ${full.slice(0, 8)}\n`);
-  });
+  }
+  const session = program.command('session').description('Session persistence (Level 9)');
+  session
+    .command('list')
+    .description('List persisted sessions')
+    .option('--status <s>', 'Filter by status: open|complete|verify_failed|aborted|max_steps')
+    .option('--json', 'Output JSON')
+    .action(async (opts: { status?: string; json?: boolean }) => { await sessionList(opts); });
+  session
+    .command('show <id>')
+    .description('Show session transcript and observations')
+    .option('--json', 'Output JSON')
+    .action(async (id: string, opts: { json?: boolean }) => { await sessionShow(id, opts); });
+  session
+    .command('resume <id>')
+    .description('Resume a persisted session (requires KLYRO_MODEL etc.)')
+    .option('-m, --model <id>', 'Model (default: from session or env)')
+    .option('--max-steps <n>', 'Max steps (default 30)', (v) => parsePositiveInt('--max-steps', v))
+    .option('--verify-command <cmd>', 'Override verification command')
+    .option('--verify', 'Enable verification (default: enabled)')
+    .action(async (id: string, opts: { model?: string; maxSteps?: number; verifyCommand?: string; verify?: boolean }) => { await sessionResume(id, opts); });
+  session
+    .command('export <id> [file]')
+    .description('Export session to file (9.4)')
+    .action(async (id: string, file?: string) => { await sessionExport(id, file); });
+  session
+    .command('import <file>')
+    .description('Import session from file (restores record + messages + observations)')
+    .action(async (file: string) => { await sessionImport(file); });
+  session
+    .command('fork <id>')
+    .description('Fork session with full context (9.4)')
+    .action(async (id: string) => { await sessionFork(id); });
+  session
+    .command('delete <id>')
+    .description('Delete a session and its artifacts')
+    .action(async (id: string) => { await sessionDelete(id); });
+
+  // Alias: klyro resume <id> → klyro session resume <id>
+  program
+    .command('resume <id>')
+    .description('Alias for `klyro session resume <id>`')
+    .option('-m, --model <id>', 'Model')
+    .option('--max-steps <n>', 'Max steps', (v) => parsePositiveInt('--max-steps', v))
+    .action(async (id: string, opts: { model?: string; maxSteps?: number }) => { await sessionResume(id, opts); });
+
+  program.command('scan').description('Scan project (7.1) — languages, frameworks, commands, 300ms cached').option('--json', 'JSON output').action(async (opts: { json?: boolean }) => { const { runScan } = await import('./cli/scan.js'); process.exit(await runScan({ cwd: process.cwd(), json: !!opts.json })); });
+  program.command('project').description('Alias for scan').option('--json', 'JSON output').action(async (opts: { json?: boolean }) => { const { runProject } = await import('./cli/scan.js'); process.exit(await runProject({ cwd: process.cwd(), json: !!opts.json })); });
+
+  // 9.2 — Continue / resume top-level flags (also handled via session resume)
+  program.option('-c, --continue', 'Continue most recent session in cwd (9.2)');
+  program.option('-r, --resume [id]', 'Resume session by id or pick most recent');
+
+  // 9.4 — same namespace as `session`: every subcommand works under both.
+  const sessions = program.command('sessions').description('Alias for session (same subcommands)');
+  sessions.command('list').description('List persisted sessions').option('--status <s>', 'Filter by status').option('--json', 'Output JSON').action(async (opts: { status?: string; json?: boolean }) => { await sessionList(opts); });
+  sessions.command('show <id>').description('Show session transcript and observations').option('--json', 'Output JSON').action(async (id: string, opts: { json?: boolean }) => { await sessionShow(id, opts); });
+  sessions.command('resume <id>').description('Resume a persisted session').option('-m, --model <id>', 'Model').option('--max-steps <n>', 'Max steps', (v) => parsePositiveInt('--max-steps', v)).action(async (id: string, opts: { model?: string; maxSteps?: number }) => { await sessionResume(id, opts); });
+  sessions.command('export <id> [file]').description('Export session to file (9.4)').action(async (id: string, file?: string) => { await sessionExport(id, file); });
+  sessions.command('import <file>').description('Import session from file (restores record + messages + observations)').action(async (file: string) => { await sessionImport(file); });
+  sessions.command('fork <id>').description('Fork session with full context (9.4)').action(async (id: string) => { await sessionFork(id); });
+  sessions.command('delete <id>').description('Delete a session and its artifacts').action(async (id: string) => { await sessionDelete(id); });
 
   // 10.1 — MCP
   const mcp = program.command('mcp').description('MCP client/server (10.1)');
@@ -623,10 +639,14 @@ async function main(): Promise<void> {
       process.stdout.write(`${name} source=${source}${spec?.disabled ? ' disabled' : ''}\n`);
     }
   });
-  mcp.command('add <name> <command> [args...]').description('Add a project MCP server to .mcp.json (stdio command)').action(async (name: string, command: string, args: string[]) => {
+  mcp.command('add <name> <command> [args...]').description('Add a project MCP server to .mcp.json (stdio command, or https:// URL for remote)').action(async (name: string, command: string, args: string[]) => {
     const { addProjectServer, projectMcpPath } = await import('./mcp/config.js');
     try {
-      addProjectServer(process.cwd(), name, { command, ...(args && args.length > 0 ? { args } : {}) });
+      // URL first arg → remote Streamable-HTTP server; else stdio command.
+      const spec = /^https?:\/\//i.test(command)
+        ? { url: command }
+        : { command, ...(args && args.length > 0 ? { args } : {}) };
+      addProjectServer(process.cwd(), name, spec);
       process.stdout.write(`added mcp server "${name}" → ${projectMcpPath(process.cwd())}\n`);
     } catch (err) {
       process.stderr.write(`klyro: mcp add failed: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -654,18 +674,20 @@ async function main(): Promise<void> {
       process.stderr.write(`klyro: mcp server not found: ${name}\n`);
       process.exit(2);
     }
-    const { McpClient } = await import('./mcp/client.js');
-    const client = new McpClient(name, spec);
-    // 15s overall probe budget (connect has its own internal timeout too).
+    const { makeMcpClient } = await import('./mcp/registry.js');
+    const client = makeMcpClient(name, spec);    // 15s overall probe budget (connect has its own internal timeout too).
     const timer = setTimeout(() => {
       process.stderr.write(`klyro: mcp probe ${name} timed out after 15s\n`);
       process.exit(2);
     }, 15_000);
     try {
-      await client.connect();
+      const withConnect = client as Partial<{ connect: () => Promise<void> }>;
+      if (typeof withConnect.connect === 'function') await withConnect.connect();
       const tools = await client.listTools();
+      const prompts = typeof client.promptsList === 'function' ? await client.promptsList().catch(() => []) : [];
       const names = tools.map((t) => t.name);
-      process.stdout.write(`${name}: ${tools.length} tool(s)${names.length > 0 ? `: ${names.join(', ')}` : ''}\n`);
+      const extra = prompts.length > 0 ? `, ${prompts.length} prompt(s): ${prompts.map((p) => p.name).join(', ')}` : '';
+      process.stdout.write(`${name}: ${tools.length} tool(s)${names.length > 0 ? `: ${names.join(', ')}` : ''}${extra}\n`);
       process.exit(0);
     } catch (err) {
       process.stderr.write(`klyro: mcp probe ${name} failed: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -693,15 +715,16 @@ async function main(): Promise<void> {
       process.stdout.write('hooks: none configured (.klyro/hooks.json, ~/.klyro/hooks.json)\n');
       return;
     }
-    for (const h of hooks) process.stdout.write(`${h.name} ${h.event} ${h.command}\n`);
+    for (const h of hooks) process.stdout.write(`${h.name} ${h.event}${h.matcher ? ` (${h.matcher})` : ''} ${h.command}\n`);
   });
-  program.command('agents [name] [extra...]').description('List agents (10.2), show one, or run: agents run <name> <task...>').action(async (name?: string, extra?: string[]) => {
-    const { BUILTIN_AGENTS } = await import('./agent/orchestrator.js');
+  program.command('agents [name] [extra...]').description('List agents (builtins + .klyro/agents/*.md), show one, or run: agents run <name> <task...>').action(async (name?: string, extra?: string[]) => {
+    const { listAllAgents } = await import('./agent/orchestrator.js');
+    const ALL = listAllAgents(process.cwd());
     // `klyro agents run <name> <task...>`: one-shot run under a named agent.
     if (name === 'run') {
       const [agentName, ...taskParts] = extra ?? [];
-      if (!agentName || !BUILTIN_AGENTS.some((a) => a.id === agentName)) {
-        process.stderr.write(`klyro: unknown agent: ${agentName ?? '(missing)'} (known: ${BUILTIN_AGENTS.map((a) => a.id).join(', ')})\n`);
+      if (!agentName || !ALL.some((a) => a.id === agentName)) {
+        process.stderr.write(`klyro: unknown agent: ${agentName ?? '(missing)'} (known: ${ALL.map((a) => a.id).join(', ')})\n`);
         process.exit(2);
       }
       const task = (taskParts ?? []).join(' ').trim();
@@ -718,18 +741,19 @@ async function main(): Promise<void> {
       process.exit(code);
     }
     if (!name) {
-      for (const a of BUILTIN_AGENTS) process.stdout.write(`${a.id} — ${a.description}\n`);
+      for (const a of ALL) process.stdout.write(`${a.id}${a.source && a.source !== 'builtin' ? ` (${a.source})` : ''} — ${a.description}\n`);
       return;
     }
-    const def = BUILTIN_AGENTS.find((a) => a.id === name);
+    const def = ALL.find((a) => a.id === name);
     if (!def) {
-      process.stderr.write(`klyro: unknown agent: ${name} (known: ${BUILTIN_AGENTS.map((a) => a.id).join(', ')})\n`);
+      process.stderr.write(`klyro: unknown agent: ${name} (known: ${ALL.map((a) => a.id).join(', ')})\n`);
       process.exit(2);
     }
     const tools = def.allowedTools ?? ['<inherited: all parent tools>'];
     const lines = [
       `agent: ${def.id}`,
       `description: ${def.description}`,
+      `source: ${def.source ?? 'builtin'}`,
       `tools (${tools.length}): ${tools.join(', ')}`,
       `readonly: ${def.readonly ?? false}`,
       `canSpawn: ${def.canSpawn ?? false}`,
@@ -737,6 +761,7 @@ async function main(): Promise<void> {
       `maxSteps: ${def.maxSteps ?? '<default>'}`,
       `maxTokens: ${def.maxTokens ?? '<default>'}`,
     ];
+    if (def.prompt) lines.push(`prompt: ${def.prompt.slice(0, 200)}${def.prompt.length > 200 ? '…' : ''}`);
     process.stdout.write(lines.join('\n') + '\n');
   });
 

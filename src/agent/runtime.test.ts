@@ -664,8 +664,52 @@ describe('runtime: level-7 telemetry', () => {
     expect(seen[1]?.suffix).toMatch(/Last error: user_denied: shell_exec/);
   });
 
-  it('never executes malformed tool calls — structured MALFORMED_TOOL_CALL instead', async () => {
+  it('edit-and-retry executes the edited input after re-validation', async () => {
     const { z } = await import('zod');
+    const { defineTool } = await import('../tools/types.js');
+    const seen: unknown[] = [];
+    const reg = new ToolRegistry().register(defineTool({
+      name: 'probe_edit',
+      description: 'probe',
+      inputSchema: z.object({ command: z.string() }),
+      permission: 'execute' as const,
+      isConcurrencySafe: true,
+      execute: async (input) => { seen.push((input as { command: string }).command); return { ok: true as const, value: {} }; },
+    }));
+    // No rules match probe_edit → privileged default-ask (interactive).
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'probe_edit' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{"command":"rm -rf /"}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'ok' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    let asks = 0;
+    const approval = {
+      ask: async () => {
+        asks++;
+        if (asks === 1) return { kind: 'edit', editedInput: { command: 'echo safe' } } as const;
+        return 'allow' as const;
+      },
+    };
+    const r = await run(
+      { task: 'edit-retry', cwd, model: 'mock', maxSteps: 3, nonInteractive: false },
+      { adapter, registry: reg, policy, approval, systemPrompt: defaultSystemPrompt },
+    );
+    // Original dangerous input never executed; edited input ran once.
+    expect(seen).toEqual(['echo safe']);
+    expect(r.toolCalls).toBe(1);
+  });
+
+  it('never executes malformed tool calls — structured MALFORMED_TOOL_CALL instead', async () => {    const { z } = await import('zod');
     const { defineTool } = await import('../tools/types.js');
     let executed = 0;
     const reg = new ToolRegistry().register(defineTool({

@@ -1,17 +1,25 @@
 /**
- * Hooks engine (10.2) — preToolUse / postToolUse shell hooks.
+ * Hooks engine (10.2, v2) — lifecycle + tool shell hooks.
+ *
+ * Events: `preToolUse` / `postToolUse` (per tool call), `sessionStart`
+ * (once per run, may abort it), `sessionEnd` (once per run, best-effort),
+ * `stop` (after each agent step).
  *
  * Config files:
  *   - project: `<cwd>/.klyro/hooks.json`
  *   - global:  `~/.klyro/hooks.json` (merged; project wins on name clash)
  *
- * Schema: `{ hooks: Array<{ name, event, command, timeoutMs? }> }`.
+ * Schema: `{ hooks: Array<{ name, event, command, matcher?, timeoutMs? }> }`.
+ * `matcher` is a regex tested against the tool name — lifecycle events
+ * (`sessionStart`/`sessionEnd`/`stop`) always match; tool events without a
+ * matcher match every tool.
  *
  * `loadHooks` never throws — a missing file is `[]`, an invalid file is
  * `[]` plus a one-time stderr warning per path. `runHook` spawns the
  * command with `shell: true` (commands are strings, must work on win +
- * posix), a default 30s timeout, a filtered env, plus `KLYRO_TOOL_NAME`
- * and `KLYRO_TOOL_INPUT_JSON` for the hook's inspection.
+ * posix), a default 30s timeout, a filtered env, `KLYRO_TOOL_NAME` /
+ * `KLYRO_TOOL_INPUT_JSON` for inspection, AND the full JSON payload on
+ * stdin (`{ event, tool, input, sessionId, ... }`).
  */
 
 import { spawn } from 'node:child_process';
@@ -20,10 +28,15 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { z } from 'zod';
 
+export const HookEventSchema = z.enum(['preToolUse', 'postToolUse', 'sessionStart', 'sessionEnd', 'stop']);
+export type HookEvent = z.infer<typeof HookEventSchema>;
+
 export const HookSchema = z.object({
   name: z.string().min(1),
-  event: z.enum(['preToolUse', 'postToolUse']),
+  event: HookEventSchema,
   command: z.string().min(1),
+  /** Optional regex matched against the tool name (tool events only). */
+  matcher: z.string().min(1).optional(),
   timeoutMs: z.number().int().positive().optional(),
 });
 
@@ -133,11 +146,44 @@ export interface HookContext {
   input: unknown;
 }
 
+/** Lifecycle payload delivered on stdin (and merged into env where small). */
+export interface HookPayload {
+  event: HookEvent;
+  tool?: string;
+  input?: unknown;
+  sessionId?: string;
+  cwd?: string;
+  status?: string;
+  step?: number;
+}
+
+/**
+ * Select hooks for an event. Tool events honor `matcher` (regex against the
+ * tool name; invalid regex never matches); lifecycle events always match.
+ * Exported pure for unit tests.
+ */
+export function hooksForEvent(hooks: Hook[], event: HookEvent, toolName?: string): Hook[] {
+  return hooks.filter((h) => {
+    if (h.event !== event) return false;
+    if (h.matcher === undefined) return true;
+    if (toolName === undefined) return true; // lifecycle events have no tool
+    try {
+      return new RegExp(h.matcher).test(toolName);
+    } catch {
+      return false;
+    }
+  });
+}
+
 /**
  * Run one hook. Resolves (never rejects) with the exit code + sliced
  * output. `ok` is true only when the process exited 0.
+ *
+ * `stdinJson` (when given) is written to the child's stdin as JSON —
+ * the primary contract (mirrors CC's stdin-JSON hooks); the env vars are
+ * kept as a convenience for shell one-liners.
  */
-export function runHook(hook: Hook, ctx: HookContext): Promise<HookResult> {
+export function runHook(hook: Hook, ctx: HookContext, stdinJson?: unknown): Promise<HookResult> {
   const timeoutMs = hook.timeoutMs ?? DEFAULT_HOOK_TIMEOUT_MS;
   return new Promise((resolve) => {
     let env: NodeJS.ProcessEnv;
@@ -154,6 +200,12 @@ export function runHook(hook: Hook, ctx: HookContext): Promise<HookResult> {
     } catch {
       env.KLYRO_TOOL_INPUT_JSON = '{}';
     }
+    let payload = '';
+    try {
+      payload = JSON.stringify(stdinJson ?? { event: 'preToolUse', tool: ctx.toolName, input: ctx.input ?? {} });
+    } catch {
+      payload = '{}';
+    }
     let child;
     try {
       child = spawn(hook.command, {
@@ -162,6 +214,7 @@ export function runHook(hook: Hook, ctx: HookContext): Promise<HookResult> {
         windowsHide: true,
         timeout: timeoutMs,
         env,
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
       resolve({ ok: false, exitCode: -1, stdout: '', stderr: String(err instanceof Error ? err.message : err).slice(0, MAX_HOOK_OUTPUT_CHARS) });
@@ -189,5 +242,38 @@ export function runHook(hook: Hook, ctx: HookContext): Promise<HookResult> {
         stderr: stderr.slice(0, MAX_HOOK_OUTPUT_CHARS),
       });
     });
+    // Deliver the stdin JSON contract, then close so the child never hangs
+    // waiting for EOF. Write errors (EPIPE on early exit) are ignored —
+    // the exit code below is what matters.
+    try {
+      if (child.stdin) {
+        child.stdin.on('error', () => undefined);
+        child.stdin.write(payload);
+        child.stdin.end();
+      }
+    } catch { /* ignore */ }
   });
+}
+
+/**
+ * Run all `sessionEnd` hooks for a finished run (best-effort, sequential).
+ * Returns hook outputs for logging. Never throws.
+ */
+export async function runSessionEndHooks(cwd: string, sessionId: string | undefined, status: string): Promise<Array<{ name: string; ok: boolean; output: string }>> {
+  const out: Array<{ name: string; ok: boolean; output: string }> = [];
+  let hooks: Hook[];
+  try {
+    hooks = hooksForEvent(loadHooks(cwd), 'sessionEnd');
+  } catch {
+    return out;
+  }
+  for (const h of hooks) {
+    try {
+      const r = await runHook(h, { toolName: '', input: {} }, { event: 'sessionEnd', sessionId, cwd, status });
+      out.push({ name: h.name, ok: r.ok, output: (r.stdout || r.stderr || '').slice(0, 2000) });
+    } catch {
+      out.push({ name: h.name, ok: false, output: '' });
+    }
+  }
+  return out;
 }

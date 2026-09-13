@@ -830,8 +830,39 @@ describe('App', () => {
     expect(frame).not.toMatch(/hunter2-hunter2/);
   });
 
-  it('vim normal mode swallows typing, shows mode, i returns to insert', async () => {
+  it('vim counts, word motions, and dd edit the buffer', async () => {
     let hooks: { setVimMode: (m: 'insert' | 'normal') => void } | null = null;
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={false}
+        onMounted={(h) => {
+          hooks = { setVimMode: h.setVimMode };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write('abcdef');
+    await waitForMatch(lastFrame, /abcdef/);
+    hooks!.setVimMode('normal');
+    await waitForMatch(lastFrame, /--NORMAL--/);
+    // 0 then 3x deletes three chars → 'def'
+    stdin.write('0');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('3');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('x');
+    await waitForMatch(lastFrame, /def/);
+    expect(lastFrame() ?? '').not.toMatch(/abcdef/);
+    // dd clears the single-line buffer
+    stdin.write('d');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('d');
+    await waitForMatch(lastFrame, /Message Klyro/);
+  });
+
+  it('vim normal mode swallows typing, shows mode, i returns to insert', async () => {    let hooks: { setVimMode: (m: 'insert' | 'normal') => void } | null = null;
     const { stdin, lastFrame } = render(
       <App
         initialModel="m" maxSteps={10} cwd="/test"

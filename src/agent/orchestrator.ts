@@ -30,6 +30,7 @@ import {
   type ResolveToolsInput,
 } from './capabilities.js';
 import { forkChild, workerEntryPath, type ChildWorkerPayload, type ChildCrashError } from './child-worker.js';
+import { loadCustomAgents } from './custom-agents.js';
 import { resolveAndFollowSymlinks } from '../policy/path-guard.js';
 import {
   ensureGitRepo,
@@ -67,6 +68,13 @@ export interface AgentDefinition {
    * spawn time (`undefined` = no additional constraint).
    */
   allowedPaths?: string[];
+  /**
+   * Specialist instructions (from `.klyro/agents/*.md` body or programmatic
+   * defs). Prepended to the delegated task at spawn time.
+   */
+  prompt?: string;
+  /** Where the definition came from (builtins omit this = 'builtin'). */
+  source?: 'builtin' | 'project' | 'global';
 }
 
 /** Default agents a model can delegate to. */
@@ -115,8 +123,7 @@ export const BUILTIN_AGENTS: readonly AgentDefinition[] = [
   },
 ];
 
-/** Compact summary returned to the parent — the child's transcript stays separate. */
-export interface ChildSummary {
+/** Compact summary returned to the parent — the child's transcript stays separate. */export interface ChildSummary {
   taskId: string;
   agentName: string;
   status: TaskStatus;
@@ -199,6 +206,30 @@ export interface OrchestratorOpts {
    * always isolate. Defaults to false.
    */
   isTui?: boolean;
+  /**
+   * Working directory used to discover custom agents
+   * (`.klyro/agents/*.md`). Defaults to `process.cwd()`.
+   */
+  cwd?: string;
+}
+
+/**
+ * All agents: builtins plus custom `.klyro/agents/*.md` definitions.
+ * Custom ids win on clash (including overriding a builtin) — the override
+ * is surfaced via `source`. No instance needed; used by CLI + spawn paths.
+ */
+export function listAllAgents(cwd?: string): AgentDefinition[] {
+  const byId = new Map<string, AgentDefinition>();
+  for (const d of BUILTIN_AGENTS) byId.set(d.id, { ...d, source: 'builtin' });
+  try {
+    for (const d of loadCustomAgents(cwd ?? process.cwd())) byId.set(d.id, d);
+  } catch { /* custom agents are best-effort */ }
+  return [...byId.values()];
+}
+
+/** Find one agent by id across builtins + custom files. */
+export function findAgent(id: string, cwd?: string): AgentDefinition | undefined {
+  return listAllAgents(cwd).find((a) => a.id === id);
 }
 
 /** Map a runtime `RunResult.status` to a task status. */
@@ -266,6 +297,7 @@ export class AgentOrchestrator {
   readonly taskManager: TaskManager;
   readonly workerSpawner: WorkerSpawner;
   readonly isTui: boolean;
+  private readonly customCwd: string | undefined;
   /** Per-task spawn metadata: capability drops + worktree placement. */
   private readonly taskMeta = new Map<
     string,
@@ -280,14 +312,15 @@ export class AgentOrchestrator {
     this.taskManager = opts.taskManager ?? new TaskManager({ sessionId: opts.sessionId });
     this.workerSpawner = opts.workerSpawner ?? new WorkerSpawner();
     this.isTui = opts.isTui ?? false;
+    this.customCwd = opts.cwd;
   }
 
   listAgents(): AgentDefinition[] {
-    return [...BUILTIN_AGENTS];
+    return listAllAgents(this.customCwd);
   }
 
   getAgent(id: string): AgentDefinition | undefined {
-    return BUILTIN_AGENTS.find((a) => a.id === id);
+    return listAllAgents(this.customCwd).find((a) => a.id === id);
   }
 
   /** Build the bridge the parent's runtime hands to tools. */
@@ -518,8 +551,12 @@ export class AgentOrchestrator {
       ...(resolved.allowedPaths !== undefined ? { allowedPaths: resolved.allowedPaths } : {}),
     };
 
+    // Specialist instructions from `.klyro/agents/*.md` (or programmatic
+    // defs) ride with the delegated task on both paths below.
+    const childTask = def.prompt ? `${def.prompt}\n\n---\n\n${input.task}` : input.task;
+
     const childOptions: RunOptions = {
-      task: input.task,
+      task: childTask,
       cwd: childCwd,
       model: childModel ?? 'inherit', // model override must reach the adapter (see runtime)
       maxSteps: def.maxSteps,
@@ -582,7 +619,7 @@ export class AgentOrchestrator {
           const systemPrompt = sysPrompt.suffix ? `${sysPrompt.system}\n${sysPrompt.suffix}` : sysPrompt.system;
           const payload: ChildWorkerPayload = {
             cwd: childCwd,
-            task: input.task,
+            task: childTask,
             // A concrete provider model must reach the child — 'inherit' only
             // exists to defer resolution inside the parent's run().
             model: (childModel ?? parent.model) as string,
