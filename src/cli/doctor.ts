@@ -114,6 +114,17 @@ function checkPlatform(): Check {
   return { name: 'Platform', ok, detail: `${process.platform} ${process.arch} ${ok ? '✓' : '✗ unsupported'}` };
 }
 
+async function checkSandbox(): Promise<Check> {
+  try {
+    const { detectSandbox } = await import('../tools/shell/sandbox.js');
+    const st = detectSandbox();
+    if (st.active) return { name: 'Sandbox', ok: true, detail: `${st.backend} ✓` };
+    return { name: 'Sandbox', ok: true, detail: `none — ${st.reason ?? 'policy+path guards only'}` };
+  } catch {
+    return { name: 'Sandbox', ok: true, detail: 'none — policy+path guards only' };
+  }
+}
+
 async function checkMcp(cwd: string): Promise<Check> {
   try {
     const { loadMcpServers } = await import('../mcp/config.js');
@@ -170,6 +181,7 @@ export async function runDoctor(opts: { json?: boolean; cwd?: string } = {}): Pr
   checks.push(await checkGit());
   checks.push(await checkTools());
   checks.push(checkPlatform());
+  checks.push(await checkSandbox());
   const mcpCheck = await checkMcp(cwd);
   const trustCheck = await checkTrust();
   checks.push(mcpCheck);

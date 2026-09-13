@@ -31,12 +31,14 @@ import { detectVerifyCommand } from '../verification/auto.js';
 import { detectVerifiers } from '../verification/registry.js';
 import { ensureBaseline, getBaseline } from '../verification/baseline.js';
 import { compressTranscript, totalTokens, calibrateEstimate, transcriptCharLength } from '../context/tokenizer.js';
+import { capForModel } from '../context/accounting.js';
 import { ratesFor, isAnthropicModel } from '../providers/model-info.js';
 import { classifyFailure, rerunOnce, gatherRepairContext, guardRepair } from '../verification/classify.js';
 import { findRelatedTests, buildScopedCommand, runScopedVerify, syntaxCheck, checkImports } from '../verification/scoped.js';
 import { EventBus, globalBus } from '../events/bus.js';
 import type { KlyroEvent } from '../events/catalog.js';
 import { TraceWriter } from '../trace/writer.js';
+import { killAllJobs } from '../tools/shell/background.js';
 import { loadHooks, runHook, type Hook } from '../cli/hooks.js';
 
 /**
@@ -463,6 +465,9 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     }
     if (opts.signal?.aborted) {
       emit?.({ kind: 'aborted' });
+      // Abort cascade (fix: background shells must not outlive the run).
+      const killed = killAllJobs();
+      emitKlyro({ type: 'abort', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', reason: killed.length > 0 ? `aborted by operator (${killed.length} background job(s) killed)` : 'aborted by operator' });
       if (store && sessionId) {
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
@@ -486,7 +491,9 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     // Budget accounting sees what the model sees (prefix + suffix); the
     // request itself keeps the halves split for cache-friendly adapters.
     const systemForBudget = telemetrySuffix ? `${stableSystem}\n\n${telemetrySuffix}` : stableSystem;
-    const BUDGET = { total: 120_000, reservedOutput: 4000 };
+    // Window-aware ceiling (was a hardcoded 120k that overflowed 8k local
+    // models): size the input budget to the model's context window.
+    const BUDGET = { total: capForModel(opts.model, 4000), reservedOutput: 4000 };
     let reqMessages = transcript;
     let reqSystem: string | undefined = stableSystem;
     let reqSuffix: string | undefined = telemetrySuffix;
@@ -706,6 +713,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     if (opts.signal?.aborted) {
       finalText = textBuf;
       emit?.({ kind: 'aborted' });
+      const killed = killAllJobs();
+      emitKlyro({ type: 'abort', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', reason: killed.length > 0 ? `aborted by operator (${killed.length} background job(s) killed)` : 'aborted by operator' });
       if (store && sessionId) {
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
@@ -976,7 +985,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     // Returns true when the call is approved for execution.
     const gateCall = async (call: typeof finalizedCalls[number]): Promise<boolean> => {
       const decision = await deps.policy.evaluate(
-        { name: call.name, input: call.input },
+        { name: call.name, input: call.input, permission: deps.registry.get(call.name)?.permission },
         { cwd: opts.cwd, nonInteractive: opts.nonInteractive },
       );
       emit?.({ kind: 'policy_decision', id: call.id, name: call.name, action: decision.action, ...(decision.action !== 'allow' ? { reason: (decision as { reason?: string }).reason } : {}) });

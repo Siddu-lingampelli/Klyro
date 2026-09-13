@@ -26,6 +26,35 @@ node dist/index.js chat "Explain TypeScript in 2 sentences"
 node dist/index.js chat
 ```
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success / complete |
+| 1 | Unexpected failure (last-resort handler) |
+| 2 | Usage / config error, policy refusal to commit, unknown command or option |
+| 3 | Config invalid / not found |
+| 4 | Provider error (auth, rate-limit, timeout) |
+| 5 | No final answer from provider |
+| 7 | Stopped: max steps, cost/time limit, or stuck |
+| 8 | Verification failed (or `--require-verify` unsatisfied) |
+| 130 | Aborted (Ctrl+C / Esc×2 / /cancel / SIGINT) |
+
+## Environment
+
+| Variable | Scope |
+|---|---|
+| `KLYRO_BASE_URL`, `KLYRO_API_KEY`, `KLYRO_MODEL`, `KLYRO_PROVIDER` | Provider selection |
+| `KLYRO_CONFIG` / `--config` | Config file override |
+| `KLYRO_YES` / `--yes` | **Commit only** — auto-approves `klyro commit` prompts; nothing else reads it |
+| `KLYRO_NO_UPDATE_CHECK=1` | Disables the 24h update check |
+| `KLYRO_ALLOW_MAIN_PUSH=1` | Per-risk escape for protected-branch push |
+| `KLYRO_CREDENTIALS_INSECURE_OK=1` | Warn (don't refuse) on group-readable credentials |
+| `KLYRO_LSP=0` | Force language tools off |
+| `KLYRO_SYMBOLS=0` | Force `find_symbol` off |
+| `KLYRO_WORKER=0` | Disable subprocess isolation for subagents |
+| `KLYRO_SESSIONS_DIR`, `KLYRO_UPDATE_CACHE`, `KLYRO_CREDENTIALS_FILE` | Relocatable state (tests + power users) |
+
 ## Documentation
 
 | Doc | Purpose |

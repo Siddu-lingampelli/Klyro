@@ -1,5 +1,14 @@
 # Klyro — Correct Terminal TUI Scroll Implementation
 
+> STATUS (shipped): the OpenTUI `<scrollbox stickyScroll>` design below was
+> NOT adopted — `package.json` has no `@opentui/react`. The shipped TUI
+> renders with Ink and implements the same four-command vocabulary
+> (`messages_half_page_up/down/first/last`) on a measured anchor viewport:
+> `src/tui/scroll-model.ts` (anchor reducer), `src/tui/measure.ts`
+> (display-line measurement), `src/tui/transcript-commands.ts` (bindings),
+> `src/tui/mouse.ts` (wheel tap). Read this doc as the behavior spec, the
+> `src/tui/` modules as the implementation.
+
 **Goal:** Implement terminal scrolling like Cline using OpenTUI's native scrollbox.  
 Do not build a custom scroll engine or custom scroll math.
 

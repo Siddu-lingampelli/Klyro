@@ -24,6 +24,7 @@ import {
 } from './scroll-model.js';
 import { buildIndex, itemAtRow, MeasureCache, type BlockDesc } from './measure.js';
 import { renderMarkdownLines } from './markdown.js';
+import { redact } from '../policy/secret-redactor.js';
 import { readVersion } from '../version.js';
 import {
   getTranscriptCommand,
@@ -41,7 +42,7 @@ export interface AppProps {
   initialTranscript?: TranscriptItem[];
   initialStatus?: Partial<StatusSnapshot>;
   approvalBridge?: TuiApprovalBridge;
-  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void; scrollHalfPage: (dir: -1 | 1) => void; scrollToTop: () => void; transcript: TranscriptScrollHandle; updateTool: (idCall: string, patch: ToolResultPatch) => void; appendThinkingDelta: (text: string) => void; clearThinking: () => void }) => void;
+  onMounted?: (hooks: { append: (i: TranscriptItem) => void; appendDelta: (text: string) => void; updateStatus: (s: Partial<StatusSnapshot>) => void; updatePlan: (p: PlanStep[]) => void; clearTranscript: () => void; scrollLines: (delta: number) => void; scrollToBottom: () => void; scrollHalfPage: (dir: -1 | 1) => void; scrollToTop: () => void; transcript: TranscriptScrollHandle; updateTool: (idCall: string, patch: ToolResultPatch) => void; appendThinkingDelta: (text: string) => void; clearThinking: () => void; pasteText: (text: string) => void; setVimMode: (mode: 'insert' | 'normal') => void }) => void;
   version?: string;
   isFullscreen?: boolean;
 }
@@ -115,6 +116,35 @@ function groupTools(items: TranscriptItem[]): Array<TranscriptItem | Group> {
   flush(); return out;
 }
 
+// Input line with an explicit block cursor for vim normal mode.
+// Same single-<Text> invariant as MarkdownText: nested inline parts only,
+// so the row-direction parent never lays siblings out as columns.
+function InputWithCursor({ input, cursor }: { input: string; cursor: number | null }) {
+  const dimColor = tokens.colors.dim as string;
+  if (!input) {
+    return (
+      <Text wrap="wrap">
+        <Text color={dimColor}>Message Klyro...</Text>|
+      </Text>
+    );
+  }
+  const safe = redact(input);
+  if (cursor === null) {
+    return <Text wrap="wrap">{safe}|</Text>;
+  }
+  const pos = Math.max(0, Math.min(cursor, safe.length));
+  const before = safe.slice(0, pos);
+  const ch = safe.slice(pos, pos + 1) || ' ';
+  const after = safe.slice(pos + 1);
+  return (
+    <Text wrap="wrap">
+      {before}
+      <Text inverse>{ch}</Text>
+      {after}
+    </Text>
+  );
+}
+
 // design.md §23/§24 — terminal Markdown via tui/markdown.ts: headings,
 // **bold**, *italic*, `code`, fences, links, lists. Ink wraps the text.
 //
@@ -123,7 +153,9 @@ function groupTools(items: TranscriptItem[]): Array<TranscriptItem | Group> {
 // out as side-by-side COLUMNS (garbled transcript) instead of lines.
 function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width?: number }) {
   void width;
-  const lines = useMemo(() => renderMarkdownLines(text), [text]);
+  // Display boundary: scrub secret shapes before painting the screen.
+  // Execution data is untouched — this only affects rendered output.
+  const lines = useMemo(() => renderMarkdownLines(redact(text)), [text]);
   const dimColor = tokens.colors.dim as string;
   const softColor = tokens.colors.soft as string;
   return (
@@ -276,6 +308,53 @@ export function App(props: AppProps): React.JSX.Element {
     const t = setTimeout(toBottom, 0);
     return () => clearTimeout(t);
   }, [submitKey]);
+  // Double-Esc convention: the first Esc while running only arms (with a
+  // status hint); a second Esc within 1500ms cancels the stream. Single-Esc
+  // immediate cancel was too easy to hit by accident next to Shift+Enter.
+  const escArmedAt = useRef(0);
+  const [escArmed, setEscArmed] = useState(false);
+  const escArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disarmEsc = useCallback(() => {
+    escArmedAt.current = 0;
+    setEscArmed(false);
+    if (escArmTimer.current) { clearTimeout(escArmTimer.current); escArmTimer.current = null; }
+  }, []);
+  // Minimal vim input mode (/vim toggles live via directHooks.setVimMode).
+  // Normal mode: h/l/0/$ move, x deletes, i/a enter insert, j/k scroll a
+  // line; every other printable key is swallowed (never typed). The cursor
+  // is an explicit index (null = end); rendering clamps it.
+  const [vimMode, setVimMode] = useState<'insert' | 'normal'>('insert');
+  const [vimCursor, setVimCursor] = useState<number | null>(null);
+  const setVimModeLive = useCallback((m: 'insert' | 'normal') => {
+    setVimMode(m);
+    if (m === 'insert') setVimCursor(null);
+  }, []);
+  // Cursor-aware editing: mirrors for synchronous use inside key handlers.
+  const inputRef = useRef('');
+  const vimCursorRef = useRef<number | null>(null);
+  useEffect(() => { inputRef.current = input; }, [input]);
+  useEffect(() => { vimCursorRef.current = vimCursor; }, [vimCursor]);
+  const clampCursor = (v: string, c: number | null): number =>
+    c === null ? v.length : Math.max(0, Math.min(c, v.length));
+  const insertAtCursor = useCallback((text: string) => {
+    const t = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    if (!t) return;
+    const v = inputRef.current;
+    const pos = clampCursor(v, vimCursorRef.current);
+    const nv = v.slice(0, pos) + t + v.slice(pos);
+    setInput(nv);
+    setVimCursor(pos + t.length >= nv.length ? null : pos + t.length);
+    setHistIdx(null);
+  }, []);
+  const deleteBeforeCursor = useCallback(() => {
+    const v = inputRef.current;
+    const pos = clampCursor(v, vimCursorRef.current);
+    if (pos === 0) return;
+    const nv = v.slice(0, pos - 1) + v.slice(pos);
+    setInput(nv);
+    setVimCursor(pos - 1 >= nv.length ? null : pos - 1);
+    setHistIdx(null);
+  }, []);
   // Shift+Enter intent: explicit shift+return, kitty/CSI-u sequence, legacy
   // ESC+CR pair, or Esc immediately followed by Return (75ms, non-empty input).
   const escReturnAt = useRef(0);
@@ -288,6 +367,63 @@ export function App(props: AppProps): React.JSX.Element {
     top: () => {},
     reset: () => {},
   });
+
+  // Streaming render throttle: per-token setState copies the whole
+  // transcript array AND the growing string (O(n²) over long streams).
+  // Deltas accumulate in refs (the truth) and flush to state at most
+  // every STREAM_FLUSH_MS, plus on turn end / new items. Renders stay
+  // live (≤64ms stale) while array+string copies stay bounded.
+  // Declared early: queued-input and key handlers below call resetStream.
+  const STREAM_FLUSH_MS = 64;
+  const streamTextRef = useRef('');
+  const streamFlushAt = useRef(0);
+  const streamTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const thinkingTextRef = useRef('');
+  const thinkingFlushAt = useRef(0);
+  const thinkingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Declared before the flush callbacks that capture it.
+  const thinkingIdRef = useRef<string | null>(null);
+  const flushStream = useCallback(() => {
+    const sid = streamingIdRef.current;
+    if (streamTimer.current) { clearTimeout(streamTimer.current); streamTimer.current = null; }
+    if (!sid) return;
+    const text = streamTextRef.current;
+    streamFlushAt.current = Date.now();
+    setTranscript((prev) => {
+      const idx = prev.findIndex((x) => x.id === sid);
+      if (idx === -1) return [...prev, { id: sid, kind: 'text', text, role: 'assistant' } as TranscriptItem];
+      const cur = prev[idx] as Extract<TranscriptItem, { kind: 'text' }>;
+      if (cur.text === text) return prev;
+      const copy = [...prev]; copy[idx] = { ...cur, text } as TranscriptItem; return copy;
+    });
+  }, []);
+  const flushThinking = useCallback(() => {
+    const tid = thinkingIdRef.current;
+    if (thinkingTimer.current) { clearTimeout(thinkingTimer.current); thinkingTimer.current = null; }
+    if (!tid) return;
+    const text = thinkingTextRef.current;
+    thinkingFlushAt.current = Date.now();
+    setTranscript((prev) => {
+      const idx = prev.findIndex((x) => x.id === tid);
+      if (idx === -1) return [...prev, { id: tid, kind: 'thinking', text } as TranscriptItem];
+      const cur = prev[idx] as Extract<TranscriptItem, { kind: 'thinking' }>;
+      if (cur.text === text) return prev;
+      const copy = [...prev]; copy[idx] = { ...cur, text } as TranscriptItem; return copy;
+    });
+  }, []);
+  const resetStream = useCallback(() => {
+    streamingIdRef.current = null; streamTextRef.current = '';
+    if (streamTimer.current) { clearTimeout(streamTimer.current); streamTimer.current = null; }
+  }, []);
+  const resetThinking = useCallback(() => {
+    thinkingIdRef.current = null; thinkingTextRef.current = '';
+    if (thinkingTimer.current) { clearTimeout(thinkingTimer.current); thinkingTimer.current = null; }
+  }, []);
+  // Flush pending tail before unmount so no trailing delta is lost.
+  useEffect(() => () => {
+    if (streamTimer.current) clearTimeout(streamTimer.current);
+    if (thinkingTimer.current) clearTimeout(thinkingTimer.current);
+  }, []);
 
   const width = stdout?.columns ?? 100;
   const height = stdout?.rows ?? 30;
@@ -439,40 +575,57 @@ export function App(props: AppProps): React.JSX.Element {
       const toSend = queuedInputs[0]!;
       setQueuedInputs((prev) => prev.slice(1));
       setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: toSend, role: 'user' } as TranscriptItem]);
-      streamingIdRef.current = null;
+      resetStream();
       const cmd = parseSlash(toSend.trim());
       if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd);
     }
-  }, [queuedInputs, status.status, awaitingApproval]);
+  }, [queuedInputs, status.status, awaitingApproval, resetStream]);
   useEffect(() => { if (status.status !== 'running') return; const start = Date.now() - elapsed; const t = setInterval(() => setElapsed(Date.now() - start), 1000); return () => clearInterval(t); }, [status.status, elapsed]);
 
-  const append = useCallback((item: TranscriptItem) => { if (item.kind !== 'text' || item.role !== 'assistant') streamingIdRef.current = null; setTranscript((prev) => [...prev, item]); }, []);
+  const append = useCallback((item: TranscriptItem) => {
+    if (item.kind !== 'text' || item.role !== 'assistant') { flushStream(); resetStream(); }
+    setTranscript((prev) => [...prev, item]);
+  }, [flushStream, resetStream]);
   const appendDelta = useCallback((text: string) => {
-    if (!text) return; const sid = streamingIdRef.current;
-    if (sid) setTranscript((prev) => { const idx = prev.findIndex((x) => x.id === sid); if (idx === -1) return [...prev, { id: sid, kind: 'text', text, role: 'assistant' } as TranscriptItem]; const cur = prev[idx] as Extract<TranscriptItem, { kind: 'text' }>; const copy = [...prev]; copy[idx] = { ...cur, text: cur.text + text } as TranscriptItem; return copy; });
-    else { const id = nextId('stream'); streamingIdRef.current = id; setTranscript((prev) => [...prev, { id, kind: 'text', text, role: 'assistant' } as TranscriptItem]); }
-  }, []);
+    if (!text) return;
+    if (!streamingIdRef.current) {
+      const id = nextId('stream'); streamingIdRef.current = id;
+      streamTextRef.current = ''; streamFlushAt.current = 0;
+    }
+    streamTextRef.current += text;
+    const now = Date.now();
+    if (now - streamFlushAt.current >= STREAM_FLUSH_MS) flushStream();
+    else if (!streamTimer.current) streamTimer.current = setTimeout(flushStream, STREAM_FLUSH_MS - (now - streamFlushAt.current));
+  }, [flushStream]);
   // Ephemeral reasoning display: merges into one transient item (never in
   // context/persistence); removed when the turn's answer completes.
-  const thinkingIdRef = useRef<string | null>(null);
   const appendThinkingDelta = useCallback((text: string) => {
-    if (!text) return; const tid = thinkingIdRef.current;
-    if (tid) setTranscript((prev) => { const idx = prev.findIndex((x) => x.id === tid); if (idx === -1) return [...prev, { id: tid, kind: 'thinking', text } as TranscriptItem]; const cur = prev[idx] as Extract<TranscriptItem, { kind: 'thinking' }>; const copy = [...prev]; copy[idx] = { ...cur, text: cur.text + text } as TranscriptItem; return copy; });
-    else { const id = nextId('thinking'); thinkingIdRef.current = id; setTranscript((prev) => [...prev, { id, kind: 'thinking', text } as TranscriptItem]); }
-  }, []);
+    if (!text) return;
+    if (!thinkingIdRef.current) {
+      const id = nextId('thinking'); thinkingIdRef.current = id;
+      thinkingTextRef.current = ''; thinkingFlushAt.current = 0;
+    }
+    thinkingTextRef.current += text;
+    const now = Date.now();
+    if (now - thinkingFlushAt.current >= STREAM_FLUSH_MS) flushThinking();
+    else if (!thinkingTimer.current) thinkingTimer.current = setTimeout(flushThinking, STREAM_FLUSH_MS - (now - thinkingFlushAt.current));
+  }, [flushThinking]);
   const clearThinking = useCallback(() => {
-    thinkingIdRef.current = null;
+    resetThinking();
     setTranscript((prev) => (prev.some((x) => x.kind === 'thinking') ? prev.filter((x) => x.kind !== 'thinking') : prev));
-  }, []);
+  }, [resetThinking]);
   useEffect(() => {
     if (status.status !== 'running') {
-      streamingIdRef.current = null;
-      thinkingIdRef.current = null;
+      // Turn end: flush any throttled tail first so the final text is
+      // complete, then drop the transient thinking block as before.
+      flushStream(); resetStream();
+      resetThinking();
+      disarmEsc();
       // Runs that end without final_text (abort/cancel/error) must not leave
       // stale thinking blocks behind — only the response may remain.
       setTranscript((prev) => (prev.some((x) => x.kind === 'thinking') ? prev.filter((x) => x.kind !== 'thinking') : prev));
     }
-  }, [status.status]);
+  }, [status.status, flushStream, resetStream, resetThinking, disarmEsc]);
   const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
   const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
   // Tool results patch the running start-item IN PLACE (no second item, so a
@@ -492,14 +645,14 @@ export function App(props: AppProps): React.JSX.Element {
     });
   }, []);
   const clearTranscript = useCallback(() => {
-    streamingIdRef.current = null;
-    thinkingIdRef.current = null;
+    resetStream();
+    resetThinking();
     setTranscript([]);
     setPlan([]);
     // Fresh content → fresh scroll (a pruned anchor would otherwise stick to
     // the bottom with a stale newSinceUnstick badge count).
     scrollCmdsRef.current.reset();
-  }, []);
+  }, [resetStream, resetThinking]);
   // Scroll control for external drivers (mouse-wheel tap in repl.ts, §8.4).
   // Stored in refs so the callbacks stay stable while acting on latest state.
   const scrollLines = useCallback((delta: number) => { scrollCmdsRef.current.line(delta); }, []);
@@ -530,7 +683,12 @@ export function App(props: AppProps): React.JSX.Element {
   );
   const onMountedRef = useRef(props.onMounted);
   useEffect(() => { onMountedRef.current = props.onMounted; }, [props.onMounted]);
-  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle, updateTool, appendThinkingDelta, clearThinking }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; (globalThis as unknown as Record<string, unknown>).__klyroAppendThinking = appendThinkingDelta; (globalThis as unknown as Record<string, unknown>).__klyroClearThinking = clearThinking; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendThinking; delete (globalThis as unknown as Record<string, unknown>).__klyroClearThinking; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle, updateTool, appendThinkingDelta, clearThinking]);
+  // Bracketed-paste bulk insert: one atomic input append (no per-char
+  // autocomplete/history side effects) with newline normalization.
+  const pasteText = useCallback((text: string) => {
+    insertAtCursor(text);
+  }, [insertAtCursor]);
+  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle, updateTool, appendThinkingDelta, clearThinking, pasteText, setVimMode: setVimModeLive }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; (globalThis as unknown as Record<string, unknown>).__klyroAppendThinking = appendThinkingDelta; (globalThis as unknown as Record<string, unknown>).__klyroClearThinking = clearThinking; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendThinking; delete (globalThis as unknown as Record<string, unknown>).__klyroClearThinking; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle, updateTool, appendThinkingDelta, clearThinking, pasteText, setVimModeLive]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
@@ -540,11 +698,12 @@ export function App(props: AppProps): React.JSX.Element {
     : [];
 
   useInput((inputStr, key) => {
-    if (key.escape && queuedInputs.length > 0) { setQueuedInputs((prev) => prev.slice(1)); return; }
+    if (key.escape && queuedInputs.length > 0) { setQueuedInputs((prev) => prev.slice(1)); disarmEsc(); return; }
     // Tab completes the top slash suggestion (e.g. `/c` → `/clear `)
     if ((key.tab || inputStr === '\t') && slashSuggest.length > 0) {
       const top = slashSuggest[0]!;
       setInput(`/${top.name} `);
+      setVimCursor(null);
       return;
     }
     // Scroll keys (work in any mode, including while running).
@@ -575,14 +734,44 @@ export function App(props: AppProps): React.JSX.Element {
       inputStr === '\x1b[13;2u' ||
       (key.return && input.trim() !== '' && now - escReturnAt.current < 75)
     ) {
-      setInput((v) => v + '\n');
+      insertAtCursor('\n');
       setHistIdx(null);
       return;
     }
+    // Vim normal mode: motion/editing keys act on the input buffer instead
+    // of typing. Return/arrows/tab/ctrl fall through to the shared logic
+    // below; every other printable key is swallowed.
+    if (vimMode === 'normal' && !awaitingApproval) {
+      // Legacy Shift+Enter partner: an Esc that just switched modes followed
+      // by Return within 75ms still means newline, not submit.
+      if (key.return && input.trim() !== '' && Date.now() - escReturnAt.current < 75) {
+        insertAtCursor('\n');
+        setVimMode('insert');
+        return;
+      }
+      const cur = vimCursor === null ? input.length : Math.max(0, Math.min(vimCursor, input.length));
+      const move = (d: number): boolean => { setVimCursor(Math.max(0, Math.min(cur + d, input.length))); return true; };
+      if (!key.ctrl && !key.meta && !key.return && !key.tab && !key.upArrow && !key.downArrow && !key.leftArrow && !key.rightArrow) {
+        if (inputStr === 'i') { setVimMode('insert'); setVimCursor(null); return; }
+        if (inputStr === 'a') { setVimCursor(Math.min(cur + 1, input.length)); setVimMode('insert'); return; }
+        if (inputStr === 'h') { move(-1); return; }
+        if (inputStr === 'l') { move(1); return; }
+        if (inputStr === '0') { setVimCursor(0); return; }
+        if (inputStr === '$') { setVimCursor(input.length); return; }
+        if (inputStr === 'x') { if (cur < input.length) setInput(input.slice(0, cur) + input.slice(cur + 1)); setHistIdx(null); return; }
+        if (inputStr === 'j') { if (isFullscreen && maxTop > 0) commands.lineDown(); return; }
+        if (inputStr === 'k') { if (isFullscreen && maxTop > 0) commands.lineUp(); return; }
+        if (key.backspace || key.delete) { move(-1); return; }
+        if (key.escape) return; // already normal
+        if (inputStr) return; // swallow everything else printable
+      } else if (key.backspace || key.delete) {
+        move(-1);
+        return;
+      }
+    }
     if (status.status === 'running') {
       // design.md §18: first Ctrl+C cancels the run, second quits.
-      if (key.ctrl && inputStr === 'c') {
-        if (!ctrlCArmed.current) {
+      if (key.ctrl && inputStr === 'c') {        if (!ctrlCArmed.current) {
           ctrlCArmed.current = true;
           void props.onSlash({ kind: 'cancel' });
         } else {
@@ -590,12 +779,26 @@ export function App(props: AppProps): React.JSX.Element {
         }
         return;
       }
-      // Esc with an empty queue cancels streaming (§18); non-empty drops one (top).
-      if (key.escape) { void props.onSlash({ kind: 'cancel' }); return; }
+      // Esc no longer cancels on first press: with a queued item it drops
+      // one; otherwise the first Esc arms and the second (≤1500ms) cancels.
+      if (key.escape) {
+        if (queuedInputs.length > 0) { setQueuedInputs((prev) => prev.slice(1)); disarmEsc(); return; }
+        const t = Date.now();
+        if (t - escArmedAt.current < 1500) {
+          disarmEsc();
+          void props.onSlash({ kind: 'cancel' });
+        } else {
+          escArmedAt.current = t;
+          setEscArmed(true);
+          if (escArmTimer.current) clearTimeout(escArmTimer.current);
+          escArmTimer.current = setTimeout(disarmEsc, 1500);
+        }
+        return;
+      }
       // Enter on empty input dismisses the badge (jump to bottom, §7.2)
-      if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } if (queuedInputs.length >= 3) return; setQueuedInputs((prev) => [...prev, v]); setInput(''); pushHistory(v); setSubmitKey((k) => k + 1); return; }
-      if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); return; }
-      if (!key.ctrl && !key.meta) setInput((v) => v + inputStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
+      if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } if (queuedInputs.length >= 3) return; setQueuedInputs((prev) => [...prev, v]); setInput(''); setVimCursor(null); pushHistory(v); setSubmitKey((k) => k + 1); return; }
+      if (key.backspace || key.delete) { deleteBeforeCursor(); return; }
+      if (!key.ctrl && !key.meta) insertAtCursor(inputStr);
       return;
     }
     // design.md §18: idle Ctrl+C exits.
@@ -608,6 +811,7 @@ export function App(props: AppProps): React.JSX.Element {
           const next = histIdx === null ? history.length - 1 : Math.max(0, histIdx - 1);
           setHistIdx(next);
           setInput(history[next] ?? '');
+          setVimCursor(null);
         }
         return;
       }
@@ -618,15 +822,18 @@ export function App(props: AppProps): React.JSX.Element {
         const next = histIdx + 1;
         if (next >= history.length) { setHistIdx(null); setInput(''); }
         else { setHistIdx(next); setInput(history[next] ?? ''); }
+        setVimCursor(null);
         return;
       }
       if (input.trim() !== '') return; // single line with text, nothing newer
       if (isFullscreen && maxTop > 0) { commands.lineDown(); return; }
     }
     // Enter on empty input dismisses the badge (jump to bottom, §7.2)
-    if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } setInput(''); setHistIdx(null); pushHistory(v); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); streamingIdRef.current = null; setSubmitKey((k) => k + 1); const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
-    if (key.backspace || key.delete) { setInput((v) => v.slice(0, -1)); setHistIdx(null); return; }
-    if (!key.ctrl && !key.meta) { setInput((v) => v + inputStr); setHistIdx(null); }
+    if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } setInput(''); setVimCursor(null); setHistIdx(null); pushHistory(v); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); resetStream(); setSubmitKey((k) => k + 1); const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
+    if (key.backspace || key.delete) { deleteBeforeCursor(); return; }
+    if (!key.ctrl && !key.meta) { insertAtCursor(inputStr); }
+    // Idle Esc enters vim normal mode (vimLive parity for keyboard-only users).
+    if (key.escape && vimMode === 'insert') { setVimMode('normal'); setVimCursor(inputRef.current.length); return; }
   });
 
   // Single source of truth: package.json via version.ts — never hardcoded.
@@ -638,9 +845,12 @@ export function App(props: AppProps): React.JSX.Element {
   const ctxWindow = getModelInfo(status.model).contextWindow;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / ctxWindow) * 100) : 0;
   // Narrow terminals: compact hints so the status bar never wraps mid-word.
-  const baseHints = width < 90
-    ? status.status === 'running' ? 'ctrl+c stop · enter queue' : 'enter send · / commands'
-    : status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑/↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
+  // An armed first-Esc surfaces here so the operator knows the second cancels.
+  const baseHints = escArmed && status.status === 'running'
+    ? 'press esc again to cancel'
+    : width < 90
+      ? status.status === 'running' ? 'ctrl+c stop · enter queue' : 'enter send · / commands'
+      : status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑/↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
   const hints = maxTop > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
 
   // I1 structural guard: the frame can never exceed terminal rows. Even if a
@@ -677,14 +887,14 @@ export function App(props: AppProps): React.JSX.Element {
                   <Box>
                     <Text color={tokens.colors.guide as string}>  {g('guide')}   </Text>
                     {running ? <Text color={markerColor}><Spinner type="dots" /> </Text> : null}
-                    <Text color={markerColor}>{marker} {verbLine}</Text>
+                    <Text color={markerColor}>{marker} {redact(verbLine)}</Text>
                     <Text color={tokens.colors.dim as string}>  {right}</Text>
                   </Box>
                   {isExpanded ? (<>
                     {gr.items.slice(0, 12).map((it) => {
                       let friendly = '';
                       try { const a = JSON.parse(it.args) as Record<string, unknown>; const p = (a.path as string) ?? (a.pattern as string) ?? (a.command as string) ?? ''; const short = p ? String(p).split('/').pop()?.slice(0, 40) ?? p : ''; if (it.name === 'read_file' && short) friendly = `${short}`; else if (it.name === 'shell_exec' && p) friendly = `$ ${String(p).slice(0, 40)}`; else if (short) friendly = short; else friendly = it.args.slice(0, 40); } catch { friendly = it.args.slice(0, 40); }
-                      return (<Box key={it.id} paddingLeft={4}><Text color={tokens.colors.guide as string}>{g('end')} </Text><Text color={tokens.colors.dim as string}>{friendly}</Text></Box>);
+                      return (<Box key={it.id} paddingLeft={4}><Text color={tokens.colors.guide as string}>{g('end')} </Text><Text color={tokens.colors.dim as string}>{redact(friendly)}</Text></Box>);
                     })}
                     {gr.items.length > 12 ? (
                       <Box paddingLeft={4}><Text color={tokens.colors.dim as string}>… {gr.items.length - 12} more</Text></Box>
@@ -695,7 +905,7 @@ export function App(props: AppProps): React.JSX.Element {
             }
             const it = item as TranscriptItem;
             if (it.kind === 'text' && it.role === 'user') {
-              return <Box key={it.id} marginBottom={1}><Text color={tokens.colors.accent as string} bold>{g('prompt')} </Text><Text wrap="wrap">{it.text}</Text></Box>;
+              return <Box key={it.id} marginBottom={1}><Text color={tokens.colors.accent as string} bold>{g('prompt')} </Text><Text wrap="wrap">{redact(it.text)}</Text></Box>;
             }
             if (it.kind === 'text') {
               // prose — render markdown, not raw **, with proper wrap and guide
@@ -709,10 +919,10 @@ export function App(props: AppProps): React.JSX.Element {
               );
             }
             // Ephemeral reasoning: light-white while working, removed on response.
-            if (it.kind === 'thinking') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text wrap="wrap" color={tokens.colors.dim as string}>{it.text}</Text></Box>;
-            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.err as string}>  {g('guide')}   {g('failure')} {it.message}</Text></Box>;
+            if (it.kind === 'thinking') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text wrap="wrap" color={tokens.colors.dim as string}>{redact(it.text)}</Text></Box>;
+            if (it.kind === 'error') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.err as string}>  {g('guide')}   {g('failure')} {redact(it.message)}</Text></Box>;
             if (it.kind === 'policy') return null;
-            if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.dim as string}>  {g('guide')}   {g('editsBadge')} {it.path}  {it.op}</Text></Box>;
+            if (it.kind === 'file_changed') return <Box key={it.id} paddingLeft={2} marginBottom={1}><Text color={tokens.colors.dim as string}>  {g('guide')}   {g('editsBadge')} {redact(it.path)}  {it.op}</Text></Box>;
             if (it.kind === 'diff') return (
               <Box key={it.id} flexDirection="column" paddingLeft={2} marginBottom={1}>
                 <Text bold color={tokens.colors.soft as string}>{it.summary ?? 'Diff'}</Text>
@@ -720,7 +930,7 @@ export function App(props: AppProps): React.JSX.Element {
                   <Box key={i} flexDirection="column" marginTop={0}>
                     <Text color={tokens.colors.soft as string}>{h.path}</Text>
                     {h.lines.map((l, j) => (
-                      <Text key={j} wrap="wrap" color={l.kind === 'add' ? tokens.colors.ok as string : l.kind === 'remove' ? tokens.colors.err as string : tokens.colors.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{l.text}</Text>
+                      <Text key={j} wrap="wrap" color={l.kind === 'add' ? tokens.colors.ok as string : l.kind === 'remove' ? tokens.colors.err as string : tokens.colors.dim as string}>{l.kind === 'add' ? '+ ' : l.kind === 'remove' ? '- ' : '  '}{redact(l.text)}</Text>
                     ))}
                   </Box>
                 ))}
@@ -729,20 +939,20 @@ export function App(props: AppProps): React.JSX.Element {
             return null;
           }) : null}
           {showThinking && status.status === 'running' && !streamingIdRef.current ? (
-            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.accent as string}><Spinner type="dots" /> </Text><Text color={tokens.colors.dim as string}>Thinking... (esc to cancel)</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
+            <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.accent as string}><Spinner type="dots" /> </Text><Text color={tokens.colors.dim as string}>Thinking... (esc ×2 to cancel)</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
           ) : null}
           {showPlan && plan.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
               <Box><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
               {plan.slice(0, 8).map((p, i) => (
-                <Box key={p.id}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.colors.ok as string : p.status === 'in_progress' ? tokens.colors.accent as string : tokens.colors.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {i + 1}. {p.title}</Text></Box>
+                <Box key={p.id}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.colors.ok as string : p.status === 'in_progress' ? tokens.colors.accent as string : tokens.colors.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {i + 1}. {redact(p.title)}</Text></Box>
               ))}
             </Box>
           ) : null}
           {showQueued && queuedInputs.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
               {queuedInputs.map((q, i) => (
-                <Text key={i} color={tokens.colors.dim as string}>queued: {q.slice(0, 60)}{i === 0 ? '  esc to drop' : ''}</Text>
+                <Text key={i} color={tokens.colors.dim as string}>queued: {redact(q.slice(0, 60))}{i === 0 ? '  esc to drop' : ''}</Text>
               ))}
             </Box>
           ) : null}
@@ -775,7 +985,8 @@ export function App(props: AppProps): React.JSX.Element {
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
         <Box>
           <Text color={tokens.colors.accent as string} bold>{g('prompt')} </Text>
-          <Text wrap="wrap">{input || <Text color={tokens.colors.dim as string}>Message Klyro...</Text> as unknown as string}|</Text>
+          {vimMode === 'normal' ? <Text color={tokens.colors.warn as string} bold>--NORMAL-- </Text> : null}
+          <InputWithCursor input={input} cursor={vimCursor} />
         </Box>
         <Text color={tokens.colors.guide as string}>{g('rule').repeat(Math.max(10, width - 2))}</Text>
       </Box>

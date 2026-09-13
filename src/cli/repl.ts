@@ -26,7 +26,7 @@ import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
 import { resolveProvider, providerHelp, lastProviderError } from '../providers.js';
 import { readVersion } from '../version.js';
-import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE, createReadWrapper } from '../tui/mouse.js';
+import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE, PASTE_ENABLE, PASTE_DISABLE, PasteFilter, createReadWrapper } from '../tui/mouse.js';
 import { inferProviderFromBaseURL } from '../agent/registry.js';
 import { getDefaultSessionStore } from '../persistence/session.js';
 import { buildSystemPrompt, parseImageInput } from '../context/system-prompt.js';
@@ -306,6 +306,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     | { kind: 'thinking'; text: string };
   const pendingQueue: QueuedEvent[] = [];
   let isMounted = false;
+  // Live vim input mode for the TUI (toggled by /vim, persisted to config).
+  let vimLive: 'insert' | 'normal' = 'insert';
   let directHooks:
     | {
         append: (i: import('../tui/transcript.js').TranscriptItem) => void;
@@ -321,6 +323,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         updateTool: (idCall: string, patch: import('../tui/transcript.js').ToolResultPatch) => void;
         appendThinkingDelta: (text: string) => void;
         clearThinking: () => void;
+        pasteText: (text: string) => void;
+        setVimMode: (mode: 'insert' | 'normal') => void;
       }
     | undefined;
 
@@ -401,6 +405,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // IMPORTANT: Ink 7 reads stdin via 'readable' + stdin.read() (paused mode),
   // never 'data' events — so the tap wraps read(), not emit().
   const mouseFilter = new MouseFilter();
+  const pasteFilter = new PasteFilter();
   const origStdinRead = process.stdin.read.bind(process.stdin);
   const origStdinEmit = process.stdin.emit.bind(process.stdin);
   let mouseTapInstalled = false;
@@ -411,9 +416,20 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       } catch { /* ignore */ }
     }
   }
+  // Bracketed paste: bulk-insert into the input buffer instead of
+  // char-at-a-time typing (no autocomplete/history churn per char).
+  function dispatchPastes(pastes: string[]): void {
+    for (const p of pastes) {
+      try {
+        if (isMounted && directHooks) directHooks.pasteText(p);
+      } catch { /* ignore */ }
+    }
+  }
   function installMouseTap(): void {
     if (!isAltScreen || mouseTapInstalled) return;
     mouseTapInstalled = true;
+    // Bracketed paste on: the terminal wraps pastes in ESC[200~ … ESC[201~.
+    try { process.stdout.write(PASTE_ENABLE); } catch { /* ignore */ }
     const stdinAny = process.stdin as unknown as {
       read: (size?: number) => Buffer | string | null;
       emit: (...a: unknown[]) => boolean;
@@ -423,12 +439,15 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       origStdinRead as (size?: number) => unknown,
       mouseFilter,
       (d) => dispatchWheels([d]),
+      { onPaste: (p) => dispatchPastes([p]), pasteFilter },
     ) as (size?: number) => Buffer | string | null;
     // Fallback path: flowing mode ('data' events), e.g. if any library
     // resumes the stream. Same split, same dispatch.
     stdinAny.emit = (...a: unknown[]): boolean => {
       if (a[0] === 'data' && Buffer.isBuffer(a[1])) {
-        const split = mouseFilter.push(a[1] as Buffer);
+        const psplit = pasteFilter.push(a[1] as Buffer);
+        dispatchPastes(psplit.pastes);
+        const split = mouseFilter.push(psplit.kept);
         dispatchWheels(split.wheels);
         if (split.kept.length === 0) return false;
         a[1] = split.kept;
@@ -440,6 +459,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     if (!mouseTapInstalled) return;
     mouseTapInstalled = false;
     mouseFilter.reset();
+    pasteFilter.reset();
+    try { process.stdout.write(PASTE_DISABLE); } catch { /* ignore */ }
     const stdinAny = process.stdin as unknown as {
       read: (size?: number) => Buffer | string | null;
       emit: (...a: unknown[]) => boolean;
@@ -471,7 +492,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   function patchConsole(): void {
     if (!isAltScreen) return;
     const sink = (...args: unknown[]): void => {
-      const line = `[${new Date().toISOString()}] ${args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`;
+      // Scrub secrets before the line reaches the ring buffer or disk —
+      // stray provider/tool logs must never persist credentials.
+      const line = redact(`[${new Date().toISOString()}] ${args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')}`);
       consoleRing.push(line);
       if (consoleRing.length > 200) consoleRing.splice(0, consoleRing.length - 200);
       try {
@@ -692,6 +715,10 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       onMounted: (hooks) => {
         directHooks = hooks;
         isMounted = true;
+        // Apply a live vim mode toggled before mount.
+        if (vimLive !== 'insert') {
+          try { hooks.setVimMode(vimLive); } catch { /* ignore */ }
+        }
         for (const ev of pendingQueue) {
           if (ev.kind === 'status') hooks.updateStatus(ev.patch);
           else if (ev.kind === 'plan') hooks.updatePlan(ev.plan);
@@ -1006,7 +1033,14 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'memory': {
-        queuedAppend({ id: `mem-${Date.now()}`, kind: 'text', text: 'Memory: .klyro/memory/session-notes.md (stub) — use /memory to view', role: 'assistant' });
+        const { loadMemory } = await import('../context/memory.js');
+        const notes = (await loadMemory(cwd)).trim();
+        queuedAppend({
+          id: `mem-${Date.now()}`,
+          kind: 'text',
+          text: notes ? `Memory (.klyro/memory/session-notes.md):\n${notes.slice(0, 4000)}` : 'Memory is empty — the agent records durable notes here via memory_write.',
+          role: 'assistant',
+        });
         return;
       }
       case 'jobs': {
@@ -1533,8 +1567,13 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       case 'cancel': {
         ac.abort();
         ac = new AbortController();
+        // Immediate abort cascade: background shells must not outlive the
+        // cancelled run (the runtime abort path also kills them, but the
+        // controller swap above means we do it here for immediacy).
+        const { killAllJobs } = await import('../tools/shell/background.js');
+        const killed = killAllJobs();
         queuedStatus({ status: 'aborted' });
-        queuedAppend({ id: `cancel-${Date.now()}`, kind: 'text', text: 'cancelled current operation', role: 'assistant' });
+        queuedAppend({ id: `cancel-${Date.now()}`, kind: 'text', text: killed.length > 0 ? `cancelled current operation (${killed.length} background job(s) killed)` : 'cancelled current operation', role: 'assistant' });
         return;
       }
       case 'shell': {
@@ -2279,13 +2318,60 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         }
         return;
       }
-      case 'keymap':
-      case 'vim':
+      case 'keymap': {
+        // Real binding table (mirrors src/tui/app.tsx useInput + mouse.ts).
+        // A stored `klyro.keymap` override is shown, not applied — the TUI
+        // has one compiled keymap; the value is kept for future remapping.
+        const { runConfig } = await import('./config.js');
+        const capture = async (args: string[]): Promise<string> => {
+          const orig = process.stdout.write.bind(process.stdout);
+          let out = '';
+          (process.stdout as unknown as { write: (s: string) => boolean }).write = ((c: string) => { out += String(c); return true; }) as typeof process.stdout.write;
+          try { await runConfig(args); } finally { (process.stdout as unknown as { write: typeof orig }).write = orig; }
+          return out;
+        };
+        const stored = cmd.name?.trim();
+        if (stored) {
+          await capture(['set', 'klyro.keymap', stored]);
+          queuedAppend({ id: `keymap2-${Date.now()}`, kind: 'text', text: `keymap note saved: ${stored} (display-only — the TUI uses its compiled keymap below)`, role: 'assistant' });
+          return;
+        }
+        queuedAppend({
+          id: `keymap-${Date.now()}`,
+          kind: 'text',
+          role: 'assistant',
+          text: [
+            'Keymap (TUI compiled bindings):',
+            '  Enter send · Shift+Enter newline · Tab complete slash · Esc drop queued / Esc×2 cancel run',
+            '  Ctrl+C cancel (1st) / quit (2nd) · Ctrl+O expand last tool group · Ctrl+G jump bottom',
+            '  PgUp/PgDn or Ctrl+U/Ctrl+D half-page · Ctrl+Home/End top/bottom · Home/End jump · Space jump to unread',
+            '  Ctrl+B/F page · Shift/Ctrl+↑/↓ line · ↑/↓ history (with text) else scroll · wheel ±3 lines',
+            '  Shift+drag selects · /vim toggles vim input mode · /keymap <note> saves a display note',
+          ].join('\n'),
+        });
+        return;
+      }
+      case 'vim': {
+        // Live vim input mode (not a config stub): toggles the TUI between
+        // insert and normal mode via directHooks; persists the choice too.
+        const want = cmd.state?.trim().toLowerCase();
+        const next = want === 'on' || want === 'normal' ? 'normal' : want === 'off' || want === 'insert' ? 'insert' : vimLive === 'insert' ? 'normal' : 'insert';
+        vimLive = next;
+        try {
+          const { runConfig } = await import('./config.js');
+          const orig = process.stdout.write.bind(process.stdout);
+          (process.stdout as unknown as { write: (s: string) => boolean }).write = (() => true) as typeof process.stdout.write;
+          try { await runConfig(['set', 'klyro.vim', next]); } finally { (process.stdout as unknown as { write: typeof orig }).write = orig; }
+        } catch { /* persist best-effort */ }
+        if (isMounted && directHooks) directHooks.setVimMode(next);
+        queuedAppend({ id: `vim-${Date.now()}`, kind: 'text', text: `vim mode: ${next}${next === 'normal' ? ' (h/l move · i/a insert · x delete · 0/$ ends · j/k scroll)' : ''}`, role: 'assistant' });
+        return;
+      }
       case 'theme':
       case 'statusline':
       case 'output-style': {
-        const key = cmd.kind === 'keymap' ? 'klyro.keymap' : cmd.kind === 'vim' ? 'klyro.vim' : cmd.kind === 'theme' ? 'klyro.theme' : cmd.kind === 'statusline' ? 'klyro.statusline' : 'klyro.outputStyle';
-        const val = (cmd.kind === 'keymap' ? cmd.name : cmd.kind === 'vim' ? cmd.state : cmd.kind === 'theme' ? cmd.name : cmd.kind === 'statusline' ? cmd.format : cmd.style)?.trim();
+        const key = cmd.kind === 'theme' ? 'klyro.theme' : cmd.kind === 'statusline' ? 'klyro.statusline' : 'klyro.outputStyle';
+        const val = (cmd.kind === 'theme' ? cmd.name : cmd.kind === 'statusline' ? cmd.format : cmd.style)?.trim();
         const { runConfig } = await import('./config.js');
         const capture = async (args: string[]): Promise<string> => {
           const orig = process.stdout.write.bind(process.stdout);

@@ -166,6 +166,15 @@ describe('slash command parser', () => {
     expect(suggestCommands('/xyz', 6)).toEqual([]);
   });
 
+  it('suggestCommands fuzzy-matches non-contiguous queries', async () => {
+    const { suggestCommands, fuzzyScore } = await import('./parser.js');
+    // 'cm' matches 'commit' as a subsequence even though not contiguous
+    const names = suggestCommands('/cmt', 6).map((d) => d.name);
+    expect(names).toContain('commit');
+    expect(fuzzyScore('commit', 'zzz')).toBe(-Infinity);
+    expect(fuzzyScore('commit', 'com')).toBeGreaterThan(fuzzyScore('commit', 'cmt'));
+  });
+
   it('parses /diff', () => {
     expect(parse('/diff')).toEqual({ kind: 'diff' });
   });

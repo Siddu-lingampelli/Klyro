@@ -63,7 +63,7 @@ async function main(): Promise<void> {
     .option('--verbose', 'Verbose output')
     .option('--quiet', 'Suppress non-essential output')
     .option('--json', 'Force JSON output where supported')
-    .option('--yes', 'Auto-approve prompts where possible')
+    .option('--yes', 'Auto-approve commit prompts (scope: `klyro commit` only)')
     .option('--no-color', 'Disable colored output')
     .option('-p, --print <prompt>', 'Headless one-shot prompt (alias for run, --output json for machine)')
     .option('--output-format <fmt>', 'Headless output format: text|json|stream-json (default text)')
@@ -550,13 +550,44 @@ async function main(): Promise<void> {
   sessions.command('export <id> [file]').description('Export session to file (9.4)').action(async (id: string, file?: string) => {
     const { getDefaultSessionStore, resolveSessionId } = await import('./persistence/session.js');
     const store = getDefaultSessionStore(); const full = await resolveSessionId(store, id); if (!full) { process.stderr.write(`session not found: ${id}\n`); process.exit(2); }
-    const rec = await store.get(full); const msgs = await store.loadMessages(full);
-    const out = file ?? `${full}.export.json`; await (await import('node:fs/promises')).writeFile(out, JSON.stringify({ record: rec, messages: msgs }, null, 2)); process.stdout.write(`exported ${full} → ${out}\n`);
+    const rec = await store.get(full); const msgs = await store.loadMessages(full); const obs = await store.loadObservations(full);
+    const out = file ?? `${full}.export.json`; await (await import('node:fs/promises')).writeFile(out, JSON.stringify({ record: rec, messages: msgs, observations: obs }, null, 2)); process.stdout.write(`exported ${full} → ${out}\n`);
   });
-  sessions.command('import <file>').description('Import session from file').action(async (file: string) => {
-    const data = JSON.parse(await (await import('node:fs/promises')).readFile(file, 'utf-8')); const { getDefaultSessionStore } = await import('./persistence/session.js'); const store = getDefaultSessionStore();
-    const rec = await store.create({ cwd: data.record?.cwd ?? process.cwd(), task: data.record?.task ?? 'imported', config: data.record?.config ?? { model: 'imported', maxSteps: 30 } });
-    process.stdout.write(`imported → ${rec.id}\n`);
+  sessions.command('import <file>').description('Import session from file (restores record + messages + observations)').action(async (file: string) => {
+    let data: unknown;
+    try {
+      data = JSON.parse(await (await import('node:fs/promises')).readFile(file, 'utf-8'));
+    } catch (err) {
+      process.stderr.write(`klyro: cannot import ${file}: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(2);
+    }
+    const rec = (data as { record?: { cwd?: unknown; task?: unknown; config?: unknown } }).record ?? {};
+    const { getDefaultSessionStore } = await import('./persistence/session.js'); const store = getDefaultSessionStore();
+    const cfg = (rec.config && typeof rec.config === 'object' ? rec.config : { model: 'imported', maxSteps: 30 }) as { model: string; maxSteps: number };
+    const created = await store.create({ cwd: typeof rec.cwd === 'string' ? rec.cwd : process.cwd(), task: typeof rec.task === 'string' ? rec.task : 'imported', config: cfg });
+    // Restore the transcript — previously this was silently dropped (lossy
+    // import). Messages/observations go through append* so at-rest redaction
+    // still applies. Malformed entries fail loudly instead of half-importing.
+    const d = data as { messages?: unknown; observations?: unknown };
+    let restored = 0;
+    if (d.messages !== undefined) {
+      if (!Array.isArray(d.messages)) { process.stderr.write(`klyro: import failed: "messages" is not an array in ${file}\n`); process.exit(2); }
+      for (const m of d.messages) {
+        if (!m || typeof m !== 'object' || typeof (m as { role?: unknown }).role !== 'string' || !('content' in (m as object))) {
+          process.stderr.write(`klyro: import failed: malformed message entry in ${file}\n`); process.exit(2);
+        }
+        await store.appendMessage(created.id, m as never);
+        restored++;
+      }
+    }
+    if (d.observations !== undefined) {
+      if (!Array.isArray(d.observations)) { process.stderr.write(`klyro: import failed: "observations" is not an array in ${file}\n`); process.exit(2); }
+      for (const o of d.observations) {
+        if (!o || typeof o !== 'object') { process.stderr.write(`klyro: import failed: malformed observation entry in ${file}\n`); process.exit(2); }
+        await store.appendObservation(created.id, o as never);
+      }
+    }
+    process.stdout.write(`imported → ${created.id} (${restored} messages restored)\n`);
   });
   sessions.command('fork <id>').description('Fork session with full context (9.4)').action(async (id: string) => {
     const { getDefaultSessionStore, matchSessionIds } = await import('./persistence/session.js'); const store = getDefaultSessionStore(); const matches = await matchSessionIds(store, id);
@@ -592,7 +623,29 @@ async function main(): Promise<void> {
       process.stdout.write(`${name} source=${source}${spec?.disabled ? ' disabled' : ''}\n`);
     }
   });
-  mcp.command('add <name> <url>').description('Add MCP server').action(async (name: string) => { process.stdout.write(`added mcp ${name} (stub)\n`); });
+  mcp.command('add <name> <command> [args...]').description('Add a project MCP server to .mcp.json (stdio command)').action(async (name: string, command: string, args: string[]) => {
+    const { addProjectServer, projectMcpPath } = await import('./mcp/config.js');
+    try {
+      addProjectServer(process.cwd(), name, { command, ...(args && args.length > 0 ? { args } : {}) });
+      process.stdout.write(`added mcp server "${name}" → ${projectMcpPath(process.cwd())}\n`);
+    } catch (err) {
+      process.stderr.write(`klyro: mcp add failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(2);
+    }
+  });
+  mcp.command('remove <name>').description('Remove a project MCP server from .mcp.json').action(async (name: string) => {
+    const { removeProjectServer, projectMcpPath } = await import('./mcp/config.js');
+    try {
+      if (!removeProjectServer(process.cwd(), name)) {
+        process.stderr.write(`klyro: mcp server not found in ${projectMcpPath(process.cwd())}: ${name}\n`);
+        process.exit(2);
+      }
+      process.stdout.write(`removed mcp server "${name}"\n`);
+    } catch (err) {
+      process.stderr.write(`klyro: mcp remove failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(2);
+    }
+  });
   mcp.command('probe <name>').description('Connect to an MCP server (15s timeout), list its tools, print count+names').action(async (name: string) => {
     const { loadMcpServers } = await import('./mcp/config.js');
     const cfg = loadMcpServers(process.cwd());
@@ -622,7 +675,11 @@ async function main(): Promise<void> {
       try { await client.close(); } catch { /* ignore */ }
     }
   });
-  mcp.command('serve').description('Serve as MCP server').action(async () => { process.stdout.write('klyro mcp serve — exposing tools (stub)\n'); });
+  mcp.command('serve').description('Serve builtin tools as an MCP server over stdio (policy-gated)').action(async () => {
+    const { serveStdio } = await import('./mcp/serve.js');
+    const code = await serveStdio(process.cwd());
+    process.exit(code);
+  });
 
   // 10.2 — Hooks: list configured preToolUse/postToolUse hooks.
   program.command('hooks [cmd]').description('Hooks (10.2): `klyro hooks` or `klyro hooks list` prints configured hooks').action(async (cmd?: string) => {

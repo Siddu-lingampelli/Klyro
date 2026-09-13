@@ -74,6 +74,18 @@ describe('highlightCodeLine (R4)', () => {
     expect(parts.length).toBeGreaterThan(0);
     expect(parts.every((p) => p.code)).toBe(true);
   });
+  it('does not treat contractions as string opens', () => {
+    // "it's" must stay plain code — previously the ' opened a string that
+    // swallowed the rest of the line (so `return` lost its highlight).
+    const parts = highlightCodeLine("const s = it's fine; return s;", 'ts');
+    const kw = parts.find((p) => p.text === 'return');
+    expect(kw?.color).toBe('cyan');
+    expect(parts.map((p) => p.text).join('')).toBe("const s = it's fine; return s;");
+  });
+  it('still opens real single-quoted strings', () => {
+    const parts = highlightCodeLine("const s = 'hi';", 'ts');
+    expect(parts.map((p) => p.text).join('')).toBe("const s = 'hi';");
+  });
 });
 
 describe('annotateFileLinks (R4)', () => {

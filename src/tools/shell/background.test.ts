@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { startBackground, startBackgroundArgv, getOutput, killJob, listJobs } from './background.js';
+import { startBackground, startBackgroundArgv, getOutput, killJob, killAllJobs, listJobs } from './background.js';
 
 describe('background shell', () => {
   it('starts and lists jobs', () => {
@@ -34,5 +34,15 @@ describe('background shell', () => {
 
   it('argv form rejects empty argv', () => {
     expect(() => startBackgroundArgv([], process.cwd())).toThrow();
+  });
+
+  it('killAllJobs kills every tracked job and reports ids', () => {
+    const a = startBackground('echo one', process.cwd());
+    const b = startBackground('echo two', process.cwd());
+    const killed = killAllJobs();
+    expect(killed).toContain(a);
+    expect(killed).toContain(b);
+    expect(listJobs().some((j) => j.id === a || j.id === b)).toBe(false);
+    expect(killAllJobs()).toEqual([]);
   });
 });

@@ -32,6 +32,7 @@ describe('doctor trust + mcp rows', () => {
       const checks = json['checks'] as { name: string }[];
       expect(checks.map((c) => c.name)).toContain('MCP servers');
       expect(checks.map((c) => c.name)).toContain('Trust stores');
+      expect(checks.map((c) => c.name)).toContain('Sandbox');
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }

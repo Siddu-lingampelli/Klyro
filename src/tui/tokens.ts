@@ -12,9 +12,12 @@ export const tokens = {
     guide: '#3A3A3A',
     accent: '#FF6B1A',
     accentSoft: '#FFF1E6',
-    ok: '#FF6B1A',
+    // Status hues are deliberately distinct from the orange brand: ok reads
+    // green, warn reads amber, err reads red. (Previously ok/warn reused the
+    // accent hex and were indistinguishable in the transcript.)
+    ok: '#2FA36B',
     err: '#E06C6C',
-    warn: '#FF6B1A',
+    warn: '#D9A021',
     info: '#6FA8DC',
     diffAddBg: '#12250F',
     diffDelBg: '#2A1212',
@@ -26,15 +29,15 @@ export const tokens = {
     soft: 'whiteBright' as const,
     dim: 'gray' as const,
     guide: 'gray' as const,
-    ok: 'yellowBright' as const,
+    ok: 'green' as const,
     err: 'red' as const,
-    warn: 'yellowBright' as const,
+    warn: 'yellow' as const,
     info: 'blue' as const,
     border: 'gray' as const,
     muted: 'gray' as const,
-    success: 'yellowBright' as const,
+    success: 'green' as const,
     error: 'red' as const,
-    warning: 'yellowBright' as const,
+    warning: 'yellow' as const,
   },
 } as const;
 

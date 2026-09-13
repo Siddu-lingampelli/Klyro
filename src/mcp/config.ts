@@ -109,3 +109,47 @@ export function enabledServers(cfg: McpServersConfig): Record<string, McpServerS
   }
   return out;
 }
+
+/** Server names are bounded: the registry builds `mcp__<server>__<tool>` (≤64 chars). */
+export const MCP_NAME_RE = /^[A-Za-z0-9_-]{1,20}$/;
+
+export function projectMcpPath(cwd: string): string {
+  return path.join(cwd, '.mcp.json');
+}
+
+function readProjectDoc(cwd: string): { doc: Record<string, unknown>; servers: Record<string, unknown> } {
+  const raw = readJsonFile(projectMcpPath(cwd));
+  const doc = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  const servers = normalizeRaw(doc);
+  return { doc, servers: { ...servers } };
+}
+
+function writeProjectDoc(cwd: string, doc: Record<string, unknown>, servers: Record<string, unknown>): void {
+  const next: Record<string, unknown> = { ...doc };
+  if ('mcpServers' in next) next['mcpServers'] = servers;
+  else next['servers'] = servers;
+  if (Object.keys(next).length === 0) next['mcpServers'] = servers;
+  const tmp = `${projectMcpPath(cwd)}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', 'utf-8');
+  fs.renameSync(tmp, projectMcpPath(cwd));
+}
+
+/** Add (or reject duplicates of) a project-level MCP server. Throws on invalid input. */
+export function addProjectServer(cwd: string, name: string, spec: unknown): void {
+  if (!MCP_NAME_RE.test(name)) throw new Error(`invalid server name "${name}" (want 1-20 chars of A-Za-z0-9_-)`);
+  const parsed = McpServerSpecSchema.safeParse(spec);
+  if (!parsed.success) throw new Error(`invalid server spec: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+  const { doc, servers } = readProjectDoc(cwd);
+  if (name in servers) throw new Error(`server "${name}" already configured in ${projectMcpPath(cwd)} (remove it first)`);
+  servers[name] = parsed.data;
+  writeProjectDoc(cwd, doc, servers);
+}
+
+/** Remove a project-level MCP server. Returns false when absent. */
+export function removeProjectServer(cwd: string, name: string): boolean {
+  const { doc, servers } = readProjectDoc(cwd);
+  if (!(name in servers)) return false;
+  delete servers[name];
+  writeProjectDoc(cwd, doc, servers);
+  return true;
+}

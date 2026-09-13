@@ -449,6 +449,19 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   }
 
   if (output === 'human') stdout.write('\n');
+  // Final cost line: headless runs previously surfaced cost only through
+  // [budget] warnings. Human/silent → stderr one-liner; json → additive
+  // cost_usd/usage fields on the final object (purely additive, no shape break).
+  {
+    const { estimateCost } = await import('../providers/model-info.js');
+    const cost = estimateCost(opts.model, result.usage.input, result.usage.output);
+    const costLine = `$${cost.toFixed(4)} · ${result.usage.input} in / ${result.usage.output} out${result.usage.estimated ? ' (estimated)' : ''}`;
+    if (output === 'json') {
+      stdout.write(JSON.stringify({ kind: 'cost', cost_usd: cost, usage: result.usage }) + '\n');
+    } else {
+      stderr.write(`klyro: cost ${costLine}\n`);
+    }
+  }
   if (result.status === 'max_steps') {
     if (output === 'json') stdout.write(JSON.stringify({ kind: 'final', status: result.status, steps: result.steps }) + '\n');
     else stderr.write(`klyro: hit max steps (${result.steps}); consider raising --max-steps\n`);

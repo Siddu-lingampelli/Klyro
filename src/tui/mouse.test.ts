@@ -2,7 +2,7 @@
  * scroll.md §15.1 — mouse splitter unit tests (no terminal).
  */
 import { describe, it, expect } from 'vitest';
-import { MouseFilter, WHEEL_LINES, createReadWrapper } from './mouse.js';
+import { MouseFilter, WHEEL_LINES, PasteFilter, createReadWrapper } from './mouse.js';
 
 describe('MouseFilter', () => {
   it('passes normal typing through untouched', () => {
@@ -93,5 +93,36 @@ describe('createReadWrapper (Ink paused-mode tap)', () => {
     const read = createReadWrapper(() => marker, new MouseFilter(), (d) => seen.push(d));
     expect(read(5)).toBe(marker);
     expect(seen).toEqual([]);
+  });
+});
+
+describe('PasteFilter (bracketed paste)', () => {
+  const B = (s: string) => Buffer.from(s, 'latin1');
+  it('strips markers and delivers one atomic paste', () => {
+    const f = new PasteFilter();
+    const r = f.push(B('hi \x1b[200~pasted\ntext\x1b[201~ bye'));
+    expect(r.kept.toString('latin1')).toBe('hi  bye');
+    expect(r.pastes).toEqual(['pasted\ntext']);
+  });
+  it('reassembles a paste split across chunks', () => {
+    const f = new PasteFilter();
+    const r1 = f.push(B('\x1b[200~par'));
+    expect(r1.pastes).toEqual([]);
+    const r2 = f.push(B('tial\x1b[20'));
+    expect(r2.pastes).toEqual([]);
+    const r3 = f.push(B('1~'));
+    expect(r3.pastes).toEqual(['partial']);
+  });
+  it('holds an unterminated paste (no leak into input)', () => {
+    const f = new PasteFilter();
+    const r = f.push(B('\x1b[200~secret-in-progress'));
+    expect(r.kept.length).toBe(0);
+    expect(r.pastes).toEqual([]);
+  });
+  it('passes plain typing through byte-identical', () => {
+    const f = new PasteFilter();
+    const r = f.push(B('hello world'));
+    expect(r.kept.toString('latin1')).toBe('hello world');
+    expect(r.pastes).toEqual([]);
   });
 });

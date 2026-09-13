@@ -130,13 +130,20 @@ export async function runLogout(provider?: string): Promise<number> {
 
 export function getStoredKey(provider: string): string | undefined {
   try {
-    // Warn (don't refuse) when the credentials file is group/other-readable.
-    // Refusing would lock out existing users with old umasks; warn instead.
+    // Refuse (don't just warn) when the credentials file is
+    // group/other-readable: a key other users can read is compromised by
+    // definition. Repair hint included. KLYRO_CREDENTIALS_INSECURE_OK=1
+    // preserves the old warn-and-continue behavior for exotic setups.
     if (process.platform !== 'win32') {
       try {
         const st = fsSync.statSync(credPath());
         if ((st.mode & 0o077) !== 0) {
-          process.stderr.write(`warning: credentials file ${credPath()} is group/other-readable (mode ${(st.mode & 0o777).toString(8)}) — run chmod 600 on it\n`);
+          if (process.env.KLYRO_CREDENTIALS_INSECURE_OK === '1') {
+            process.stderr.write(`warning: credentials file ${credPath()} is group/other-readable (mode ${(st.mode & 0o777).toString(8)}) — run chmod 600 on it\n`);
+          } else {
+            process.stderr.write(`klyro: refusing to use group/other-readable credentials file ${credPath()} (mode ${(st.mode & 0o777).toString(8)}) — run: chmod 600 ${credPath()} (or set KLYRO_CREDENTIALS_INSECURE_OK=1 to override)\n`);
+            return undefined;
+          }
         }
       } catch { /* missing file → no warning */ }
     }

@@ -4,15 +4,16 @@
  */
 import type { Message } from '../agent/message.js';
 import { compressTranscript } from './tokenizer.js';
+import { capForModel } from './accounting.js';
 import type { SessionStore } from '../persistence/store.js';
 
 export interface CompactionResult { messages: Message[]; summary: string; dropped: number; method: 'elide' | 'summarize' | 'fallback' }
 
 export async function compact(
   messages: Message[],
-  opts: { system?: string; cap?: number; focus?: string; checkpointedFiles?: string[]; summarizeFn?: (prompt: string) => Promise<string> }
+  opts: { system?: string; cap?: number; focus?: string; checkpointedFiles?: string[]; summarizeFn?: (prompt: string) => Promise<string>; model?: string }
 ): Promise<CompactionResult> {
-  const cap = opts.cap ?? 120_000;
+  const cap = opts.cap ?? capForModel(opts.model);
   // (a) elide old tool results
   const elided = compressTranscript(opts.system, messages, { total: cap, reservedOutput: 16_000 });
   if (opts.checkpointedFiles && elided.dropped > 0) {

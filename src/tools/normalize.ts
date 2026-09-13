@@ -5,6 +5,8 @@
  */
 
 import type { ToolResult } from './types.js';
+import { toolErrorToKlyroCode } from '../shared/error-map.js';
+import type { KlyroErrorCode } from '../shared/errors.js';
 
 /** Standard tool error codes. Tools may add their own. */
 export const TOOL_ERROR_CODES = {
@@ -33,28 +35,32 @@ export function toToolError(err: unknown, fallbackCode: ToolErrorCode = TOOL_ERR
   code: ToolErrorCode;
   message: string;
   details?: unknown;
+  /** Harness-wide code from the central mapper (shared/error-map.ts). */
+  klyroCode: KlyroErrorCode;
 } {
   if (err === null || err === undefined) {
-    return { code: fallbackCode, message: 'Unknown error' };
+    return { code: fallbackCode, message: 'Unknown error', klyroCode: toolErrorToKlyroCode(fallbackCode) };
   }
   if (err instanceof Error) {
     // If the error already declares a tool-level `code` (e.g. PathGuardError),
     // honor it instead of mapping through Node errno.
     const maybeCode = (err as { code?: unknown }).code;
     if (typeof maybeCode === 'string' && isToolErrorCode(maybeCode)) {
-      return { code: maybeCode, message: err.message };
+      return { code: maybeCode, message: err.message, klyroCode: toolErrorToKlyroCode(maybeCode) };
     }
     if (typeof maybeCode === 'string') {
       // Looks like a Node errno (e.g. 'ENOENT'); map it.
+      const code = mapNodeErrorCode(maybeCode);
       return {
-        code: mapNodeErrorCode(maybeCode),
+        code,
         message: err.message,
         details: { syscall: (err as NodeError).syscall, path: (err as NodeError).path },
+        klyroCode: toolErrorToKlyroCode(code),
       };
     }
-    return { code: fallbackCode, message: err.message, details: err.stack };
+    return { code: fallbackCode, message: err.message, details: err.stack, klyroCode: toolErrorToKlyroCode(fallbackCode) };
   }
-  return { code: fallbackCode, message: String(err) };
+  return { code: fallbackCode, message: String(err), klyroCode: toolErrorToKlyroCode(fallbackCode) };
 }
 
 const CUSTOM_TOOL_CODES = new Set([

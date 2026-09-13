@@ -1,5 +1,13 @@
 # Klyro — Cline-Style Terminal TUI Implementation
 
+> STATUS (shipped): OpenTUI was NOT adopted — the TUI renders with Ink
+> (`ink` + `react`). There is no `<scrollbox>`; scrolling is a custom
+> anchor viewport (`src/tui/scroll-model.ts`, `src/tui/measure.ts`) driven
+> by the same four transcript commands, and input lives outside the
+> transcript as specified. Layout (Header → transcript → input → status)
+> matches this doc; the component paths below (`apps/cli/...`) predate the
+> `src/tui/` layout.
+
 Purpose: Build Klyro's terminal UI like Cline's current CLI TUI: native terminal rendering with OpenTUI, React components, a scrollable transcript, keyboard-driven interaction, streaming output, tool activity, and a fixed input area.
 
 Important: This is TUI / terminal only. No browser, HTML, CSS, DOM, or web UI.

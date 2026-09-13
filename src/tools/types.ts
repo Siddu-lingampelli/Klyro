@@ -9,11 +9,12 @@
  */
 
 import type { z } from 'zod';
+import type { KlyroErrorCode } from '../shared/errors.js';
 
 /** Standard tool result — either a typed value or a structured error. */
 export type ToolResult<T> =
   | { ok: true; value: T }
-  | { ok: false; error: { code: string; message: string; details?: unknown } };
+  | { ok: false; error: { code: string; message: string; details?: unknown; klyroCode?: KlyroErrorCode } };
 
 /**
  * Context handed to every tool execution. Tools MUST treat this as immutable
@@ -65,7 +66,12 @@ export interface Tool<TInput, TOutput> {
   description: string;
   /** Zod schema for runtime validation. */
   inputSchema: z.ZodType<TInput>;
-  /** Permission class: read | edit | execute | admin */
+  /**
+   * Permission class: read | edit | execute | admin.
+   * Consumed by the runtime → policy path: the runtime passes this into
+   * `PolicyEngine.evaluate`, and `execute`/`admin` tools with no explicit
+   * allow rule fall through to ask (interactive) / deny (headless).
+   */
   permission?: 'read' | 'edit' | 'execute' | 'admin';
   /** True if tool is safe to run in parallel with others */
   isConcurrencySafe?: boolean;

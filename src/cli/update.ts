@@ -2,10 +2,12 @@
  * klyro update — check registry for newer version, cached 24h.
  * Env KLYRO_NO_UPDATE_CHECK=1 disables.
  *
- * Integrity: before recommending `npm i`, we verify the tarball's SRI hash
- * (sha512) against the registry's recorded `dist.integrity`. An install is
- * only recommended when the download hash matches, so a tampered CDN or
- * MITM registry response can't push a malicious binary to the operator.
+ * Integrity: before recommending `npm i`, we verify the tarball against
+ * BOTH the registry's SRI digest (sha512/sha256) AND the legacy sha1
+ * `dist.shasum` when present — a tampered CDN or MITM registry response
+ * must forge two independent digests to push a malicious binary.
+ * Downgrade protection: a registry `latest` that is not strictly newer
+ * than the running version (semver) is never recommended.
  */
 
 import * as fs from 'node:fs/promises';
@@ -30,6 +32,26 @@ function cachePath(): string {
 interface Dist {
   tarball?: string;
   integrity?: string;
+  /** Legacy sha1 hex digest — second independent check when present. */
+  shasum?: string;
+}
+
+/** Minimal semver compare for `x.y.z[-prerelease]`; null when unparseable. */
+export function compareSemver(a: string, b: string): number | null {
+  const pa = /^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/.exec(a.trim());
+  const pb = /^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/.exec(b.trim());
+  if (!pa || !pb) return null;
+  for (const i of [1, 2, 3] as const) {
+    const d = Number(pa[i]) - Number(pb[i]);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  const ra = pa[4] ?? '';
+  const rb = pb[4] ?? '';
+  if (ra === rb) return 0;
+  // A prerelease is older than the release with the same core.
+  if (ra === '') return 1;
+  if (rb === '') return -1;
+  return ra < rb ? -1 : 1;
 }
 
 /** SRI string may carry multiple hashes parsable with `pick`; we accept sha512 or sha256. */
@@ -55,7 +77,7 @@ async function fetchWithTimeout(url: string, timeoutMs = FETCH_TIMEOUT_MS): Prom
   }
 }
 
-/** Download the tarball and confirm its hash equals the registry's SRI digest. */
+/** Download the tarball and confirm it matches the registry's SRI digest AND shasum. */
 async function verifyTarballIntegrity(dist: Dist): Promise<boolean> {
   const sri = parseSRI(dist.integrity);
   const tarball = dist.tarball;
@@ -63,7 +85,13 @@ async function verifyTarballIntegrity(dist: Dist): Promise<boolean> {
   const res = await fetchWithTimeout(tarball, TARBALL_TIMEOUT_MS);
   const buf = Buffer.from(await res.arrayBuffer());
   const actual = createHash(sri.algo).update(buf).digest('base64');
-  return actual === sri.digest;
+  if (actual !== sri.digest) return false;
+  // Second independent digest: legacy sha1 shasum, when the registry sends one.
+  if (typeof dist.shasum === 'string' && /^[0-9a-f]{40}$/i.test(dist.shasum)) {
+    const sha1 = createHash('sha1').update(buf).digest('hex');
+    if (sha1.toLowerCase() !== dist.shasum.toLowerCase()) return false;
+  }
+  return true;
 }
 
 export async function checkForUpdate(current: string): Promise<string | null> {
@@ -82,7 +110,12 @@ export async function checkForUpdate(current: string): Promise<string | null> {
     const res = await fetchWithTimeout(`${REGISTRY_BASE}/latest`);
     const json = (await res.json()) as { version?: string };
     const latest = json.version ?? '';
-    if (latest && latest !== current) {
+    // Downgrade protection: only ever recommend a strictly newer version.
+    // A registry answering with an older-or-equal `latest` (stale mirror,
+    // cache poisoning, downgrade attack) is treated as "no update".
+    const cmp = compareSemver(latest, current);
+    const isNewer = cmp === null ? latest !== current : cmp > 0;
+    if (latest && isNewer) {
       // Verify the tarball's integrity before caching/recommending this version.
       const verRes = await fetchWithTimeout(`${REGISTRY_BASE}/${encodeURIComponent(latest)}`);
       const verJson = (await verRes.json()) as { dist?: Dist };
@@ -91,6 +124,12 @@ export async function checkForUpdate(current: string): Promise<string | null> {
       await fs.mkdir(path.dirname(cache), { recursive: true });
       await fs.writeFile(cache, JSON.stringify({ at: Date.now(), latest }), 'utf-8');
       return latest;
+    }
+    if (latest && cmp !== null && cmp <= 0) {
+      // Refresh the negative cache so a poisoned answer isn't re-fetched
+      // every invocation for the next 24h.
+      await fs.mkdir(path.dirname(cache), { recursive: true }).catch(() => undefined);
+      await fs.writeFile(cache, JSON.stringify({ at: Date.now(), latest: current }), 'utf-8').catch(() => undefined);
     }
   } catch {
     // network failure — silent

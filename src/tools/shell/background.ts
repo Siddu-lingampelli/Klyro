@@ -86,6 +86,21 @@ export function killJob(id: string): void {
   jobs.delete(id);
 }
 
+/**
+ * Abort cascade: kill every tracked background job. Called from the
+ * runtime abort path and the REPL `/cancel` handler so a cancelled run
+ * never leaks runaway shells. Returns the killed job ids for audit.
+ */
+export function killAllJobs(): string[] {
+  const killed: string[] = [];
+  for (const job of [...jobs.values()]) {
+    try { job.proc.kill('SIGKILL'); } catch { /* ignore */ }
+    jobs.delete(job.id);
+    killed.push(job.id);
+  }
+  return killed;
+}
+
 export function listJobs(): Array<{ id: string; command: string; cwd: string; running: boolean }> {
   return [...jobs.values()].map((j) => ({ id: j.id, command: j.command, cwd: j.cwd, running: j.proc.exitCode === null }));
 }

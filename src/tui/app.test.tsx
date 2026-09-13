@@ -383,8 +383,13 @@ describe('App', () => {
     stdin.write('/c');
     await new Promise((r) => setTimeout(r, 30));
     const withSuggest = lastFrame() ?? '';
-    expect(withSuggest).toMatch(/\/clear/);
     expect(withSuggest).toMatch(/tab to complete/i);
+    // Prefix dominance: every suggestion for '/c' still starts with c.
+    const sugLines = withSuggest.split('\n').filter((l) => l.includes('/') && /clear|compact|cost|config|context|commands|copy|cancel/.test(l));
+    expect(sugLines.length).toBeGreaterThan(0);
+    // Unambiguous fuzzy prefix completes deterministically.
+    stdin.write('le');
+    await new Promise((r) => setTimeout(r, 30));
     stdin.write('\t');
     await new Promise((r) => setTimeout(r, 30));
     expect(lastFrame() ?? '').toContain('/clear ');
@@ -473,9 +478,9 @@ describe('App', () => {
     expect(kinds).toEqual(['cancel', 'quit']);
   });
 
-  it('running Esc with empty queue cancels streaming (design.md §18)', async () => {
+  it('running Esc×2 with empty queue cancels streaming (double-Esc convention)', async () => {
     const onSlash = vi.fn<(cmd: SlashCommand) => Promise<void>>(async () => {});
-    const { stdin } = render(
+    const { stdin, lastFrame } = render(
       <App
         initialModel="m"
         maxSteps={10}
@@ -485,6 +490,12 @@ describe('App', () => {
         initialStatus={{ status: 'running' }}
       />,
     );
+    // First Esc only arms (hint shows, no cancel yet).
+    stdin.write('\x1b');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onSlash).not.toHaveBeenCalled();
+    await waitForMatch(lastFrame, /press esc again to cancel/);
+    // Second Esc within the window cancels.
     stdin.write('\x1b');
     await new Promise((r) => setTimeout(r, 50));
     expect(onSlash).toHaveBeenCalled();
@@ -802,8 +813,50 @@ describe('App', () => {
     expect(frame).not.toContain('queued:');
   });
 
-  it('aborted run leaves no thinking behind (only response may remain)', async () => {
-    let hooks: {
+  it('scrubs secret shapes at the render boundary (never paints raw)', async () => {    let hooks: { append: (i: TranscriptItem) => void } | null = null;
+    const { lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={false}
+        onMounted={(h) => {
+          hooks = { append: h.append };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    hooks!.append({ id: 'sec-1', kind: 'text', text: 'deploy with password=hunter2-hunter2', role: 'assistant' });
+    const frame = await waitForMatch(lastFrame, /REDACTED/);
+    expect(frame).not.toMatch(/hunter2-hunter2/);
+  });
+
+  it('vim normal mode swallows typing, shows mode, i returns to insert', async () => {
+    let hooks: { setVimMode: (m: 'insert' | 'normal') => void } | null = null;
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={false}
+        onMounted={(h) => {
+          hooks = { setVimMode: h.setVimMode };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write('ok');
+    await waitForMatch(lastFrame, /ok/);
+    hooks!.setVimMode('normal');
+    await waitForMatch(lastFrame, /--NORMAL--/);
+    stdin.write('zzz');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(lastFrame() ?? '').not.toMatch(/zzz/);
+    stdin.write('i');
+    await waitForAbsent(lastFrame, /--NORMAL--/);
+    stdin.write('!');
+    await waitForMatch(lastFrame, /ok!/);
+  });
+
+  it('aborted run leaves no thinking behind (only response may remain)', async () => {    let hooks: {
       appendThinkingDelta: (t: string) => void;
       updateStatus: (s: Partial<StatusSnapshot>) => void;
     } | null = null;

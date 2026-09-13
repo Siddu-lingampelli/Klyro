@@ -421,15 +421,39 @@ export const COMMAND_DEFS: CommandDef[] = [
   { name: 'install', hint: 'install deps' },
 ];
 
-/** Prefix-match command names for TUI autocomplete — top `limit` (default 6). */
+/**
+ * Fuzzy score for TUI autocomplete: subsequence match with bonuses for
+ * prefix (+100), word-boundary (+30), and consecutive (+15) matches, minus
+ * a gap penalty. Returns -Infinity when `query` is not a subsequence.
+ */
+export function fuzzyScore(name: string, query: string): number {
+  const n = name.toLowerCase();
+  const q = query.toLowerCase();
+  if (!q) return 0;
+  let score = 0;
+  let ni = 0;
+  let lastHit = -2;
+  for (let qi = 0; qi < q.length; qi++) {
+    const found = n.indexOf(q[qi]!, ni);
+    if (found === -1) return -Infinity;
+    if (qi === 0 && found === 0) score += 100; // prefix
+    if (found > 0 && (n[found - 1] === '-' || n[found - 1] === '_')) score += 30; // word boundary
+    if (found === lastHit + 1) score += 15; // consecutive
+    else score -= (found - ni); // gap penalty
+    lastHit = found;
+    ni = found + 1;
+  }
+  score -= (n.length - q.length); // prefer shorter names
+  return score;
+}
+
+/** Fuzzy-match command names for TUI autocomplete — top `limit` (default 6). */
 export function suggestCommands(prefix: string, limit = 6): CommandDef[] {
   const p = prefix.toLowerCase().replace(/^\//, '');
   if (!p) return COMMAND_DEFS.slice(0, limit);
-  const starts: CommandDef[] = [];
-  const contains: CommandDef[] = [];
-  for (const d of COMMAND_DEFS) {
-    if (d.name.startsWith(p)) starts.push(d);
-    else if (d.name.includes(p)) contains.push(d);
-  }
-  return [...starts, ...contains].slice(0, limit);
+  return COMMAND_DEFS.map((d) => ({ d, s: fuzzyScore(d.name, p) + fuzzyScore(d.hint, p) * 0.25 }))
+    .filter((x) => x.s > -Infinity)
+    .sort((a, b) => b.s - a.s)
+    .slice(0, limit)
+    .map((x) => x.d);
 }

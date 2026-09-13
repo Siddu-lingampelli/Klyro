@@ -11,10 +11,12 @@
  *   3. `requireApproval` servers add an ask-rule to the PolicyEngine so the
  *      runtime loop prompts before executing.
  *
- * Permission class: no code in src consumes `Tool.permission` (it is
- * write-only metadata today), so we pick the most restrictive class,
- * 'admin' — the same class as `spawn_agent`, since MCP tools execute
- * arbitrary external side effects (read/write/network) outside our control.
+ * Permission class: the runtime passes each tool's `permission` into
+ * `PolicyEngine.evaluate`, and `execute`/`admin` tools with no explicit
+ * allow rule fall through to ask (interactive) or deny (headless). We
+ * pick the most restrictive class, 'admin' — the same class as
+ * `spawn_agent`, since MCP tools execute arbitrary external side effects
+ * (read/write/network) outside our control.
  *
  * Debug capture: when `KLYRO_MCP_DEBUG=1` is set, every MCP tool success
  * AND error ALSO writes the UNREDACTED raw JSON payload (pre-redaction,

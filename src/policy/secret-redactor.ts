@@ -14,7 +14,10 @@ import { Transform } from 'node:stream';
 const PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: 'aws-key', re: /AKIA[0-9A-Z]{16}/g },
   { name: 'aws-secret', re: /(?:aws_secret_access_key|secret)\s*[:=]\s*[A-Za-z0-9/+=]{40}/gi },
-  { name: 'aws-secret-b64', re: /(?<![A-Za-z0-9/+=])(?=[A-Za-z0-9/+=]*[+/=])[A-Za-z0-9/+=]{40,}={0,2}(?![A-Za-z0-9/+=])/g, },
+  // Long base64-ish runs must BOTH contain a +/= (excludes pure-hex SHAs
+  // and hashes) AND a digit (excludes letter-only words/sentences that
+  // happen to be long). Genuine secrets mix classes; prose rarely does.
+  { name: 'aws-secret-b64', re: /(?<![A-Za-z0-9/+=])(?=[A-Za-z0-9/+=]*[+/=])(?=[A-Za-z0-9/+=]*[0-9])[A-Za-z0-9/+=]{40,}={0,2}(?![A-Za-z0-9/+=])/g, },
   { name: 'pem-block', re: /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g },
   { name: 'github-token', re: /gh[pousr]_[A-Za-z0-9]{36,255}/g },
   { name: 'slack-token', re: /xox[abprs]-[A-Za-z0-9-]{10,}/g },

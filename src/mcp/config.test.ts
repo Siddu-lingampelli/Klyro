@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { expandEnv, loadMcpServers, MAX_MCP_TIMEOUT_MS } from './config.js';
+import { expandEnv, loadMcpServers, MAX_MCP_TIMEOUT_MS, addProjectServer, removeProjectServer } from './config.js';
 
 describe('expandEnv', () => {
   it('expands ${env:VAR} from process.env', () => {
@@ -68,5 +68,24 @@ describe('loadMcpServers', () => {
     } finally {
       delete process.env['KLYRO_MCP_TEST_KEY'];
     }
+  });
+});
+
+describe('addProjectServer / removeProjectServer', () => {
+  it('round-trips a server through .mcp.json', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-mcp-add-'));
+    addProjectServer(dir, 'srv', { command: 'node', args: ['s.js'] });
+    expect(loadMcpServers(dir).servers['srv']?.command).toBe('node');
+    expect(removeProjectServer(dir, 'srv')).toBe(true);
+    expect(loadMcpServers(dir).servers['srv']).toBeUndefined();
+    expect(removeProjectServer(dir, 'srv')).toBe(false);
+  });
+
+  it('rejects bad names, bad specs, and duplicates', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-mcp-add-'));
+    expect(() => addProjectServer(dir, 'bad name!', { command: 'x' })).toThrow(/invalid server name/);
+    expect(() => addProjectServer(dir, 'ok', { args: [] })).toThrow(/invalid server spec/);
+    addProjectServer(dir, 'dup', { command: 'x' });
+    expect(() => addProjectServer(dir, 'dup', { command: 'y' })).toThrow(/already configured/);
   });
 });

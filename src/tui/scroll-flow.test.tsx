@@ -58,7 +58,9 @@ describe('scroll flow diagnostics', () => {
     const chunk = 'STREAMCHUNK lorem ipsum dolor sit amet. ';
     for (let i = 0; i < 12; i++) {
       g.__klyroAppendDelta!(`${chunk}#${i} `);
-      await tick(40);
+      // Tick longer than the 64ms streaming render throttle so the flush
+      // has landed before asserting visibility (follow-tail, not latency).
+      await tick(90);
       const frame = lastFrame() ?? '';
       expect(rowsOf(frame)).toBeLessThanOrEqual(32);
       // latest streamed chunk must be visible (follow-tail)

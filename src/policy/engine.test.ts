@@ -51,6 +51,42 @@ describe('PolicyEngine', () => {
     expect(d.action).toBe('allow');
   });
 
+  it('asks for privileged execute/admin tools with no allow rule (interactive)', async () => {
+    const e = new PolicyEngine([], DEFAULT_POLICY_CONFIG);
+    const admin = await e.evaluate({ name: 'spawn_agent', input: {}, permission: 'admin' }, { cwd, nonInteractive: false });
+    expect(admin.action).toBe('ask');
+    const exec = await e.evaluate({ name: 'run_verify', input: { command: 'x' }, permission: 'execute' }, { cwd, nonInteractive: false });
+    expect(exec.action).toBe('ask');
+  });
+
+  it('denies privileged execute/admin tools with no allow rule (headless)', async () => {
+    const e = new PolicyEngine([], DEFAULT_POLICY_CONFIG);
+    const d = await e.evaluate({ name: 'spawn_agent', input: {}, permission: 'admin' }, { cwd, nonInteractive: true });
+    expect(d.action).toBe('deny');
+  });
+
+  it('keeps default-allow for read/edit classes and unclassified calls', async () => {
+    const e = new PolicyEngine([], DEFAULT_POLICY_CONFIG);
+    const read = await e.evaluate({ name: 'read_file', input: {}, permission: 'read' }, { cwd, nonInteractive: true });
+    expect(read.action).toBe('allow');
+    const edit = await e.evaluate({ name: 'write_file', input: {}, permission: 'edit' }, { cwd, nonInteractive: true });
+    expect(edit.action).toBe('allow');
+    const legacy = await e.evaluate({ name: 'spawn_agent', input: {} }, { cwd, nonInteractive: true });
+    expect(legacy.action).toBe('allow');
+  });
+
+  it('explicit allow rule still wins over the privileged default', async () => {
+    const e = new PolicyEngine([], { ...DEFAULT_POLICY_CONFIG, allow: ['spawn_agent'] });
+    const d = await e.evaluate({ name: 'spawn_agent', input: {}, permission: 'admin' }, { cwd, nonInteractive: true });
+    expect(d.action).toBe('allow');
+  });
+
+  it('auto mode keeps allow-everything for privileged tools', async () => {
+    const e = new PolicyEngine([], { ...DEFAULT_POLICY_CONFIG, mode: 'auto' });
+    const d = await e.evaluate({ name: 'spawn_agent', input: {}, permission: 'admin' }, { cwd, nonInteractive: true });
+    expect(d.action).toBe('allow');
+  });
+
   it('read-file-size rule fires on real file size (not dead sizeBytes)', async () => {
     const { mkdtempSync, writeFileSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');

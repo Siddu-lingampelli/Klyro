@@ -118,6 +118,14 @@ export function highlightCodeLine(line: string, lang: string): MdPart[] {
       }
     }
     if (STRING_DELIMS.includes(ch)) {
+      // Contraction guard: a single-quote mid-word (it's, don't, users')
+      // is prose punctuation, not a string delimiter — only open on `'`
+      // after start-of-line or a non-word char. Other delims open anywhere.
+      if (ch === "'" && i > 0 && /[A-Za-z0-9_)}\]]/.test(line[i - 1]!)) {
+        buf += ch;
+        i++;
+        continue;
+      }
       flush();
       inString = true; strDelim = ch; buf = ch; i++;
       continue;
@@ -126,6 +134,7 @@ export function highlightCodeLine(line: string, lang: string): MdPart[] {
       let j = i;
       while (j < line.length && /[A-Za-z0-9_$]/.test(line[j]!)) j++;
       const tok = line.slice(i, j);
+      flush(); // pending separators (spaces, punctuation) precede the token
       flushKw(tok);
       i = j;
       continue;

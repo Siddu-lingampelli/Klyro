@@ -107,6 +107,93 @@ export class MouseFilter {
 export const MOUSE_ENABLE = '\x1b[?1000h\x1b[?1006h'; // button events + SGR coords
 export const MOUSE_DISABLE = '\x1b[?1000l\x1b[?1006l';
 
+export const PASTE_START = '\x1b[200~';
+export const PASTE_END = '\x1b[201~';
+export const PASTE_ENABLE = '\x1b[?2004h'; // bracketed paste: terminal wraps pastes
+export const PASTE_DISABLE = '\x1b[?2004l';
+const PASTE_START_BUF = Buffer.from(PASTE_START, 'latin1');
+const PASTE_END_BUF = Buffer.from(PASTE_END, 'latin1');
+const MAX_PASTE_BYTES = 1024 * 1024;
+
+/**
+ * Bracketed-paste splitter. Strips the `ESC[200~` / `ESC[201~` markers and
+ * delivers pasted content as one atomic string so the TUI can bulk-insert
+ * it (no per-char autocomplete/history side effects). Content split across
+ * stdin chunks is reassembled; an unterminated paste is held (up to 1 MiB,
+ * then force-flushed) so a partial escape never leaks into the input.
+ */
+export class PasteFilter {
+  private pending = Buffer.alloc(0);
+  private inPaste = false;
+  private chunks: Buffer[] = [];
+  private size = 0;
+
+  push(chunk: Buffer): { kept: Buffer; pastes: string[] } {
+    const data = Buffer.concat([this.pending, chunk]);
+    this.pending = Buffer.alloc(0);
+    const kept: Buffer[] = [];
+    const pastes: string[] = [];
+    let pos = 0;
+    const tailPartial = (from: number): number => {
+      // Length of the trailing run that could be a split marker prefix.
+      const tail = data.subarray(from);
+      for (let len = Math.min(tail.length, 5); len >= 1; len--) {
+        const piece = tail.subarray(tail.length - len);
+        if (PASTE_START_BUF.subarray(0, len).equals(piece) || PASTE_END_BUF.subarray(0, len).equals(piece)) return len;
+      }
+      return 0;
+    };
+    while (pos < data.length) {
+      if (!this.inPaste) {
+        const idx = data.indexOf(PASTE_START_BUF, pos);
+        if (idx === -1) {
+          const hold = tailPartial(pos);
+          kept.push(data.subarray(pos, hold > 0 ? data.length - hold : data.length));
+          if (hold > 0) this.pending = data.subarray(data.length - hold);
+          break;
+        }
+        kept.push(data.subarray(pos, idx));
+        pos = idx + PASTE_START_BUF.length;
+        this.inPaste = true;
+        this.chunks = [];
+        this.size = 0;
+        continue;
+      }
+      const idx = data.indexOf(PASTE_END_BUF, pos);
+      if (idx === -1) {
+        const hold = tailPartial(pos);
+        const end = hold > 0 ? data.length - hold : data.length;
+        if (end > pos) {
+          this.chunks.push(data.subarray(pos, end));
+          this.size += end - pos;
+        }
+        if (hold > 0) this.pending = data.subarray(data.length - hold);
+        if (this.size >= MAX_PASTE_BYTES) {
+          pastes.push(Buffer.concat(this.chunks).toString('utf8'));
+          this.chunks = [];
+          this.size = 0;
+          this.inPaste = false; // force-flush: don't hold unbounded input
+        }
+        break;
+      }
+      this.chunks.push(data.subarray(pos, idx));
+      pastes.push(Buffer.concat(this.chunks).toString('utf8'));
+      this.chunks = [];
+      this.size = 0;
+      this.inPaste = false;
+      pos = idx + PASTE_END_BUF.length;
+    }
+    return { kept: Buffer.concat(kept), pastes };
+  }
+
+  reset(): void {
+    this.pending = Buffer.alloc(0);
+    this.inPaste = false;
+    this.chunks = [];
+    this.size = 0;
+  }
+}
+
 /**
  * stdin.read() wrapper implementing the tap (see repl.ts installMouseTap).
  * Ink 7 consumes stdin via paused-mode read() calls, so filtering happens
@@ -120,19 +207,30 @@ export function createReadWrapper(
   origRead: (size?: number) => unknown,
   filter: MouseFilter,
   onWheel: (delta: number) => void,
+  opts?: { onPaste?: (text: string) => void; pasteFilter?: PasteFilter },
 ): (size?: number) => unknown {
   return (size?: number): unknown => {
     if (size !== undefined) return origRead(size);
     const chunk = origRead();
     if (chunk == null) return chunk;
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
-    const split = filter.push(buf);
-    for (const w of split.wheels) {
+    let buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+    if (opts?.pasteFilter) {
+      const split = opts.pasteFilter.push(buf);
+      for (const p of split.pastes) {
+        try {
+          opts.onPaste?.(p);
+        } catch { /* ignore */ }
+      }
+      buf = split.kept;
+      if (buf.length === 0 && split.pastes.length > 0) return null;
+    }
+    const msplit = filter.push(buf);
+    for (const w of msplit.wheels) {
       try {
         onWheel(w);
       } catch { /* ignore */ }
     }
-    if (split.kept.length === 0) return null;
-    return typeof chunk === 'string' ? split.kept.toString('utf8') : split.kept;
+    if (msplit.kept.length === 0) return null;
+    return typeof chunk === 'string' ? msplit.kept.toString('utf8') : msplit.kept;
   };
 }

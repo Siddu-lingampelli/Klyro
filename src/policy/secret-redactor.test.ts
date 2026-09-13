@@ -48,6 +48,13 @@ describe('redact', () => {
     const sha = 'da39a3ee5e6b4b0d3255bfef95601890afd80709';
     expect(redact(`commit ${sha}`)).toBe(`commit ${sha}`);
   });
+
+  it('still redacts genuine mixed base64 secrets, ignores letter-only runs', () => {
+    const secret = 'xQ1+aB2/cD3+eF4/gH5+iJ6/kL7+mN8/oP9+qR0+sT1==';
+    expect(redact(`key ${secret}`)).toContain('[REDACTED]:aws-secret-b64');
+    const words = 'a'.repeat(48);
+    expect(redact(`note ${words}`)).toBe(`note ${words}`);
+  });
 });
 
 describe('createRedactor', () => {

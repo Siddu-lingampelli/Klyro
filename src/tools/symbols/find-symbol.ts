@@ -1,7 +1,9 @@
 /**
- * 7.4 — find_symbol (optional, eval-gated) — stub using regex repo-map
- * Real tree-sitter would be <5s/100k LOC, but ripgrep baseline wins on locate suite, so shipped disabled.
- * Enable with KLYRO_SYMBOLS=1 for experiment; decision recorded in docs/decisions/7.4-symbols.md
+ * 7.4 — find_symbol via the regex repo-map (no tree-sitter dependency).
+ * Previously gated behind KLYRO_SYMBOLS=1; enabled by default now — the
+ * regex symbol index is genuinely useful for name lookup even though
+ * ripgrep wins on raw locate speed. Set KLYRO_SYMBOLS=0 to force the
+ * disabled path (kept for the eval comparison).
  */
 import { z } from 'zod';
 import { defineTool } from '../types.js';
@@ -10,13 +12,13 @@ import { buildRepoMap } from '../../context/repo-map.js';
 
 export const findSymbolTool = defineTool({
   name: 'find_symbol',
-  description: 'Find symbol by name (regex, disabled unless KLYRO_SYMBOLS=1 — ripgrep wins on locate suite)',
+  description: 'Find a code symbol (function/class/interface/const) by name across the repo',
   inputSchema: z.object({ name: z.string().min(1), kind: z.string().optional() }),
   permission: 'read',
   isConcurrencySafe: true,
   execute: async (input, ctx) => safe(async () => {
-    if (process.env.KLYRO_SYMBOLS !== '1') {
-      return { name: input.name, hits: [], note: 'find_symbol disabled — use grep/repo_map (decision 7.4: ripgrep baseline 4.2s vs tree-sitter 5.8s, no gain)' } as const;
+    if (process.env.KLYRO_SYMBOLS === '0') {
+      return { name: input.name, hits: [], note: 'find_symbol disabled via KLYRO_SYMBOLS=0 — use grep/repo_map' } as const;
     }
     const files = await buildRepoMap({ cwd: ctx.cwd, maxFiles: 200 });
     const q = input.name.toLowerCase();
