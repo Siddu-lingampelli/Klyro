@@ -322,6 +322,24 @@ export class SessionStore {
     return data.messages;
   }
 
+  /**
+   * Conversation rewind: drop messages (and observations) at or after
+   * `cutoffTs`, keeping everything older. Returns the removed counts.
+   * Used by `/rewind <n> full` to restore the conversation alongside code.
+   */
+  async truncateMessages(id: string, cutoffTs: number): Promise<{ messages: number; observations: number }> {
+    return this.withLock(id, async () => {
+      const data = await this.readSession(id);
+      const keptMessages = data.messages.filter((m) => (typeof m.ts === 'number' ? m.ts : 0) < cutoffTs);
+      const keptObs = data.observations.filter((o) => (typeof o.startedAt === 'number' ? o.startedAt : 0) < cutoffTs);
+      const removed = { messages: data.messages.length - keptMessages.length, observations: data.observations.length - keptObs.length };
+      data.messages = keptMessages;
+      data.observations = keptObs;
+      await this.writeSession(id, data);
+      return removed;
+    });
+  }
+
   async loadObservations(id: string): Promise<StoredObservation[]> {
     const data = await this.readSession(id);
     return data.observations;

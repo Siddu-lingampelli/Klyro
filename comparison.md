@@ -1,6 +1,6 @@
-# Klyro vs Claude Code — Full Architectural Audit (36 rounds)
+# Klyro vs Claude Code — Full Architectural Audit (36 rounds + 1.0.6 addendum)
 
-*Project: Klyro (`A:\claude code\Agent`) · HEAD `b28b98f` (release 1.0.5) · `tsc` exit 0 · tests 85 files / 889 passed · `doctor` all green · npm `latest = 1.0.5`. Rounds 1–18 delivered in a prior audit turn and reproduced here; rounds 19–36 are new. No files were modified to produce this audit.*
+*Project: Klyro (`A:\claude code\Agent`) · HEAD `f748aeb` (release 1.0.6) · `tsc` exit 0 · tests 91 files / 920 passed · `doctor` all green. Rounds 1–36 below are the 1.0.5 audit verbatim; the 1.0.6 delta (43 files, +3231/−478, 12 new modules) is covered in the superseding addendum appended at the end (also standalone in `comparison.1.0.6.md`). Prior version preserved in `comparison.md.bak`; pre-1.0.3 in `comparison.md.bak.pre-1.0.3`. No source files were modified to produce this audit.*
 
 ## Evidence marks
 
@@ -670,7 +670,7 @@
 
 **Divergences:** (1) open vs closed; (2) $0-unknown under-bills hosted unknowns; (3) fixed probe order, no weighting; (4) cache pricing runtime-side only; (5) no single registration point; (6) anti-exfil hard-fail. **Takeaway:** breadth + honesty vs managed depth; unify provider registration. End of Phase 1 (36 rounds).
 
-# PHASE 2 — CROSS-CUTTING AUDIT (post-1.0.5, residual)
+# PHASE 2 — CROSS-CUTTING AUDIT (1.0.5 baseline — superseded by the 1.0.6 addendum for fixed items)
 
 Prior HIGHs (abort cascade, default-allow, screen/log scrub, downgrade recommend, lossy import) are **fixed in 1.0.5** — verified by 889 green tests. What remains:
 
@@ -727,3 +727,22 @@ Streaming copies bounded by 64ms throttle (fixed 1.0.5); `scanner separator-flus
 - Rounds 19–36: investigator outputs from six parallel read-only subagents, lightly trimmed for length; file:line references preserved as delivered.
 - Risk register + capstone: synthesized from all 36 rounds post-1.0.5 (prior HIGHs marked fixed only where the 1.0.5 diff + 889 green tests confirm).
 - `comparison.md.bak` (111KB) was NOT overwritten — it holds the pre-1.0.3 audit and remains intact.
+
+---
+
+# SUPERSEDING ADDENDUM — 1.0.6 (HEAD `f748aeb`)
+
+**See `comparison.1.0.6.md` for the full addendum** — updated rounds (3, 18, 19, 21, 22, 23, 24, 25, 28, 31, 34, 35), refreshed risk register (resolved-vs-remaining), and the 1.0.6 capstone synthesis. Summary of what 1.0.6 changed and why it matters architecturally:
+
+- **Hooks v2:** 5 lifecycle events (`sessionStart/sessionEnd/stop` joined `pre/postToolUse`), per-tool `matcher` regex, and **stdin JSON** as the primary contract (`hooks.ts:31,165-247`); `sessionStart` non-zero → hard `blocked` abort; `--bare` skips all hooks (`runtime.ts:454-472,364-379`). Resolves Risk #4.
+- **Open registries:** custom agents (`.klyro/agents/*.md`, project-overrides-builtin, `custom-agents.ts:69-85`) and custom commands (`.klyro/commands/*.md`, `$1..$9/$@`, recursion-guarded, `cli/slash/custom.ts:105-124`). Resolves Risk #5.
+- **Approval edit-retry:** `e` opens an inline JSON editor; runtime re-validates against tool schema and re-polls policy, bounded 3 rounds, cache-correct (`runtime.ts:1047-1138`, `approval.tsx:92-143`). Resolves Risk #1.
+- **Rewind menu:** numbered `/rewind <n> [summary]`, `/checkpoints`, `/undo <n>` via `listCheckpointInfo()` (`checkpoints/store.ts:141-169`, `repl.ts:1118-1163`).
+- **Result envelope + `--bare`:** exactly one `kind:result` line per run, `--bare` skips MCP/hooks/memory/persistence (`run.ts:490-548,217-249`), headless temperature/max-tokens. Resolves Risk #8.
+- **Memory trio:** rotate-to-archive (no silent tail-loss, pruned to 20) + wired 20-turn todo reminder + `/memory append` human path with identical redaction/atomicity (`memory.ts:29-49`, `runtime.ts:511-536`). Resolves Risks #2/#3.
+- **Eval judge:** opt-in `judge.rubric` model-graded against any adapter, fail-closed; `--judge-model` CLI (`judge.ts:41-86`, `harness.ts:114-141`, `eval.ts:170-181`).
+- **Provider registry:** one file (`providers/endpoints.ts`) — single registration point the 1.0.5 capstone asked for; `providers.ts` derives probing from it.
+- **Remote MCP + prompts:** Streamable-HTTP JSON-RPC (`mcp/remote.ts:31-161`), `command` XOR `url` spec, `prompts/list`+`prompts/get`, `/mcp__server__prompt` slash commands (`repl.ts:2671-2686`). Partially resolves Risk #7.
+- **Init + session merge:** first-class `klyro init` shared with `/init` (`cli/init.ts`); `session`/`sessions` now the *same* subcommands (`index.ts:433,617-624`). Partially resolves Risk #9.
+
+**Unresolved from 1.0.5:** `orchestrator.abortOnParent: undefined` (Risk #6, LOW); checkpoint caps/signatures/fsync/stub-diff (Risk #10, MED); triple runtime + ignored globals (Risk #9 tail); MCP OAuth + pure-SSE transport (Risk #7 tail). Latest residual top-10 lives at the end of `comparison.1.0.6.md`.

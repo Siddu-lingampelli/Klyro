@@ -1,0 +1,1 @@
+{"type":"smoke","runs":1,"expectStatus":"complete","expectToolCalls":1,"judge":{"rubric":["hello.txt contains exactly the text the agent was asked to write"]}}

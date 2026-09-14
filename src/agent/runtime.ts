@@ -31,7 +31,7 @@ import { detectVerifyCommand } from '../verification/auto.js';
 import { detectVerifiers } from '../verification/registry.js';
 import { ensureBaseline, getBaseline } from '../verification/baseline.js';
 import { compressTranscript, totalTokens, calibrateEstimate, transcriptCharLength } from '../context/tokenizer.js';
-import { capForModel } from '../context/accounting.js';
+import { capForModel, RESERVE_OUTPUT_TOKENS } from '../context/accounting.js';
 import { shouldRemind, reminderForTodos } from '../context/memory.js';
 import { ratesFor, isAnthropicModel } from '../providers/model-info.js';
 import { classifyFailure, rerunOnce, gatherRepairContext, guardRepair } from '../verification/classify.js';
@@ -153,6 +153,16 @@ export interface RunOptions {
    */
   persist?: {
     store?: import('../persistence/store.js').SessionStore;
+    sessionId?: string;
+  };
+  /**
+   * Level 10 — tamper-evident audit. When an AuditLog is provided, the
+   * runtime writes policy decisions and tool completions into the chained
+   * audit stream (complements, does not replace, persistence). Defaults off
+   * so callers opt in; `klyro` CLI enables it when a sessions dir exists.
+   */
+  audit?: {
+    log?: import('../persistence/audit.js').AuditLog;
     sessionId?: string;
   };
   /**
@@ -392,6 +402,15 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     bus.emit(ev);
     tracer?.write(ev).catch(() => undefined);
   };
+  // Light audit writer: mirrors policy decisions + tool results into the
+  // chained audit log. Best-effort — audit errors must not break the run.
+  const auditLog = opts.audit?.log;
+  const auditSessionId = opts.audit?.sessionId ?? opts.persist?.sessionId;
+  const writeAudit = (ev: import('../persistence/audit.js').AuditEvent): void => {
+    if (!auditLog || !auditSessionId) return;
+    // fire-and-forget — the log serializes its own chain internally
+    void auditLog.write(ev).catch(() => undefined);
+  };
   const closeTracer = async (): Promise<void> => {
     try { await tracer?.close(); } catch { /* ignore */ }
   };
@@ -477,6 +496,10 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   const fileEditCounts = new Map<string, number>();
   let stuckTriggers = 0;
   let stuckAbort = false;
+  // Steerable stop: a stop hook's `{"continue":true}` verdict carries one
+  // more turn. Consumed once at the completion point, max 3 per run.
+  let stopCont: string | null = null;
+  let stopContUsed = 0;
 
   outer: while (steps < maxSteps) {
     // 5.1 limits: max-cost, max-time
@@ -549,7 +572,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     const systemForBudget = telemetrySuffix ? `${stableSystem}\n\n${telemetrySuffix}` : stableSystem;
     // Window-aware ceiling (was a hardcoded 120k that overflowed 8k local
     // models): size the input budget to the model's context window.
-    const BUDGET = { total: capForModel(opts.model, 4000), reservedOutput: 4000 };
+    const BUDGET = { total: capForModel(opts.model, RESERVE_OUTPUT_TOKENS), reservedOutput: RESERVE_OUTPUT_TOKENS };
     let reqMessages = transcript;
     let reqSystem: string | undefined = stableSystem;
     let reqSuffix: string | undefined = telemetrySuffix;
@@ -645,14 +668,14 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           telemetry.recordError('overflow_retry');
           emitKlyro({ type: 'error', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', code: 'REQUEST_TOO_LARGE', message: 'context overflow — aggressively compacting transcript and retrying the request once' });
           try {
-            const compacted = compressTranscript(reqSystem, transcript, { total: 30_000, reservedOutput: 4000 });
+            const compacted = compressTranscript(reqSystem, transcript, { total: 30_000, reservedOutput: RESERVE_OUTPUT_TOKENS });
             if (compacted.messages.length < transcript.length || compacted.dropped > 0) {
               transcript.splice(0, transcript.length, ...compacted.messages);
             } else {
               // Transcript already fits the aggressive budget — force it
               // strictly smaller so the retry cannot repeat the overflow.
               const halved = Math.max(4000, Math.floor(totalTokens(reqSystem, transcript) / 2));
-              const smaller = compressTranscript(reqSystem, transcript, { total: halved, reservedOutput: 4000 });
+              const smaller = compressTranscript(reqSystem, transcript, { total: halved, reservedOutput: RESERVE_OUTPUT_TOKENS });
               transcript.splice(0, transcript.length, ...smaller.messages);
             }
             tokenCache = { lastRef: null, lastSystem: undefined, lastCount: 0 };
@@ -778,6 +801,17 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined };
     }
     if (finalizedCalls.length === 0) {
+      // Steerable stop: a stop hook asked for one more turn instead of
+      // completing. Consumed once per verdict, max 3 per run.
+      if (stopCont !== null && stopContUsed < 3) {
+        stopContUsed++;
+        const contMsg: Message = { role: 'user', content: [text(`[system note] ${stopCont}`)] };
+        stopCont = null;
+        transcript.push(contMsg);
+        await checkpoint(contMsg);
+        emit?.({ kind: 'step_end', step: steps });
+        continue;
+      }
       if (hadInvalidTool) {
         // The model attempted a tool call that failed validation; the error is
         // already a tool_result in the transcript — loop so the model can
@@ -1057,6 +1091,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         } else {
           emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: decision.action, reason: (decision as { reason?: string }).reason });
         }
+        writeAudit({ kind: 'policy_decision', sessionId: auditSessionId ?? 'ephemeral', callId: call.id, action: decision.action, ts: Date.now() });
 
         if (decision.action === 'deny') {
           const denyMsg: Message = {
@@ -1145,33 +1180,43 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     // executor crash must never kill the step).
     const execTool = async (
       call: typeof finalizedCalls[number],
-    ): Promise<{ obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number }> => {
+    ): Promise<{ obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number; hookContext: Array<{ hook: string; context: string }> }> => {
       const t0 = Date.now();
       emitKlyro({ type: 'tool.call', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, input: call.input });
       // Hooks: matching preToolUse hooks run before execution. A non-zero
       // exit denies the tool with POLICY_DENIED — the real tool never runs.
       // Matchers scope hooks per tool; stdin carries the structured payload.
+      // A structured JSON verdict wins over the exit code: deny blocks with
+      // its message, allow+context attaches model-visible context.
+      const hookContext: Array<{ hook: string; context: string }> = [];
       const matchingPre = hooksForEvent(runHooks, 'preToolUse', call.name);
       if (matchingPre.length > 0) {
         for (const hook of matchingPre) {
           let exitCode: number | null = -1;
           let detail = '';
+          let verdict: { decision?: string; message?: string; context?: string } | undefined;
           try {
             const r = await runHook(hook, { toolName: call.name, input: call.input }, { event: 'preToolUse', tool: call.name, input: call.input, sessionId, cwd: opts.cwd });
             exitCode = r.exitCode;
             detail = (r.stderr || r.stdout || '').slice(0, 300);
+            if (r.verdict) verdict = r.verdict;
           } catch (err) {
             detail = String(err instanceof Error ? err.message : err).slice(0, 300);
           }
-          if (exitCode !== 0) {
-            const reason = `hook ${hook.name} denied: ${detail || 'hook failed'}`;
+          if (verdict?.decision === 'deny' || exitCode !== 0) {
+            const reason = `hook ${hook.name} denied: ${verdict?.message || detail || 'hook failed'}`;
             emit?.({ kind: 'policy_decision', id: call.id, name: call.name, action: 'deny', reason });
             emitKlyro({ type: 'permission.decision', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, action: 'deny', reason });
             const latencyMs = Date.now() - t0;
             return {
               obs: { ok: false, error: { code: 'POLICY_DENIED', message: reason } } as import('../tools/types.js').ToolResult<unknown>,
               latencyMs,
+              hookContext,
             };
+          }
+          // Allow verdicts may carry model-visible context (sliced at parse).
+          if (verdict?.decision !== 'deny' && typeof verdict?.context === 'string' && verdict.context) {
+            hookContext.push({ hook: hook.name, context: verdict.context });
           }
         }
       }
@@ -1182,7 +1227,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         obs = { ok: false, error: { code: 'EXEC_CRASH', message: err instanceof Error ? err.message : String(err) } } as import('../tools/types.js').ToolResult<unknown>;
       }
       const latencyMs = Date.now() - t0;
-      return { obs, latencyMs };
+      return { obs, latencyMs, hookContext };
     };
 
     // 5.2 stuck termination (P0-3): the FIRST detection injects one
@@ -1208,6 +1253,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       call: typeof finalizedCalls[number],
       obs: import('../tools/types.js').ToolResult<unknown>,
       latencyMs: number,
+      hookContext: Array<{ hook: string; context: string }> = [],
     ): Promise<void> => {
       const output = obs.ok ? redactOutput(obs.value) : redactOutput({ error: obs.error });
       const toolMsg: Message = {
@@ -1216,6 +1262,16 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       };
       transcript.push(toolMsg);
       await checkpoint(toolMsg, { toolCallId: call.id, toolName: call.name, input: call.input, output, isError: !obs.ok });
+      // Hook-injected context rides as its own user message right after the
+      // tool result (uniform across output shapes — no result surgery).
+      if (hookContext.length > 0) {
+        const note: Message = {
+          role: 'user',
+          content: [text(hookContext.map((h) => `[hook ${h.hook} context]\n${h.context}`).join('\n\n'))],
+        };
+        transcript.push(note);
+        await checkpoint(note);
+      }
       if (obs.ok) {
         telemetry.recordToolCall(call, latencyMs, false);
         if (call.name === 'write_file' || call.name === 'edit_file' || call.name === 'multi_edit' || call.name === 'apply_patch') {
@@ -1234,6 +1290,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       }
       emitKlyro({ type: 'tool.result', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, output, isError: !obs.ok, latencyMs });
       emit?.({ kind: 'tool_result', id: call.id, name: call.name, output, isError: !obs.ok, latencyMs });
+      // Light audit: every executed call completes into the chained log.
+      writeAudit({ kind: 'tool_call_completed', sessionId: auditSessionId ?? 'ephemeral', callId: call.id, isError: !obs.ok, latencyMs, ts: Date.now() });
       if (obs.ok) {
         const fileChanged = inferFileChanged(call.name, call.input, obs.value);
         if (fileChanged) {
@@ -1284,8 +1342,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     // Sequential path: gate → execute → commit per call, in order.
     const runOne = async (call: typeof finalizedCalls[number]): Promise<void> => {
       if (!(await gateCall(call))) return;
-      const { obs, latencyMs } = await execTool(call);
-      await commitResult(call, obs, latencyMs);
+      const { obs, latencyMs, hookContext } = await execTool(call);
+      await commitResult(call, obs, latencyMs, hookContext);
     };
 
     // 3.5 — parallel when every call is concurrencySafe, sequential otherwise.
@@ -1304,7 +1362,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         // Fan-out cap: execute in sequential chunks of MAX_PARALLEL_TOOLS.
         // Commits below stay in original call order, so the transcript is
         // unaffected by the chunking.
-        const settled: PromiseSettledResult<{ obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number }>[] = [];
+        const settled: PromiseSettledResult<{ obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number; hookContext: Array<{ hook: string; context: string }> }>[] = [];
         for (let off = 0; off < approved.length; off += MAX_PARALLEL_TOOLS) {
           if (opts.signal?.aborted) break;
           const chunk = approved.slice(off, off + MAX_PARALLEL_TOOLS);
@@ -1313,7 +1371,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         for (let i = 0; i < settled.length; i++) {
           const s = settled[i]!;
           if (s.status === 'fulfilled') {
-            await commitResult(approved[i]!, s.value.obs, s.value.latencyMs);
+            await commitResult(approved[i]!, s.value.obs, s.value.latencyMs, s.value.hookContext);
           } else {
             await commitResult(
               approved[i]!,
@@ -1342,13 +1400,20 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         await checkpoint(msg);
       }
     } catch { /* ignore — completions are best-effort visibility */ }
-    // stop hooks: run once per completed step (blocking, side effects only —
-    // output is logged, never injected into the transcript).
+    // stop hooks: run once per completed step (blocking). A structured
+    // `{"continue": true, "message": ...}` verdict asks for one more turn
+    // instead of completing — consumed at the completion point below,
+    // bounded to 3 continuations per run so a hook can't loop forever.
+    stopCont = null; // fresh verdict per step; stale ones never carry over
     for (const hook of hooksForEvent(runHooks, 'stop')) {
       try {
         const r = await runHook(hook, { toolName: '', input: {} }, { event: 'stop', sessionId, cwd: opts.cwd, step: steps, status: 'open' });
         if (!r.ok) {
           try { process.stderr.write(`klyro: hooks: stop ${hook.name} failed (exit ${String(r.exitCode)})\n`); } catch { /* ignore */ }
+        } else if (r.verdict?.cont === true && stopContUsed < 3) {
+          stopCont = typeof r.verdict.message === 'string' && r.verdict.message
+            ? r.verdict.message
+            : `stop hook ${hook.name} requested continuation`;
         }
       } catch { /* ignore — stop hooks never fail the turn */ }
     }

@@ -1,6 +1,7 @@
 /**
  * 2.2 — klyro login / logout / aliases
- * Stores masked key → ~/.klyro/credentials.json 0600
+ * Stores masked key → OS keychain when available, else
+ * ~/.klyro/credentials.json 0600 (with refuse-on-lax-perms reads).
  */
 
 import * as fs from 'node:fs/promises';
@@ -17,17 +18,37 @@ export function credPath(): string {
   return path.join(home, '.klyro', 'credentials.json');
 }
 
-/** Persist one provider key (0600). Never logs or returns the key. */
-export async function saveKey(provider: string, key: string): Promise<void> {
+/** Persist one provider key: OS keychain when available, else 0600 file. Never logs or returns the key. */
+export async function saveKey(provider: string, key: string): Promise<'keychain' | 'file'> {
+  const trimmed = key.trim();
+  try {
+    const { keychainSet } = await import('./keychain.js');
+    if (await keychainSet(provider, trimmed)) return 'keychain';
+  } catch { /* fall through to file */ }
   const creds: Record<string, string> = {};
   try {
     const raw = await fs.readFile(credPath(), 'utf-8');
     Object.assign(creds, JSON.parse(raw));
   } catch { /* ignore */ }
-  creds[provider] = key.trim();
+  creds[provider] = trimmed;
   await fs.mkdir(path.dirname(credPath()), { recursive: true });
   await fs.writeFile(credPath(), JSON.stringify(creds, null, 2), { mode: 0o600 });
   try { await fs.chmod(credPath(), 0o600); } catch { /* ignore on Windows */ }
+  return 'file';
+}
+
+/**
+ * Async key read: OS keychain first (when available), then the 0600 file
+ * (with refuse-on-lax-perms). Use in async paths (provider resolution,
+ * eval, setup); sync contexts keep `getStoredKey` (file only).
+ */
+export async function getStoredKeyAsync(provider: string): Promise<string | undefined> {
+  try {
+    const { keychainGet } = await import('./keychain.js');
+    const v = await keychainGet(provider);
+    if (v) return v;
+  } catch { /* fall through to file */ }
+  return getStoredKey(provider);
 }
 
 /** Which providers have stored keys (names only — never values). */
@@ -82,8 +103,12 @@ export async function runLogin(): Promise<number> {
     const model = ((await rl.question(`Model [${defs.model}]: `)) || defs.model).trim();
     const storeProvider = provider === 'local' ? 'openai' : provider;
     if (key.trim()) {
-      await saveKey(storeProvider, key);
-      process.stdout.write(`Saved ${storeProvider} key to ${credPath()} (0600)\n`);
+      const where = await saveKey(storeProvider, key);
+      process.stdout.write(
+        where === 'keychain'
+          ? `Saved ${storeProvider} key to the OS keychain\n`
+          : `Saved ${storeProvider} key to ${credPath()} (0600)\n`,
+      );
     }
     // Persist non-secret settings (merged with existing config, never clobbers).
     const { loadConfig, saveConfig } = await import('./config.js');
@@ -108,6 +133,16 @@ export async function runLogin(): Promise<number> {
 }
 
 export async function runLogout(provider?: string): Promise<number> {
+  // Best-effort keychain removal first (a keychain-held key must not survive
+  // a file-only logout).
+  try {
+    const { keychainDelete } = await import('./keychain.js');
+    if (provider) await keychainDelete(provider);
+    else {
+      await keychainDelete('openai');
+      await keychainDelete('anthropic');
+    }
+  } catch { /* ignore */ }
   try {
     const raw = await fs.readFile(credPath(), 'utf-8');
     const creds = JSON.parse(raw) as Record<string, string>;

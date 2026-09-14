@@ -31,6 +31,17 @@ export function normalizeBaseURL(url: string): string {
   return url.replace(/\/+$/, '');
 }
 
+/** True for loopback hostnames (localhost / 127.0.0.0/8 / ::1). */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0' || h === '::') return true;
+  if (h.startsWith('127.')) {
+    const parts = h.split('.');
+    return parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+  }
+  return false;
+}
+
 /**
  * Validate that the base URL is HTTPS (or localhost over HTTP for local LLMs).
  * Refuses to send the bearer token over a plaintext remote connection.
@@ -51,12 +62,9 @@ export function assertSafeBaseURL(url: string, opts?: { allowInsecure?: boolean 
     // Allow insecure HTTP if explicitly opted in (for remote Ollama etc.)
     if (opts?.allowInsecure === true || process.env.KLYRO_ALLOW_INSECURE === '1') return;
     const host = parsed.hostname.toLowerCase();
-    // Allow loopback and private networks without extra flag
-    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0' || host === '::' || host === '[::]') return;
-    if (host.startsWith('127.')) {
-      const parts = host.split('.');
-      if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) return;
-    }
+    // Allow loopback without flag (shared helper); private LAN ranges keep
+    // the provider-path behavior below.
+    if (isLoopbackHost(host)) return;
     // Private ranges 10/8, 192.168/16, 172.16-31/12
     if (/^10\.\d+\.\d+\.\d+$/.test(host)) return;
     if (/^192\.168\.\d+\.\d+$/.test(host)) return;
@@ -68,6 +76,30 @@ export function assertSafeBaseURL(url: string, opts?: { allowInsecure?: boolean 
     );
   }
   throw new Error(`Unsupported KLYRO_BASE_URL protocol: ${parsed.protocol}`);
+}
+
+/**
+ * Remote MCP URL guard. Mirrors `assertSafeBaseURL`'s fail-closed posture but
+ * is named for MCP config/transports so callers do not have to import provider
+ * URL text.
+ */
+export function assertSafeRemoteURL(url: string, opts?: { allowInsecure?: boolean }): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`invalid remote MCP URL: ${url}`);
+  }
+  if (parsed.protocol === 'https:') return;
+  if (parsed.protocol === 'http:') {
+    if (isLoopbackHost(parsed.hostname)) return;
+    if (opts?.allowInsecure === true || process.env.KLYRO_ALLOW_INSECURE === '1') return;
+    throw new Error(
+      `Refusing to connect to remote MCP server over plaintext HTTP to ${parsed.hostname}. ` +
+        `Use https:// or a loopback URL, or set KLYRO_ALLOW_INSECURE=1 for this terminal only (not recommended).`,
+    );
+  }
+  throw new Error(`unsupported remote MCP URL protocol: ${parsed.protocol}`);
 }
 
 export async function chat(

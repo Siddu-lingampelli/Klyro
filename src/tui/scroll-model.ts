@@ -134,11 +134,16 @@ export function resolveTopRow(s: ScrollState, ctx: ScrollCtx): Resolved {
 }
 
 /** Badge label per §7.2 (Claude Code style: "N unread" / "jump to end").
- *  Empty string = hidden. `idle` = agent done streaming, the only new lines
- *  are the ones already counted — the affordance flips to "jump to end". */
+ *  Empty string = hidden. `idle` = agent done streaming; when idle the badge
+ *  flips to the actionable "jump to end" affordance instead of a raw count. */
 export function badgeLabel(atBottom: boolean, newSinceUnstick: number, idle: boolean): string {
   if (atBottom || newSinceUnstick <= 0) return '';
-  void idle; // Ink can't capture the idle click; count is shown either way (§7.2)
+  // When the agent is idle (no more lines arriving), show the actionable
+  // affordance; otherwise keep the live unread count.
+  if (idle) {
+    if (newSinceUnstick >= 1000) return '↓ 999+ · jump to end';
+    return `↓ ${newSinceUnstick} · jump to end`;
+  }
   if (newSinceUnstick >= 1000) return '↓ 999+ unread';
   return `↓ ${newSinceUnstick} unread`;
 }

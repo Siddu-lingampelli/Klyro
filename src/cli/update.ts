@@ -137,7 +137,7 @@ export async function checkForUpdate(current: string): Promise<string | null> {
   return null;
 }
 
-export async function runUpdate(): Promise<number> {
+export async function runUpdate(opts: { apply?: boolean } = {}): Promise<number> {
   const here = await import('../index.js').then(() => '');
   // Get version from package.json via dynamic import
   const { readFileSync } = await import('node:fs');
@@ -150,6 +150,21 @@ export async function runUpdate(): Promise<number> {
     const latest = await checkForUpdate(cur);
     if (latest) {
       process.stdout.write(`Update available: ${cur} → ${latest} (integrity verified)\n  npm i -g klyro@latest\n`);
+      if (opts.apply) {
+        // Opt-in self-apply: the tarball was already hash-verified by
+        // checkForUpdate, so npm installs exactly the verified version.
+        process.stdout.write(`Applying update to klyro@${latest}...\n`);
+        const { spawnSync } = await import('node:child_process');
+        const npmCli = process.env['npm_execpath'];
+        const r = npmCli
+          ? spawnSync(process.execPath, [npmCli, 'i', '-g', `klyro@${latest}`], { stdio: 'inherit' })
+          : spawnSync('npm', ['i', '-g', `klyro@${latest}`], { stdio: 'inherit', shell: process.platform === 'win32' });
+        if (r.error) {
+          process.stderr.write(`klyro update: apply failed: ${r.error.message}\n`);
+          return 1;
+        }
+        return r.status === 0 ? 0 : 1;
+      }
     } else {
       process.stdout.write(`klyro ${cur} is latest\n`);
     }

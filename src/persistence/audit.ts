@@ -79,11 +79,49 @@ async function prevHashFor(filePath: string): Promise<string> {
   }
 }
 
+/** Default rotation bound: 1 MiB live segment, 5 rotated segments kept. */
+export const AUDIT_MAX_BYTES = 1_048_576;
+export const AUDIT_ROTATE_KEEP = 5;
+
+/**
+ * Rotate an audit log once it exceeds `maxBytes`: shift the newest segment
+ * over the oldest (deleted), leave a fresh live file. Each segment carries
+ * its own GENESIS-rooted chain, so rotation is tamper-evident per segment.
+ * Returns true when a rotation actually happened (the caller must reset its
+ * in-memory chain tip to GENESIS — the next live record starts a fresh
+ * chain). Best-effort — rotation failures never break appends.
+ */
+async function rotateAuditLog(filePath: string, maxBytes: number, keep: number): Promise<boolean> {
+  try {
+    const stat = await fs.stat(filePath);
+    if (stat.size <= maxBytes) return false;
+    try { await fs.rm(`${filePath}.${keep}`, { force: true }); } catch { /* best-effort */ }
+    for (let i = keep - 1; i >= 1; i--) {
+      try { await fs.rename(`${filePath}.${i}`, `${filePath}.${i + 1}`); } catch { /* missing segment */ }
+    }
+    await fs.rename(filePath, `${filePath}.1`);
+    return true;
+  } catch {
+    /* stat failure (no file yet) — nothing to rotate */
+    return false;
+  }
+}
+
 export class AuditLog {
   /** Serializes chained appends so concurrent writes can't fork the chain. */
   private chain: Promise<void> = Promise.resolve();
+  /**
+   * Cached last-written hash: avoids re-reading the whole file (O(n) per
+   * write) on every append. Null = not loaded yet — first append reads the
+   * file (picks up an existing chain), then the cache takes over.
+   */
+  private lastHash: string | null = null;
 
-  constructor(private readonly filePath: string) {}
+  constructor(
+    private readonly filePath: string,
+    private readonly maxBytes: number = AUDIT_MAX_BYTES,
+    private readonly keepSegments: number = AUDIT_ROTATE_KEEP,
+  ) {}
 
   async write(event: AuditEvent): Promise<void> {
     const task = this.chain.then(() => this.appendChained(event));
@@ -93,27 +131,26 @@ export class AuditLog {
   }
 
   private async appendChained(event: AuditEvent): Promise<void> {
-    const prevHash = await prevHashFor(this.filePath);
+    // Rotation leaves a fresh live file and resets the in-memory tip: the
+    // next live record restarts at GENESIS (each segment is its own chain).
+    const rotated = await rotateAuditLog(this.filePath, this.maxBytes, this.keepSegments);
+    if (rotated) this.lastHash = AUDIT_GENESIS;
+    if (this.lastHash === null) this.lastHash = await prevHashFor(this.filePath);
+    const prevHash = this.lastHash;
     const body: Record<string, unknown> = { ...(event as unknown as Record<string, unknown>), prevHash };
     const record: ChainedAuditRecord = { ...body, prevHash, hash: sha256Hex(canonicalJson(body)) };
+    this.lastHash = record.hash;
     await SessionStore.appendJsonl(this.filePath, record);
   }
 }
 
-/**
- * Recompute the hash chain of a session JSONL file.
- * Sessions live at `<sessionsDir>/<sessionId>.jsonl` (see SessionStore).
- */
-export async function verifyAuditChain(
-  sessionsDir: string,
-  sessionId: string,
-): Promise<{ ok: boolean; events: number; error?: string }> {
-  const filePath = path.join(sessionsDir, `${sessionId}.jsonl`);
+/** Recompute one segment's chain; returns verified lines or a numbered error. */
+async function verifySegment(filePath: string, segmentLabel: string): Promise<{ events: number; error?: string }> {
   let raw: string;
   try {
     raw = await fs.readFile(filePath, 'utf-8');
   } catch {
-    return { ok: false, events: 0, error: `audit log not found: ${filePath}` };
+    return { events: 0, error: `${segmentLabel}: not found` };
   }
   const lines = raw.split('\n').filter((l) => l.trim());
   let expectedPrev = AUDIT_GENESIS;
@@ -124,16 +161,42 @@ export async function verifyAuditChain(
     try {
       parsed = JSON.parse(line) as Record<string, unknown>;
     } catch {
-      return { ok: false, events, error: `line ${i + 1}: unparseable JSON` };
+      return { events, error: `${segmentLabel}:${i + 1}: unparseable JSON` };
     }
     if (parsed.prevHash !== expectedPrev) {
-      return { ok: false, events, error: `line ${i + 1}: prevHash mismatch (chain fork or truncation)` };
+      return { events, error: `${segmentLabel}:${i + 1}: prevHash mismatch (chain fork or truncation)` };
     }
     if (typeof parsed.hash !== 'string' || parsed.hash !== hashAuditRecord(parsed)) {
-      return { ok: false, events, error: `line ${i + 1}: hash mismatch (tampered record)` };
+      return { events, error: `${segmentLabel}:${i + 1}: hash mismatch (tampered record)` };
     }
     expectedPrev = parsed.hash;
     events++;
   }
-  return { ok: true, events };
+  return { events };
+}
+
+/**
+ * Recompute the hash chain of a session JSONL file, including rotated
+ * segments (`.jsonl.1` … `.jsonl.keep` each verified as its own chain).
+ * Sessions live at `<sessionsDir>/<sessionId>.jsonl` (see SessionStore).
+ */
+export async function verifyAuditChain(
+  sessionsDir: string,
+  sessionId: string,
+  keepSegments: number = AUDIT_ROTATE_KEEP,
+): Promise<{ ok: boolean; events: number; error?: string }> {
+  let totalEvents = 0;
+  for (let i = keepSegments; i >= 1; i--) {
+    const label = `${sessionId}.jsonl.${i}`;
+    const seg = await verifySegment(path.join(sessionsDir, label), label);
+    if (seg.error) {
+      if (seg.error.endsWith(': not found')) continue; // missing rotated segment is fine
+      return { ok: false, events: totalEvents, error: seg.error };
+    }
+    totalEvents += seg.events;
+  }
+  const live = await verifySegment(path.join(sessionsDir, `${sessionId}.jsonl`), `${sessionId}.jsonl`);
+  if (live.error) return { ok: false, events: totalEvents, error: live.error };
+  totalEvents += live.events;
+  return { ok: true, events: totalEvents };
 }

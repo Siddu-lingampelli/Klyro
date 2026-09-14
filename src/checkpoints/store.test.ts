@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { snapshot, listCheckpoints, listCheckpointInfo, undo } from './store.js';
+import { snapshot, listCheckpoints, listCheckpointInfo, snapshotFiles, undo } from './store.js';
 
 describe('checkpoints', () => {
   let tmp: string;
@@ -32,6 +32,14 @@ describe('checkpoints', () => {
     expect(infos[1]!.index).toBe(2);
     expect(infos[0]!.files).toBe(1);
     expect(typeof infos[0]!.ts).toBe('number');
+  });
+
+  it('snapshotFiles lists what a snapshot would restore', async () => {
+    const p = path.join(tmp, 'a.txt');
+    await fs.writeFile(p, 'v1', 'utf-8');
+    const id = await snapshot(tmp, ['a.txt']);
+    expect(await snapshotFiles(tmp, id)).toContain('a.txt');
+    expect(await snapshotFiles(tmp, 'no-such-id')).toEqual([]);
   });
 
   it('undo restores deletions (missing-file tracking)', async () => {

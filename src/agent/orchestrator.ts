@@ -123,7 +123,24 @@ export const BUILTIN_AGENTS: readonly AgentDefinition[] = [
   },
 ];
 
-/** Compact summary returned to the parent — the child's transcript stays separate. */export interface ChildSummary {
+/**
+ * Layer specialist instructions into a child's system prompt (not the user
+ * task). Pure — unit-tested directly. No-op when the def has no prompt.
+ */
+export function layerSpecialistPrompt(
+  base: RuntimeDeps['systemPrompt'],
+  def: Pick<AgentDefinition, 'id' | 'prompt'>,
+): RuntimeDeps['systemPrompt'] {
+  if (!def.prompt) return base;
+  return (ctx) => {
+    const r = base(ctx);
+    const block = `\n\n<specialist id="${def.id}">\n${def.prompt}\n</specialist>`;
+    return typeof r === 'string' ? r + block : { ...r, system: r.system + block };
+  };
+}
+
+/** Compact summary returned to the parent — the child's transcript stays separate. */
+export interface ChildSummary {
   taskId: string;
   agentName: string;
   status: TaskStatus;
@@ -537,7 +554,8 @@ export class AgentOrchestrator {
     );
 
     const childRegistry = new ScopedRegistry(this.deps.registry, resolved.allowed);
-    const childDeps: RuntimeDeps = { ...this.deps, registry: childRegistry };
+    const childPromptFn = layerSpecialistPrompt(this.deps.systemPrompt, def);
+    const childDeps: RuntimeDeps = { ...this.deps, registry: childRegistry, systemPrompt: childPromptFn };
 
     const childRef: ParentContextRef = {
       taskId: record.id,
@@ -551,12 +569,8 @@ export class AgentOrchestrator {
       ...(resolved.allowedPaths !== undefined ? { allowedPaths: resolved.allowedPaths } : {}),
     };
 
-    // Specialist instructions from `.klyro/agents/*.md` (or programmatic
-    // defs) ride with the delegated task on both paths below.
-    const childTask = def.prompt ? `${def.prompt}\n\n---\n\n${input.task}` : input.task;
-
     const childOptions: RunOptions = {
-      task: childTask,
+      task: input.task,
       cwd: childCwd,
       model: childModel ?? 'inherit', // model override must reach the adapter (see runtime)
       maxSteps: def.maxSteps,
@@ -611,7 +625,7 @@ export class AgentOrchestrator {
       };
       try {
         if (useProcessIsolation) {
-          const sysPrompt = resolveSystemPrompt(this.deps.systemPrompt, { cwd: childCwd });
+          const sysPrompt = resolveSystemPrompt(childPromptFn, { cwd: childCwd });
           // Splice the volatile telemetry suffix into the stable prefix so the
           // child's provider sees one system string. Telemetry is best-effort
           // inside the child (it re-emits); the goal here is parity, not
@@ -619,7 +633,7 @@ export class AgentOrchestrator {
           const systemPrompt = sysPrompt.suffix ? `${sysPrompt.system}\n${sysPrompt.suffix}` : sysPrompt.system;
           const payload: ChildWorkerPayload = {
             cwd: childCwd,
-            task: childTask,
+            task: input.task,
             // A concrete provider model must reach the child — 'inherit' only
             // exists to defer resolution inside the parent's run().
             model: (childModel ?? parent.model) as string,

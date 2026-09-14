@@ -13,12 +13,54 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { z } from 'zod';
 
+/** MCP remote URL guard — https:// (or loopback http://) only. */
+export function assertSafeMcpUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`invalid MCP server url: ${url}`);
+  }
+  if (parsed.protocol === 'https:') return;
+  if (parsed.protocol === 'http:') {
+    const h = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0' || h === '::' || h.startsWith('127.')) return;
+    throw new Error(`insecure MCP server url (plain HTTP) for host ${parsed.hostname} — use https:// or a loopback URL, or set KLYRO_ALLOW_INSECURE_MCP=1`);
+  }
+  throw new Error(`unsupported MCP server url protocol: ${parsed.protocol}`);
+}
+
+/** True when the plain-HTTP MCP opt-in is set (env or persisted equivalent). */
+export function insecureMcpAllowed(): boolean {
+  return process.env.KLYRO_ALLOW_INSECURE_MCP === '1';
+}
+
 export const McpServerPolicySchema = z.object({
   allowTools: z.array(z.string()).optional(),
   denyTools: z.array(z.string()).optional(),
   requireApproval: z.boolean().optional(),
   timeoutMs: z.number().int().positive().optional(),
 });
+
+/**
+ * B2 — optional OAuth/PKCE auth surface for remote (`url`) transports.
+ * Present ⇒ the probe/connect path resolves a bearer token and attaches
+ * `Authorization`; the debug capture scrubs it (see `scrubAuthHeaders`).
+ */
+export const McpServerAuthSchema = z.object({
+  /** OAuth 2.0 client id registered with the authorization server. */
+  clientId: z.string().min(1),
+  /** Token endpoint; when absent, derived from the authorization issuer. */
+  tokenEndpoint: z.string().url().optional(),
+  /** Authorization endpoint / metadata issuer; defaults to the server URL. */
+  authorizationEndpoint: z.string().url().optional(),
+  /** Custom redirect URI; defaults to a loopback listener on 127.0.0.1. */
+  redirectUri: z.string().url().optional(),
+  /** Space-separated additional scopes. */
+  scopes: z.string().optional(),
+});
+
+export type McpServerAuth = z.infer<typeof McpServerAuthSchema>;
 
 export type McpServerPolicy = z.infer<typeof McpServerPolicySchema>;
 
@@ -29,16 +71,40 @@ export const McpServerSpecSchema = z.object({
   env: z.record(z.string(), z.string()).optional(),
   /** Remote transport: Streamable-HTTP JSON-RPC endpoint. Required unless `command` is set. */
   url: z.string().url().optional(),
+  /**
+   * Remote transport flavor: `streamable` (default, POST per message) or
+   * `sse` (legacy HTTP+SSE: persistent GET event stream + message POST).
+   */
+  transport: z.enum(['streamable', 'sse']).optional(),
   /** Extra HTTP headers for remote transport (`${env:VAR}` expanded). */
   headers: z.record(z.string(), z.string()).optional(),
+  /** B2 — optional OAuth/PKCE auth surface; only valid on remote transports. */
+  auth: McpServerAuthSchema.optional(),
   disabled: z.boolean().optional(),
   policy: McpServerPolicySchema.optional(),
 }).superRefine((s, ctx) => {
+  if (s.auth && !s.url) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'MCP server "auth" requires a remote "url" transport (stdio has no OAuth surface)' });
+  }
   if (!s.command && !s.url) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'MCP server needs either "command" (stdio) or "url" (remote HTTP)' });
   }
   if (s.command && s.url) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'MCP server takes either "command" or "url", not both' });
+  }
+  if (s.url && !s.command) {
+    const u = s.url as string;
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(u);
+    } catch { /* invalid URL caught by z.string().url() */ }
+    if (parsed && parsed.protocol === 'http:') {
+      const h = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+      const loopback = h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0' || h === '::' || h.startsWith('127.');
+      if (!loopback && process.env.KLYRO_ALLOW_INSECURE_MCP !== '1') {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `insecure MCP server url (plain HTTP) for host ${parsed.hostname} — use https:// or a loopback URL, or set KLYRO_ALLOW_INSECURE_MCP=1` });
+      }
+    }
   }
 });
 

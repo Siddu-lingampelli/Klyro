@@ -23,6 +23,7 @@ import { Box, Text, useInput } from 'ink';
 import type { ApprovalChoice, ApprovalRequest } from '../policy/approval.js';
 import type { ApprovalPrompt } from '../policy/approval.js';
 import { approvalChoiceForKey, sanitizeForPrompt } from '../policy/approval.js';
+import { tokens } from './tokens.js';
 
 interface PendingPrompt {
   req: ApprovalRequest;
@@ -167,40 +168,41 @@ export function ApprovalModal({ bridge }: { bridge: TuiApprovalBridge }): React.
     const clean = sanitizeForPrompt(s);
     return !full && clean.length > n ? clean.slice(0, n) + '…' : clean;
   };
+  const c = tokens.colors;
   return (
     <Box
       flexDirection="column"
       borderStyle="double"
-      borderColor="yellow"
+      borderColor={c.warn}
       paddingX={1}
       marginY={1}
     >
-      <Text color="yellow" bold>⚠ approval needed — {pending.toolName}</Text>
-      <Text color="gray">  reason: &quot;{trunc(pending.reason)}&quot;</Text>
+      <Text color={c.warn} bold>⚠ approval needed — {pending.toolName}</Text>
+      <Text color={c.dim}>  reason: &quot;{trunc(pending.reason)}&quot;</Text>
       {pending.summary ? <Text>  &quot;{trunc(pending.summary)}&quot;</Text> : null}
       {editing !== null ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text color="yellow" bold>  editing input JSON (Enter = submit, Esc = back):</Text>
+          <Text color={c.warn} bold>  editing input JSON (Enter = submit, Esc = back):</Text>
           <Text wrap="wrap">  {(editing.length > 1500 ? editing.slice(0, 1500) + '…' : editing) + '▌'}</Text>
-          {editError ? <Text color="red">  {editError}</Text> : null}
+          {editError ? <Text color={c.err}>  {editError}</Text> : null}
         </Box>
       ) : null}
-      {explain ? <Text color="cyan">  Explain: This tool will {pending.toolName} with the shown args. [y] once, [a] session, [A] always→settings, [n] deny, [e] edit, [f] full text, [?] toggle help.</Text> : null}
+      {explain ? <Text color={c.info}>  Explain: This tool will {pending.toolName} with the shown args. [y] once, [a] session, [A] always→settings, [n] deny, [e] edit, [f] full text, [?] toggle help.</Text> : null}
       <Box marginTop={1}>
-        <Text color="green">[y] once</Text>
-        <Text color="gray">  </Text>
-        <Text color="green">[a] session</Text>
-        <Text color="gray">  </Text>
-        <Text color="green">[A] always</Text>
-        <Text color="gray">  </Text>
-        <Text color="red">[n] deny</Text>
-        <Text color="gray">  </Text>
-        <Text color="yellow">[e] edit</Text>
-        <Text color="gray">  </Text>
-        <Text color="cyan">[f] full</Text>
-        <Text color="gray">  </Text>
-        <Text color="cyan">[?] explain</Text>
-        <Text color="gray">  (Enter = deny)</Text>
+        <Text color={c.ok}>[y] once</Text>
+        <Text color={c.dim}>  </Text>
+        <Text color={c.ok}>[a] session</Text>
+        <Text color={c.dim}>  </Text>
+        <Text color={c.ok}>[A] always</Text>
+        <Text color={c.dim}>  </Text>
+        <Text color={c.err}>[n] deny</Text>
+        <Text color={c.dim}>  </Text>
+        <Text color={c.warn}>[e] edit</Text>
+        <Text color={c.dim}>  </Text>
+        <Text color={c.info}>[f] full</Text>
+        <Text color={c.dim}>  </Text>
+        <Text color={c.info}>[?] explain</Text>
+        <Text color={c.dim}>  (Enter = deny)</Text>
       </Box>
     </Box>
   );

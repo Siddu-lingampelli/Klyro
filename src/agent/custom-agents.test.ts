@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loadCustomAgents } from './custom-agents.js';
+import { layerSpecialistPrompt } from './orchestrator.js';
 
 describe('custom agent files', () => {
   it('loads typed definitions with prompt body', () => {
@@ -51,5 +52,14 @@ describe('custom agent files', () => {
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true });
     }
+  });
+
+  it('layerSpecialistPrompt appends a namespaced block, leaves task alone', () => {
+    const base = () => 'BASE';
+    expect(layerSpecialistPrompt(base, { id: 'x' })({ cwd: '/', telemetry: '' })).toBe('BASE');
+    const layered = layerSpecialistPrompt(base, { id: 'rev', prompt: 'Be strict.' });
+    expect(layered({ cwd: '/', telemetry: '' })).toBe('BASE\n\n<specialist id="rev">\nBe strict.\n</specialist>');
+    const split = layerSpecialistPrompt(() => ({ system: 'S', suffix: 'T' }), { id: 'rev', prompt: 'Be strict.' });
+    expect(split({ cwd: '/', telemetry: '' })).toEqual({ system: 'S\n\n<specialist id="rev">\nBe strict.\n</specialist>', suffix: 'T' });
   });
 });

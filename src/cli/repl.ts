@@ -1129,41 +1129,76 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
       case 'rewind': {
         // Numbered rewind menu: bare /rewind lists snapshots (1 = latest),
-        // /rewind <n> restores, /rewind <n> summary also reports reverted files.
-        const { listCheckpointInfo, undo } = await import('../checkpoints/store.js');
+        // /rewind <n> restores code, /rewind <n> summary adds a revert
+        // report, /rewind <n> preview dry-runs, /rewind <n> full also
+        // truncates the conversation after the snapshot.
+        const { listCheckpointInfo, snapshotFiles, undo } = await import('../checkpoints/store.js');
         const infos = await listCheckpointInfo(cwd);
         if (infos.length === 0) {
           queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text: 'No checkpoints yet — snapshots are taken after each file mutation.', role: 'assistant' });
           return;
         }
         const n = cmd.n ?? 1;
-        if (cmd.n === undefined && !cmd.summary) {
+        const mode = cmd.mode;
+        if (cmd.n === undefined && !mode) {
           const rows = infos.slice(0, 10).map((c) => {
             const age = c.ts > 0 ? ` (${Math.max(1, Math.round((Date.now() - c.ts) / 60000))}m ago)` : '';
             return `  ${c.index}. ${c.id.slice(0, 12)} · ${c.files} file(s)${age}`;
           });
-          queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text: `Checkpoints (1 = latest):\n${rows.join('\n')}\nrun /rewind <n> to restore, /rewind <n> summary for a revert report`, role: 'assistant' });
+          queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text: `Checkpoints (1 = latest):\n${rows.join('\n')}\nrun /rewind <n> to restore, /rewind <n> preview to dry-run, /rewind <n> summary for a revert report, /rewind <n> full to also rewind the conversation`, role: 'assistant' });
           return;
         }
         if (n < 1 || n > infos.length) {
           queuedAppend({ id: `rewind-err-${Date.now()}`, kind: 'error', message: `rewind failed: only ${infos.length} checkpoint(s), got n=${n}` });
           return;
         }
+        const target = infos[n - 1]!;
+        if (mode === 'preview') {
+          // Dry run: list what WOULD be restored + current dirty state.
+          const files = await snapshotFiles(cwd, target.id);
+          let dirty = '';
+          try {
+            const { execFileSync } = await import('node:child_process');
+            dirty = execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf-8', timeout: 5000 }) as string;
+          } catch { dirty = ''; }
+          const listed = files.slice(0, 20).map((f) => `  ${f}`).join('\n') || '  (no files recorded)';
+          const dirtyLines = dirty.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 10);
+          queuedAppend({
+            id: `rewind-${Date.now()}`,
+            kind: 'text',
+            text: `Preview: /rewind ${n} would restore checkpoint ${target.id.slice(0, 12)}:\n${listed}${files.length > 20 ? `\n  … +${files.length - 20} more` : ''}${dirtyLines.length > 0 ? `\nCurrent dirty files that would be overwritten:\n${dirtyLines.map((f) => `  ${f}`).join('\n')}` : '\nWorking tree is clean.'}\nRun /rewind ${n} to apply.`,
+            role: 'assistant',
+          });
+          return;
+        }
         try {
           // Capture the pre-restore dirty state so `summary` can report it.
           let before = '';
-          if (cmd.summary) {
+          if (mode === 'summary' || mode === 'full') {
             try {
               const { execFileSync } = await import('node:child_process');
               before = execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf-8', timeout: 5000 }) as string;
             } catch { before = ''; }
           }
           await undo(cwd, n);
-          const target = infos[n - 1]!;
           let text = `Rewound to checkpoint ${n} (${target.id.slice(0, 12)}, ${target.files} file(s))`;
-          if (cmd.summary) {
+          if (mode === 'summary' || mode === 'full') {
             const files = before.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 20);
             text += files.length > 0 ? `\nReverted working-tree changes:\n${files.map((f) => `  ${f}`).join('\n')}` : '\nWorking tree was clean before restore.';
+          }
+          if (mode === 'full') {
+            // Conversation rewind: drop persisted messages/observations at
+            // or after the snapshot, so resume continues from that point.
+            if (tuiSessionId) {
+              try {
+                const removed = await tuiStore.truncateMessages(tuiSessionId, target.ts > 0 ? target.ts : Date.now());
+                text += `\nConversation rewound: dropped ${removed.messages} message(s), ${removed.observations} observation(s).`;
+              } catch (err) {
+                text += `\nConversation rewind failed (code restored): ${err instanceof Error ? err.message : String(err)}`;
+              }
+            } else {
+              text += '\nNo active session — code restored, conversation untouched.';
+            }
           }
           queuedAppend({ id: `rewind-${Date.now()}`, kind: 'text', text, role: 'assistant' });
         } catch (err) {
@@ -1615,12 +1650,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
       case 'auth': {
-        const { getStoredKey } = await import('./auth.js');
-        const rows = ['openai', 'anthropic'].map((p) => {
-          const hasFile = !!getStoredKey(p);
+        const { getStoredKeyAsync } = await import('./auth.js');
+        const rows = await Promise.all(['openai', 'anthropic'].map(async (p) => {
+          const hasKeychain = !!(await getStoredKeyAsync(p));
           const hasEnv = !!(p === 'openai' ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || !!process.env.KLYRO_API_KEY;
-          return `  ${p}: ${hasFile ? 'stored key (0600)' : hasEnv ? 'env key' : '—'}`;
-        });
+          return `  ${p}: ${hasKeychain ? 'stored key (keychain/file)' : hasEnv ? 'env key' : '—'}`;
+        }));
         queuedAppend({ id: `auth-${Date.now()}`, kind: 'text', text: `Auth:\n${rows.join('\n')}\ncurrent provider: ${currentProvider}\nmanage via /login /logout`, role: 'assistant' });
         return;
       }
@@ -2684,12 +2719,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           const pm = /^mcp__([A-Za-z0-9_-]{1,20})__([A-Za-z0-9_-]+)$/.exec(m[1]!.toLowerCase());
           if (pm) {
             const { runMcpPrompt } = await import('../mcp/registry.js');
-            const argList = m[2] ? m[2].split(/\s+/) : [];
-            const args: Record<string, string> = {};
-            argList.forEach((a, i) => { args[`arg${i + 1}`] = a; });
-            args['input'] = m[2] ?? '';
+            const tokens = m[2] ? m[2].split(/\s+/).filter(Boolean) : [];
             try {
-              const text = await runMcpPrompt(cwd, pm[1]!, pm[2]!, args);
+              const text = await runMcpPrompt(cwd, pm[1]!, pm[2]!, tokens);
               await runWithBridge(text);
             } catch (err) {
               queuedAppend({ id: `mcp-p-${Date.now()}`, kind: 'error', message: `mcp prompt failed: ${err instanceof Error ? err.message : String(err)}` });

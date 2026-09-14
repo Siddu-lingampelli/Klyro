@@ -203,7 +203,6 @@ export async function runDoctor(opts: { json?: boolean; cwd?: string } = {}): Pr
   process.stdout.write('─'.repeat(40) + '\n');
   for (const c of checks) {
     const glyph = c.ok ? '✓' : '✗';
-    const color = c.ok ? '' : '';
     process.stdout.write(`${glyph} ${c.name.padEnd(14)} ${c.detail}\n`);
   }
   process.stdout.write('─'.repeat(40) + '\n');

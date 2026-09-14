@@ -43,13 +43,64 @@ export function resetPersistentCwd(): void {
   persistentCwd = null;
 }
 
+/** Bounds for the tool-output dir (G5d) — oldest-first LRU prune. */
+export const TOOL_OUTPUT_MAX_FILES = 50;
+export const TOOL_OUTPUT_MAX_BYTES = 50 * 1024 * 1024;
+/**
+ * Prune a directory: delete oldest files until both the file-count and
+ * total-bytes bounds hold. Pure helper (exported for unit tests).
+ */
+export async function pruneDir(dir: string, maxFiles: number, maxBytes: number): Promise<string[]> {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const files: Array<{ file: string; mtimeMs: number; size: number }> = [];
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    try {
+      const st = await fs.stat(path.join(dir, e.name));
+      files.push({ file: path.join(dir, e.name), mtimeMs: st.mtimeMs, size: st.size });
+    } catch { /* raced deletion */ }
+  }
+  // Oldest first.
+  files.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  const deleted: string[] = [];
+  while (files.length > maxFiles) deleted.push(files.shift()!.file);
+  let total = files.reduce((s, f) => s + f.size, 0);
+  while (total > maxBytes && files.length > 0) {
+    const f = files.shift()!;
+    total -= f.size;
+    deleted.push(f.file);
+  }
+  await Promise.all(deleted.map((f) => fs.rm(f, { force: true }).catch(() => undefined)));
+  return deleted;
+}
+/**
+ * Prune `~/.klyro/tool-output/` (≤50 files, ≤50MB). Best-effort — never
+ * throws, failures just leave the dir unpruned until the next write.
+ */
+export async function pruneToolOutput(): Promise<void> {
+  try {
+    await pruneDir(FULL_OUTPUT_DIR, TOOL_OUTPUT_MAX_FILES, TOOL_OUTPUT_MAX_BYTES);
+  } catch {
+    /* dir missing or unreadable — nothing to prune */
+  }
+}
+
 // Filtered env — only safe vars, secrets stripped
 const ALLOWED_ENV_PREFIXES = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'NODE_', 'NPM_', 'PNPM_', 'YARN_'];
+/**
+ * Secret-name test: SECRET/TOKEN/KEY anywhere in the name. KEY covers
+ * allowed-prefix vars such as NODE_*_API_KEY / NPM_*_KEY that the prefix
+ * allowlist would otherwise admit. Case-insensitive to catch mixed-case
+ * exporters (e.g. npm_config_key). Mirrors verification/registry.ts.
+ */
+const SECRET_NAME_RE = /SECRET|TOKEN|KEY/i;
 export function filteredEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (k.startsWith('KLYRO_') && k.includes('API_KEY')) continue;
-    if (k.includes('SECRET') || k.includes('TOKEN') || k === 'ANTHROPIC_API_KEY' || k === 'OPENAI_API_KEY') continue;
+    if (SECRET_NAME_RE.test(k) || k === 'ANTHROPIC_API_KEY' || k === 'OPENAI_API_KEY') continue;
     if (ALLOWED_ENV_PREFIXES.some((p) => k.startsWith(p)) || k === 'PWD' || k === 'TMPDIR' || k === 'TEMP') {
       out[k] = v;
     }
@@ -58,7 +109,7 @@ export function filteredEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
   if (extra) {
     for (const [k, v] of Object.entries(extra)) {
       if (k === 'NODE_OPTIONS' || k === 'LD_PRELOAD' || k === 'LD_LIBRARY_PATH') continue;
-      if (k.includes('SECRET') || k.includes('TOKEN') || k === 'ANTHROPIC_API_KEY' || k === 'OPENAI_API_KEY') continue;
+      if (SECRET_NAME_RE.test(k) || k === 'ANTHROPIC_API_KEY' || k === 'OPENAI_API_KEY') continue;
       if (ALLOWED_ENV_PREFIXES.some((p) => k.startsWith(p)) || k === 'PATH' || k === 'PWD' || k === 'TMPDIR' || k === 'TEMP') {
         out[k] = v;
       }
@@ -131,6 +182,12 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /\bwget\b.*(?:\s--method=POST\b|\s--body-data\b)/i, reason: 'exfiltration: wget --method=POST/--body-data denied' },
   { pattern: /\bInvoke-RestMethod\b/i, reason: 'exfiltration: Invoke-RestMethod denied' },
   { pattern: /\bStart-BitsTransfer\b/i, reason: 'exfiltration: Start-BitsTransfer denied' },
+  // Windows has no native sandbox backend, so PowerShell network primitives
+  // are the primary upload/exfil vectors there — denied outright (partial
+  // mitigation; genuinely honest limits are documented in the audit, the real
+  // boundary is the bwrap/landlock sandbox on POSIX).
+  { pattern: /\b(Invoke-WebRequest|iwr)\b/i, reason: 'exfiltration: Invoke-WebRequest/iwr denied (no win32 sandbox backend)' },
+  { pattern: /\bSystem\.Net\.WebClient\b/i, reason: 'exfiltration: System.Net.WebClient denied (no win32 sandbox backend)' },
   // Protected-branch push deny (mirrors policy engine shellDenyRule).
   // Explicit `git push ... main|master|production`. Honored only when
   // KLYRO_ALLOW_MAIN_PUSH=1 is NOT set (see findBlockedReason). Bare
@@ -427,6 +484,8 @@ export const shellExecTool = defineTool<z.infer<typeof InputSchema>, ShellOutput
         const fullPath = path.join(FULL_OUTPUT_DIR, `${outId}.txt`);
         const fullContent = `STDOUT:\n${fullOutBuf.toString('utf-8')}\n\nSTDERR:\n${fullErrBuf.toString('utf-8')}\n`;
         await fs.writeFile(fullPath, fullContent, 'utf-8');
+        // G5d: bound the tool-output dir (~50 files / 50MB LRU). Best-effort.
+        await pruneToolOutput();
       } catch { /* ignore */ }
 
       // Head+tail truncation: keep first 15k and last 15k chars

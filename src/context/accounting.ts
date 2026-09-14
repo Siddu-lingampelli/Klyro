@@ -15,8 +15,15 @@ export interface ContextAccounting {
   toolResultMax: number;
 }
 
+/**
+ * Single output-reserve used by every budget in the harness (displayed
+ * accounting, runtime enforcement, compaction elide). One constant so the
+ * meter and the enforcer can never disagree.
+ */
+export const RESERVE_OUTPUT_TOKENS = 8000;
+
 export function accounting(system: string | undefined, messages: Message[], opts: { cap?: number; reserveOutput?: number; toolResultMax?: number; compactAt?: number; model?: string } = {}): ContextAccounting {
-  const reserveOutput = opts.reserveOutput ?? 16_000;
+  const reserveOutput = opts.reserveOutput ?? RESERVE_OUTPUT_TOKENS;
   // Window-aware default: the legacy 120k ceiling overflows small-window
   // models (e.g. 8k local models) and wastes large ones — size to the model.
   const cap = opts.cap ?? capForModel(opts.model, reserveOutput);
@@ -33,7 +40,7 @@ export function accounting(system: string | undefined, messages: Message[], opts
  * tiny windows still function. Unknown models use the registry fallback
  * window (100k); a missing model name keeps the legacy 120k.
  */
-export function capForModel(model: string | undefined, reserveOutput = 16_000): number {
+export function capForModel(model: string | undefined, reserveOutput = RESERVE_OUTPUT_TOKENS): number {
   if (!model) return 120_000;
   const window = getModelInfo(model).contextWindow;
   if (!Number.isFinite(window) || window <= 0) return 120_000;

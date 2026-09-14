@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { RemoteMcpClient, parseSseBody } from './remote.js';
+import { McpError } from './client.js';
 import { McpClient } from './client.js';
 import { makeMcpClient } from './registry.js';
 
@@ -33,6 +34,27 @@ function startStub(): Promise<{ url: string; close: () => Promise<void> }> {
     });
   });
 }
+
+describe('RemoteMcpClient G1 (remote http rejection)', () => {
+  it('refuses a plaintext remote endpoint at contract time', () => {
+    delete process.env.KLYRO_ALLOW_INSECURE_MCP;
+    expect(() => new RemoteMcpClient('bad', { url: 'http://evil.example.com/mcp' })).toThrow(McpError);
+  });
+
+  it('accepts loopback http and https', () => {
+    expect(() => new RemoteMcpClient('loop', { url: 'http://127.0.0.1:1/mcp' })).not.toThrow();
+    expect(() => new RemoteMcpClient('tls', { url: 'https://x.example/mcp' })).not.toThrow();
+  });
+
+  it('plaintext remote passes when opted in', () => {
+    process.env.KLYRO_ALLOW_INSECURE_MCP = '1';
+    try {
+      expect(() => new RemoteMcpClient('opt', { url: 'http://evil.example.com/mcp' })).not.toThrow();
+    } finally {
+      delete process.env.KLYRO_ALLOW_INSECURE_MCP;
+    }
+  });
+});
 
 describe('RemoteMcpClient', () => {
   let url = '';

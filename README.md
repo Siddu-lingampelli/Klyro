@@ -55,6 +55,19 @@ node dist/index.js chat
 | `KLYRO_WORKER=0` | Disable subprocess isolation for subagents |
 | `KLYRO_SESSIONS_DIR`, `KLYRO_UPDATE_CACHE`, `KLYRO_CREDENTIALS_FILE` | Relocatable state (tests + power users) |
 
+## New in recent releases
+
+- `klyro run --bare` — deterministic runs: skips MCP, hooks, memory/KLYRO.md/context, persistence
+- `klyro mcp trust <name>` / `mcp prompts [server]` / `mcp add <name> <https-url>` — remote MCP + prompt trust
+- `klyro agents lint` — validate `.klyro/agents/*.md` (ids, tool names)
+- `klyro init` — scan-seeded `KLYRO.md` + `.mcp.json` (never overwrites)
+- `klyro update --apply` — opt-in self-apply of the verified update
+- `klyro eval --judge-model <id>` — model-graded rubric scoring
+- Hooks: `matcher` scoping, stdin JSON, `sessionStart`/`sessionEnd`/`stop` events, JSON verdicts
+- Custom agents (`.klyro/agents/*.md`), custom commands (`.klyro/commands/*.md`), vim mode (`/vim`), `@`-file completion
+- Credentials prefer the OS keychain (macOS Keychain, Linux libsecret), 0600 file fallback
+- Headless JSON ends with exactly one stable `kind:result` envelope (parse the LAST line)
+
 ## Documentation
 
 | Doc | Purpose |

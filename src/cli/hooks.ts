@@ -12,7 +12,13 @@
  * Schema: `{ hooks: Array<{ name, event, command, matcher?, timeoutMs? }> }`.
  * `matcher` is a regex tested against the tool name — lifecycle events
  * (`sessionStart`/`sessionEnd`/`stop`) always match; tool events without a
- * matcher match every tool.
+ * matcher match every tool; invalid regex never matches.
+ *
+ * Verdict contract: stdout parsed as JSON yields `{decision, message,
+ * context, continue|cont}`. preToolUse `decision:"deny"` blocks with
+ * `message` (wins over exit code); `decision:"allow"` + `context` attaches
+ * model-visible context to the tool result. stop `continue:true` grants one
+ * more turn (max 3/run). Non-JSON stdout keeps pure exit-code semantics.
  *
  * `loadHooks` never throws — a missing file is `[]`, an invalid file is
  * `[]` plus a one-time stderr warning per path. `runHook` spawns the
@@ -51,6 +57,20 @@ export interface HookResult {
   exitCode: number | null;
   stdout: string;
   stderr: string;
+  /**
+   * Structured verdict parsed from stdout when it is a JSON object
+   * (mirrors CC hook JSON output). Fields:
+   *   - decision: 'allow' | 'deny' (preToolUse; deny wins over exit code)
+   *   - message: denial reason / continuation note
+   *   - context: extra model-visible context (preToolUse allow only)
+   *   - cont: stop-hook request to continue the loop one more turn
+   */
+  verdict?: {
+    decision?: string;
+    message?: string;
+    context?: string;
+    cont?: boolean;
+  };
 }
 
 export const DEFAULT_HOOK_TIMEOUT_MS = 30_000;
@@ -235,11 +255,13 @@ export function runHook(hook: Hook, ctx: HookContext, stdinJson?: unknown): Prom
     });
     child.on('close', (code) => {
       const exitCode = typeof code === 'number' ? code : -1;
+      const out = stdout.slice(0, MAX_HOOK_OUTPUT_CHARS);
       resolve({
         ok: exitCode === 0,
         exitCode,
-        stdout: stdout.slice(0, MAX_HOOK_OUTPUT_CHARS),
+        stdout: out,
         stderr: stderr.slice(0, MAX_HOOK_OUTPUT_CHARS),
+        ...parseVerdict(out),
       });
     });
     // Deliver the stdin JSON contract, then close so the child never hangs
@@ -255,6 +277,23 @@ export function runHook(hook: Hook, ctx: HookContext, stdinJson?: unknown): Prom
   });
 }
 
+/** Parse a structured JSON verdict from hook stdout (best-effort). */
+function parseVerdict(out: string): Pick<HookResult, 'verdict'> {
+  const trimmed = out.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return {};
+  try {
+    const p = JSON.parse(trimmed) as Record<string, unknown>;
+    const verdict: NonNullable<HookResult['verdict']> = {};
+    if (typeof p['decision'] === 'string') verdict.decision = p['decision'];
+    if (typeof p['message'] === 'string') verdict.message = (p['message'] as string).slice(0, 2000);
+    if (typeof p['context'] === 'string') verdict.context = (p['context'] as string).slice(0, 2000);
+    if (typeof p['continue'] === 'boolean') verdict.cont = p['continue'] as boolean;
+    if (typeof p['cont'] === 'boolean' && verdict.cont === undefined) verdict.cont = p['cont'] as boolean;
+    return Object.keys(verdict).length > 0 ? { verdict } : {};
+  } catch {
+    return {};
+  }
+}
 /**
  * Run all `sessionEnd` hooks for a finished run (best-effort, sequential).
  * Returns hook outputs for logging. Never throws.

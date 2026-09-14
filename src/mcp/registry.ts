@@ -31,6 +31,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { McpClient, McpError, type McpClientLike, type McpToolDef } from './client.js';
 import { RemoteMcpClient } from './remote.js';
+import { SseMcpClient } from './sse.js';
 import { loadMcpServers, type McpServerSpec } from './config.js';
 import { evaluateMcpPolicy } from './policy.js';
 import { jsonSchemaToZod } from './schema.js';
@@ -82,6 +83,28 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Recursively scrub credential-bearing keys (`authorization`, `cookie`,
+ * `x-api-key`) from a debug payload so a server echoing credentials back in
+ * an error body can't leak a live token into the capture file. Other values
+ * pass through untouched.
+ */
+function scrubCredentialKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(scrubCredentialKeys);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k.toLowerCase() === 'authorization' || k.toLowerCase() === 'cookie' || k.toLowerCase() === 'x-api-key') {
+        out[k] = '[REDACTED]';
+      } else {
+        out[k] = scrubCredentialKeys(v);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
 /** Debug-capture filename disambiguator when Date.now() collides. */
 let mcpDebugCounter = 0;
 
@@ -102,7 +125,7 @@ function captureMcpDebug(server: string, tool: string, payload: unknown): void {
       mcpDebugCounter += 1;
       file = path.join(dir, `mcp-${safe}-${Date.now()}-${mcpDebugCounter}.json`);
     }
-    fs.writeFileSync(file, JSON.stringify({ server, tool, payload }, null, 2), { mode: 0o600 });
+    fs.writeFileSync(file, JSON.stringify({ server, tool, payload: scrubCredentialKeys(payload) }, null, 2), { mode: 0o600 });
     try {
       process.stderr.write(`klyro: mcp debug captured ${server}/${tool} -> ${file}\n`);
     } catch {
@@ -169,11 +192,12 @@ async function executeMcpTool(
 }
 
 /**
- * Construct the right client for a spec: remote HTTP when `url` is set,
- * else stdio. Used by registration, probe, and prompt runs.
+ * Construct the right client for a spec: remote HTTP when `url` is set
+ * (`transport: 'sse'` selects the legacy event-stream flavor, default is
+ * Streamable HTTP), else stdio. Used by registration, probe, and prompts.
  */
 export function makeMcpClient(name: string, spec: McpServerSpec): McpClientLike {
-  if (spec.url) return new RemoteMcpClient(name, spec);
+  if (spec.url) return spec.transport === 'sse' ? new SseMcpClient(name, spec) : new RemoteMcpClient(name, spec);
   if (!spec.command) throw new McpError(`mcp server "${name}" has neither command nor url`, 'INVALID_SPEC');
   return new McpClient(name, spec);
 }
@@ -347,28 +371,77 @@ export async function loadAndRegisterMcp(opts: {  cwd: string;
 }
 
 /**
- * Run one MCP prompt (`/mcp__<server>__<prompt>`) on demand: fresh stdio
+ * Run one MCP prompt (`/mcp__<server>__<prompt>`) on demand: fresh
  * connection per invocation (no client lifecycle to manage), redacted
- * output. Typing the prompt name is explicit consent, so project servers
- * connect without the registration-time approval gate. Throws McpError /
- * Error on unknown server, disabled server, or prompt failure.
+ * output. Project servers need trust-store approval (see `klyro mcp
+ * trust`) — typing the prompt name is intent, not approval. Throws
+ * McpError / Error on unknown server, disabled server, or prompt failure.
  */
 export async function runMcpPrompt(
   cwd: string,
   server: string,
   prompt: string,
-  args: Record<string, string>,
+  tokens: string[],
+  opts: {
+    trust?: { isTrusted: (name: string, hash: string) => boolean };
+    clientFactory?: (name: string, spec: McpServerSpec) => McpClientLike;
+  } = {},
 ): Promise<string> {
   const cfg = loadMcpServers(cwd);
   const spec = cfg.servers[server];
   if (!spec) throw new Error(`mcp server not found: ${server}`);
   if (spec.disabled) throw new Error(`mcp server disabled: ${server}`);
-  const client = makeMcpClient(server, spec);
+  // Consent parity with the tool path: project-sourced servers require a
+  // trust-store approval (see `klyro mcp trust`). Typing the prompt name
+  // is intent, not approval — auto-spawning a project subprocess stays gated.
+  if (cfg.sources[server] === 'project') {
+    const { McpTrust, hashSpec } = await import('./trust.js');
+    const trust = opts.trust ?? new McpTrust();
+    if (!trust.isTrusted(server, hashSpec(spec))) {
+      throw new Error(`mcp server "${server}" is not trusted — run: klyro mcp trust ${server}`);
+    }
+  }
+  const client = (opts.clientFactory ?? makeMcpClient)(server, spec);
   if (!client.promptsGet) throw new Error(`mcp server "${server}" does not support prompts`);
+  const withConnect = client as Partial<{ connect: () => Promise<void> }>;
+  if (typeof withConnect.connect === 'function') await withConnect.connect();
+  // Typed args: `key=value` tokens bind by name; bare tokens fill the
+  // prompt's declared argument names in order; leftovers join into `input`.
+  // Servers without declared arguments keep the legacy arg1..N + input form.
+  let mapped: Record<string, string>;
   try {
-    const withConnect = client as Partial<{ connect: () => Promise<void> }>;
-    if (typeof withConnect.connect === 'function') await withConnect.connect();
-    const text = await client.promptsGet(prompt, args);
+    const defs = typeof client.promptsList === 'function' ? await client.promptsList() : [];
+    const def = defs.find((d) => d.name === prompt);
+    const declared = def?.arguments?.map((a) => a.name) ?? [];
+    // Split tokens once: key=value binds by name, bare tokens are positional.
+    mapped = {};
+    const positional: string[] = [];
+    for (const tok of tokens) {
+      const eq = tok.indexOf('=');
+      if (eq > 0) mapped[tok.slice(0, eq)] = tok.slice(eq + 1);
+      else positional.push(tok);
+    }
+    if (declared.length > 0) {
+      // Named bindings win; bare tokens fill the remaining declared slots
+      // in order; anything left over joins into `input`.
+      const free = declared.filter((d) => !(d in mapped));
+      positional.forEach((v, i) => {
+        if (i < free.length) mapped[free[i]!] = v;
+      });
+      const extras = positional.slice(free.length);
+      if (extras.length > 0) mapped['input'] = extras.join(' ');
+    } else {
+      positional.forEach((v, i) => { mapped[`arg${i + 1}`] = v; });
+      mapped['input'] = positional.join(' ');
+    }
+  } catch {
+    // prompts/list failed — fall back to legacy positional mapping.
+    mapped = {};
+    tokens.forEach((v, i) => { mapped[`arg${i + 1}`] = v; });
+    mapped['input'] = tokens.join(' ');
+  }
+  try {
+    const text = await client.promptsGet(prompt, mapped);
     return redact(text).slice(0, 8000);
   } finally {
     await client.close().catch(() => undefined);

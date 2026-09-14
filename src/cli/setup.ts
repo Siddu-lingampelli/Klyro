@@ -14,7 +14,7 @@
  * The `ask` callback is injected so this is unit-testable without a TTY.
  */
 
-import { LOGIN_DEFAULTS, getStoredKey, saveKey } from './auth.js';
+import { LOGIN_DEFAULTS, saveKey } from './auth.js';
 import { loadConfig, saveConfig } from './config.js';
 import { assertSafeBaseURL } from '../chat.js';
 
@@ -100,7 +100,8 @@ export async function runFirstRunSetup(
     const storeProvider = name === 'local' ? 'openai' : name;
 
     // Reuse an already-saved key when present — don't make the user re-paste.
-    const hasKey = !!getStoredKey(storeProvider);
+    const { getStoredKeyAsync } = await import('./auth.js');
+    const hasKey = !!(await getStoredKeyAsync(storeProvider));
     let key = '';
     if (hasKey) {
       const keep = await ask(`API key already saved for ${storeProvider} — keep it? [Y/n]: `);

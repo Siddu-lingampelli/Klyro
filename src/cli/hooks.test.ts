@@ -118,6 +118,18 @@ describe('runHook', () => {
     expect(r.ok).toBe(true);
     expect(r.stdout).toContain('preToolUse:write_file');
   });
+
+  it('parses structured JSON verdicts from stdout', async () => {
+    const cmd = `"${process.execPath}" -e "console.log(JSON.stringify({ decision: 'deny', message: 'nope', context: 'ctx' }))"`;
+    const r = await runHook({ name: 'v', event: 'preToolUse', command: cmd }, { toolName: 'x', input: {} });
+    expect(r.ok).toBe(true);
+    expect(r.verdict).toMatchObject({ decision: 'deny', message: 'nope', context: 'ctx' });
+  });
+
+  it('leaves verdict undefined for non-JSON stdout', async () => {
+    const r = await runHook({ name: 'plain', event: 'preToolUse', command: nodeOk }, { toolName: 'x', input: {} });
+    expect(r.verdict).toBeUndefined();
+  });
 });
 
 describe('hooksForEvent (v2 matchers)', () => {

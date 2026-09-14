@@ -54,9 +54,14 @@ describe('freeze when pinned (§5.6)', () => {
     expect(badgeLabel(false, 1200, false)).toBe('↓ 999+ unread');
     expect(badgeLabel(true, 5, false)).toBe('');
     expect(badgeLabel(false, 0, false)).toBe('');
-    // Idle no longer flips the wording (Ink can't capture the click the
-    // "jump to end" affordance implied); the count shows either way (§7.2).
-    expect(badgeLabel(false, 5, true)).toBe('↓ 5 unread');
+  });
+  it('badge flips to the jump-to-end affordance when idle', () => {
+    // Idle (agent done): the actionable affordance replaces the raw count.
+    expect(badgeLabel(false, 5, true)).toBe('↓ 5 · jump to end');
+    expect(badgeLabel(false, 1200, true)).toBe('↓ 999+ · jump to end');
+    // Still hidden at bottom or with zero pending lines.
+    expect(badgeLabel(true, 5, true)).toBe('');
+    expect(badgeLabel(false, 0, true)).toBe('');
   });
 });
 

@@ -77,4 +77,43 @@ describe('AuditLog hash chain', () => {
   it('canonicalJson is key-order stable', () => {
     expect(canonicalJson({ b: 1, a: 2 })).toBe(canonicalJson({ a: 2, b: 1 }));
   });
+
+  it('in-memory tip cache: chains after external change via reload', async () => {
+    const p = path.join(dir, 's2.jsonl');
+    const a = new AuditLog(p);
+    await a.write({ kind: 'session_created', sessionId: 's2', task: 't', cwd: '/x', ts: 1 });
+    await a.write({ kind: 'step_started', sessionId: 's2', step: 1, ts: 2 });
+    // A fresh instance picks up the existing chain tip (file-backed read),
+    // then chains in-memory from there.
+    const b = new AuditLog(p);
+    await b.write({ kind: 'step_completed', sessionId: 's2', step: 1, ts: 3 });
+    const res = await verifyAuditChain(dir, 's2');
+    expect(res).toEqual({ ok: true, events: 3 });
+  });
+
+  it('rotation bounds live file under maxBytes and segments verify', async () => {
+    const p = path.join(dir, 's3.jsonl');
+    // keep=10 so no record is evicted across the 40 writes: the count then
+    // equals the full write set (eviction only kicks in past keep segments).
+    const log = new AuditLog(p, /*maxBytes*/ 1024, /*keep*/ 10);
+    // Force enough writes to trigger at least one rotation.
+    for (let i = 0; i < 40; i++) {
+      await log.write({ kind: 'step_started', sessionId: 's3', step: i, ts: i });
+    }
+    const stat = await fs.stat(p);
+    expect(stat.size).toBeLessThanOrEqual(4096); // bounded live segment
+    const seg1 = await fs.stat(p + '.1').catch(() => null);
+    expect(seg1).not.toBeNull(); // at least one rotation happened
+    const res = await verifyAuditChain(dir, 's3', 10);
+    expect(res.ok).toBe(true);
+    expect(res.events).toBeGreaterThan(30);
+    // Tampering a rotated segment is also detected.
+    const segLines = (await fs.readFile(p + '.1', 'utf-8')).split('\n').filter(Boolean);
+    const bad = { ...(JSON.parse(segLines[0]!) as Record<string, unknown>), step: 9999 };
+    segLines[0] = JSON.stringify(bad);
+    await fs.writeFile(p + '.1', segLines.join('\n') + '\n', 'utf-8');
+    const res2 = await verifyAuditChain(dir, 's3', 10);
+    expect(res2.ok).toBe(false);
+    expect(res2.error).toMatch(/s3\.jsonl\.1/);
+  });
 });

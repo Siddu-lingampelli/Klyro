@@ -22,8 +22,7 @@ describe('SessionStore', () => {
     expect(fetched?.id).toBe(r.id);
   });
 
-  it('appends messages and observations', async () => {
-    const r = await store.create({ cwd: '/x', task: 't', config: { model: 'm', maxSteps: 10 } });
+  it('appends messages and observations', async () => {    const r = await store.create({ cwd: '/x', task: 't', config: { model: 'm', maxSteps: 10 } });
     await store.appendMessage(r.id, { role: 'user', content: 'hi', ts: 1 });
     await store.appendMessage(r.id, { role: 'assistant', content: 'hello', ts: 2 });
     const msgs = await store.loadMessages(r.id);
@@ -40,6 +39,20 @@ describe('SessionStore', () => {
     const obs = await store.loadObservations(r.id);
     expect(obs).toHaveLength(1);
     expect(obs[0]?.toolName).toBe('read_file');
+  });
+
+  it('truncateMessages drops messages/observations at or after a cutoff', async () => {
+    const r = await store.create({ cwd: '/x', task: 't', config: { model: 'm', maxSteps: 10 } });
+    await store.appendMessage(r.id, { role: 'user', content: 'old', ts: 1 });
+    await store.appendMessage(r.id, { role: 'assistant', content: 'new', ts: 100 });
+    await store.appendObservation(r.id, {
+      toolCallId: 'c1', toolName: 'read_file', input: {}, output: 'x',
+      isError: false, startedAt: 100, finishedAt: 101,
+    });
+    const removed = await store.truncateMessages(r.id, 50);
+    expect(removed).toEqual({ messages: 1, observations: 1 });
+    expect(await store.loadMessages(r.id)).toHaveLength(1);
+    expect(await store.loadObservations(r.id)).toHaveLength(0);
   });
 
   it('forks with copied messages and observations', async () => {

@@ -930,8 +930,9 @@ describe('App', () => {
     stdin.write(KEY_HOME);
     await waitForMatch(lastFrame, /⇅ 0\/\d+/);
     hooks!.append({ id: 'late-1', kind: 'text', text: 'LATE-1-tag', role: 'assistant' });
-    // Badge counts lines grown while pinned.
-    await waitForMatch(lastFrame, /↓ \d+ unread/);
+    // Badge counts lines grown while pinned (idle shows "jump to end" affordance).
+    await waitForMatch(lastFrame, /↓ \d+/);
+    expect(lastFrame() ?? '').toContain('· jump to end');
     hooks!.clearTranscript();
     // Wait for transcript content to actually clear (no stale MSG-* items) —
     // this is the "no stale badge" invariant: after a clear, the view must

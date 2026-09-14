@@ -12,6 +12,7 @@ import { TuiApprovalBridge, ApprovalModal } from './approval.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash, suggestCommands } from '../cli/slash/parser.js';
 import { loadCustomCommands, listCompletableFiles } from '../cli/slash/custom.js';
+import { loadMcpServers } from '../mcp/config.js';
 import { tokens, g } from './tokens.js';
 import {
   initialScroll,
@@ -172,7 +173,7 @@ function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width
             let color: string | undefined;
             if (dim) color = p.dim ? dimColor : undefined;
             else if (p.color) color = p.color;
-            else if (p.href) color = 'blue';
+            else if (p.href) color = tokens.colors.info;
             else if (p.dim) color = dimColor;
             else if (p.code) color = softColor;
             else if (p.bold) color = softColor;
@@ -427,10 +428,14 @@ export function App(props: AppProps): React.JSX.Element {
     if (thinkingTimer.current) { clearTimeout(thinkingTimer.current); thinkingTimer.current = null; }
   }, []);
   // Flush pending tail before unmount so no trailing delta is lost.
+  // (React may drop post-unmount setStates; the turn-end effect above is
+  // the primary guarantee — this covers paths that unmount mid-stream.)
   useEffect(() => () => {
+    flushStream();
+    flushThinking();
     if (streamTimer.current) clearTimeout(streamTimer.current);
     if (thinkingTimer.current) clearTimeout(thinkingTimer.current);
-  }, []);
+  }, [flushStream, flushThinking]);
 
   const width = stdout?.columns ?? 100;
   const height = stdout?.rows ?? 30;
@@ -708,8 +713,19 @@ export function App(props: AppProps): React.JSX.Element {
       return [];
     }
   }, [props.cwd]);
+  // MCP prompt stems: `/mcp__<server>__` completes server names so prompt
+  // commands are discoverable; full prompt names need a live connection
+  // (see `klyro mcp prompts`), so the stem carries that hint.
+  const mcpStems = useMemo(() => {
+    if (!input.startsWith('/mcp__')) return [];
+    try {
+      return Object.keys(loadMcpServers(props.cwd).servers).map((s) => ({ name: `mcp__${s}__`, hint: 'mcp server — run `mcp prompts <server>` for names' }));
+    } catch {
+      return [];
+    }
+  }, [props.cwd, input]);
   const slashSuggest = input.startsWith('/') && !input.slice(1).includes(' ') && !awaitingApproval
-    ? suggestCommands(input, 6, customCmds)
+    ? suggestCommands(input, 6, [...customCmds, ...mcpStems])
     : [];
   // `@` file completion — fuzzy over the workspace file index while typing
   // a mention token (no space yet). Directories carry trailing `/`.
@@ -720,7 +736,11 @@ export function App(props: AppProps): React.JSX.Element {
       return [];
     }
   }, [props.cwd]);
-  const atToken = /^@(\S*)$/.exec(input);
+  // @-completion now matches a mention at ANY position (mid-line included),
+// not just a whole-input `^@token`. Complete-at-cursor semantics: the token
+// ends at the end of input (Tab-completion surface). `foo bar @ut` completes
+// just like a bare `@ut` did.
+  const atToken = /(?:^|\s)@(\S*)$/.exec(input);
   const pathSuggest = atToken && !awaitingApproval
     ? suggestCommands(`/${atToken[1] ?? ''}`, 6, fileIndex.map((f) => ({ name: f, hint: 'file' }))).map((d) => ({ ...d, name: `@${d.name}` }))
     : [];
@@ -736,7 +756,14 @@ export function App(props: AppProps): React.JSX.Element {
     }
     if ((key.tab || inputStr === '\t') && pathSuggest.length > 0) {
       const top = pathSuggest[0]!;
-      setInput(`${top.name} `);
+      // Mid-line @: splice the completed filename into the mention token,
+      // preserving the message prefix (`look at @ut` → `look at @util.ts`).
+      const m = /(?:^|\s)@(\S*)$/.exec(input);
+      if (m && m[1] !== undefined) {
+        setInput(input.slice(0, input.length - m[1].length) + top.name.slice(1) + ' ');
+      } else {
+        setInput(`${top.name} `);
+      }
       setVimCursor(null);
       return;
     }

@@ -149,8 +149,9 @@ async function main(): Promise<void> {
   program
     .command('update')
     .description('Check for klyro updates (cached 24h, KLYRO_NO_UPDATE_CHECK=1 to disable)')
-    .action(async () => {
-      const code = await runUpdate();
+    .option('--apply', 'Apply the update now via npm i -g (opt-in; default is notify-only)')
+    .action(async (opts: { apply?: boolean }) => {
+      const code = await runUpdate({ apply: !!opts.apply });
       process.exit(code);
     });
 
@@ -617,7 +618,7 @@ async function main(): Promise<void> {
   const sessions = program.command('sessions').description('Alias for session (same subcommands)');
   sessions.command('list').description('List persisted sessions').option('--status <s>', 'Filter by status').option('--json', 'Output JSON').action(async (opts: { status?: string; json?: boolean }) => { await sessionList(opts); });
   sessions.command('show <id>').description('Show session transcript and observations').option('--json', 'Output JSON').action(async (id: string, opts: { json?: boolean }) => { await sessionShow(id, opts); });
-  sessions.command('resume <id>').description('Resume a persisted session').option('-m, --model <id>', 'Model').option('--max-steps <n>', 'Max steps', (v) => parsePositiveInt('--max-steps', v)).action(async (id: string, opts: { model?: string; maxSteps?: number }) => { await sessionResume(id, opts); });
+  sessions.command('resume <id>').description('Resume a persisted session').option('-m, --model <id>', 'Model').option('--max-steps <n>', 'Max steps', (v) => parsePositiveInt('--max-steps', v)).option('--verify-command <cmd>', 'Override verification command').option('--verify', 'Enable verification (default: enabled)').action(async (id: string, opts: { model?: string; maxSteps?: number; verifyCommand?: string; verify?: boolean }) => { await sessionResume(id, opts); });
   sessions.command('export <id> [file]').description('Export session to file (9.4)').action(async (id: string, file?: string) => { await sessionExport(id, file); });
   sessions.command('import <file>').description('Import session from file (restores record + messages + observations)').action(async (file: string) => { await sessionImport(file); });
   sessions.command('fork <id>').description('Fork session with full context (9.4)').action(async (id: string) => { await sessionFork(id); });
@@ -697,8 +698,52 @@ async function main(): Promise<void> {
       try { await client.close(); } catch { /* ignore */ }
     }
   });
-  mcp.command('serve').description('Serve builtin tools as an MCP server over stdio (policy-gated)').action(async () => {
-    const { serveStdio } = await import('./mcp/serve.js');
+  mcp.command('trust <name>').description('Trust a project MCP server spec (records its hash, enables auto-connect)').action(async (name: string) => {
+    const { loadMcpServers } = await import('./mcp/config.js');
+    const { McpTrust, hashSpec } = await import('./mcp/trust.js');
+    const cfg = loadMcpServers(process.cwd());
+    const spec = cfg.servers[name];
+    if (!spec) {
+      process.stderr.write(`klyro: mcp server not found: ${name}\n`);
+      process.exit(2);
+    }
+    new McpTrust().approve(name, hashSpec(spec));
+    process.stdout.write(`trusted mcp server "${name}" (source=${cfg.sources[name] ?? 'unknown'})\n`);
+  });
+  mcp.command('prompts [server]').description('List MCP prompts as /mcp__<server>__<prompt> slash names').action(async (server?: string) => {
+    const { loadMcpServers, enabledServers } = await import('./mcp/config.js');
+    const { makeMcpClient } = await import('./mcp/registry.js');
+    const cfg = loadMcpServers(process.cwd());
+    const targets = server ? [server] : Object.keys(enabledServers(cfg));
+    if (targets.length === 0) {
+      process.stdout.write('mcp prompts: none (no servers configured)\n');
+      return;
+    }
+    let shown = 0;
+    for (const name of targets) {
+      const spec = cfg.servers[name];
+      if (!spec) {
+        process.stderr.write(`klyro: mcp server not found: ${name}\n`);
+        continue;
+      }
+      const client = makeMcpClient(name, spec);
+      try {
+        const withConnect = client as Partial<{ connect: () => Promise<void> }>;
+        if (typeof withConnect.connect === 'function') await withConnect.connect();
+        const prompts = typeof client.promptsList === 'function' ? await client.promptsList() : [];
+        for (const p of prompts) {
+          process.stdout.write(`/mcp__${name}__${p.name}${p.description ? ` — ${p.description}` : ''}\n`);
+          shown++;
+        }
+      } catch (err) {
+        process.stderr.write(`klyro: mcp prompts ${name} failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      } finally {
+        try { await client.close(); } catch { /* ignore */ }
+      }
+    }
+    if (shown === 0) process.stdout.write('mcp prompts: none exposed by configured servers\n');
+  });
+  mcp.command('serve').description('Serve builtin tools as an MCP server over stdio (policy-gated)').action(async () => {    const { serveStdio } = await import('./mcp/serve.js');
     const code = await serveStdio(process.cwd());
     process.exit(code);
   });
@@ -717,9 +762,37 @@ async function main(): Promise<void> {
     }
     for (const h of hooks) process.stdout.write(`${h.name} ${h.event}${h.matcher ? ` (${h.matcher})` : ''} ${h.command}\n`);
   });
-  program.command('agents [name] [extra...]').description('List agents (builtins + .klyro/agents/*.md), show one, or run: agents run <name> <task...>').action(async (name?: string, extra?: string[]) => {
+  program.command('agents [name] [extra...]').description('List agents (builtins + .klyro/agents/*.md), show one, lint files, or run: agents run <name> <task...>').action(async (name?: string, extra?: string[]) => {
     const { listAllAgents } = await import('./agent/orchestrator.js');
     const ALL = listAllAgents(process.cwd());
+    // `klyro agents lint`: validate custom agent files (ids, tool names).
+    if (name === 'lint') {
+      const { loadCustomAgents } = await import('./agent/custom-agents.js');
+      const { builtinRegistry } = await import('./tools/registry.js');
+      const known = new Set(builtinRegistry().list().map((t) => t.name));
+      const customs = loadCustomAgents(process.cwd());
+      if (customs.length === 0) {
+        process.stdout.write('agents lint: no custom agents in .klyro/agents/ (or ~/.klyro/agents/)\n');
+        return;
+      }
+      let bad = 0;
+      for (const a of customs) {
+        const problems: string[] = [];
+        if (!a.description || a.description === `Custom agent ${a.id}`) problems.push('missing description');
+        for (const t of a.allowedTools ?? []) {
+          if (!known.has(t)) problems.push(`unknown tool "${t}" (will be dropped at spawn)`);
+        }
+        if (!a.prompt && !(a.allowedTools ?? []).length) problems.push('no prompt body and no tools — agent has no specialization');
+        if (problems.length > 0) {
+          bad++;
+          process.stdout.write(`${a.id} (${a.source ?? 'custom'}):\n${problems.map((p) => `  ! ${p}`).join('\n')}\n`);
+        } else {
+          process.stdout.write(`${a.id} (${a.source ?? 'custom'}): ok\n`);
+        }
+      }
+      if (bad > 0) process.exit(2);
+      return;
+    }
     // `klyro agents run <name> <task...>`: one-shot run under a named agent.
     if (name === 'run') {
       const [agentName, ...taskParts] = extra ?? [];

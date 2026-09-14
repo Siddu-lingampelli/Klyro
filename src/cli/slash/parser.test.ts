@@ -182,7 +182,9 @@ describe('slash command parser', () => {
   it('parses /rewind variants and /checkpoints', () => {
     expect(parse('/rewind')).toEqual({ kind: 'rewind', n: 1 });
     expect(parse('/rewind 3')).toEqual({ kind: 'rewind', n: 3 });
-    expect(parse('/rewind 2 summary')).toEqual({ kind: 'rewind', n: 2, summary: true });
+    expect(parse('/rewind 2 summary')).toEqual({ kind: 'rewind', n: 2, mode: 'summary' });
+    expect(parse('/rewind 2 preview')).toEqual({ kind: 'rewind', n: 2, mode: 'preview' });
+    expect(parse('/rewind 2 full')).toEqual({ kind: 'rewind', n: 2, mode: 'full' });
     expect(parse('/rewind 0')).toEqual({ kind: 'rewind', n: 1 });
     expect(parse('/checkpoints').kind).toBe('checkpoints');
   });

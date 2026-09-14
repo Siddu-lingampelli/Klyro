@@ -94,6 +94,19 @@ export interface RunEvalOptions {
 }
 
 export async function runEval(opts: RunEvalOptions): Promise<number> {
+  // Live judge adapter (shared by suite + JSONL paths) for `judge.rubric`.
+  let judgeAdapter: ProviderAdapter | undefined;
+  if (opts.judgeModel) {
+    const { httpChatAdapter } = await import('../agent/provider-adapter.js');
+    const { getStoredKeyAsync } = await import('./auth.js');
+    const baseUrl = process.env.KLYRO_BASE_URL;
+    const apiKey = process.env.KLYRO_API_KEY ?? (await getStoredKeyAsync('openai')) ?? (await getStoredKeyAsync('anthropic'));
+    if (!baseUrl || !apiKey) {
+      stderr.write('klyro eval: --judge-model needs KLYRO_BASE_URL and KLYRO_API_KEY (or a stored key)\n');
+      return 2;
+    }
+    judgeAdapter = httpChatAdapter({ baseURL: baseUrl, apiKey });
+  }
   // 5.4 — suite mode: load from evals/fixtures
   if (opts.suite) {
     const { runHarness, loadFileFixture } = await import('../eval/harness.js');
@@ -137,12 +150,17 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
       stderr.write(`klyro eval: no fixtures for suite ${opts.suite}\n`);
       return 2;
     }
-    // Simple harness for suite: just run check.sh via file fixtures
-    const { runFileFixture, loadFileFixture: loadFF } = await import('../eval/harness.js');
+    // Suite runner: agent-driven fixtures (script.json) execute the real
+    // runtime + tools before check.sh; static fixtures just run check.sh.
+    // --judge-model threads a live grader into both paths that declare rubrics.
+    const { runFileFixture, runAgentFixture, loadFileFixture: loadFF } = await import('../eval/harness.js');
     const results = [];
     for (const t of tasks) {
       const fixture = await loadFF(path.join(fixturesDir, t.id));
-      const r = await runFileFixture(fixture, { runs: opts.runs, parallel: opts.parallel });
+      const judgeOpts = judgeAdapter && opts.judgeModel ? { judgeAdapter, judgeModel: opts.judgeModel } : {};
+      const r = fixture.script
+        ? await runAgentFixture(fixture, judgeOpts)
+        : await runFileFixture(fixture, { runs: opts.runs, parallel: opts.parallel });
       results.push(r);
       const tag = r.status === 'pass' ? 'PASS' : 'FAIL';
       if (opts.output === 'json') stdout.write(JSON.stringify({ kind: 'eval_result', ...r }) + '\n');
@@ -167,19 +185,7 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
     return 2;
   }
 
-  // Live judge adapter for `judge.rubric` (env endpoint + key; mock otherwise).
-  let judgeAdapter: ProviderAdapter | undefined;
-  if (opts.judgeModel) {
-    const { httpChatAdapter } = await import('../agent/provider-adapter.js');
-    const { getStoredKey } = await import('./auth.js');
-    const baseUrl = process.env.KLYRO_BASE_URL;
-    const apiKey = process.env.KLYRO_API_KEY ?? getStoredKey('openai') ?? getStoredKey('anthropic');
-    if (!baseUrl || !apiKey) {
-      stderr.write('klyro eval: --judge-model needs KLYRO_BASE_URL and KLYRO_API_KEY (or a stored key)\n');
-      return 2;
-    }
-    judgeAdapter = httpChatAdapter({ baseURL: baseUrl, apiKey });
-  }
+  // Live judge adapter was built at the top (shared with suite mode).
 
   const results: EvalResult[] = [];
   for (const sc of scenarios) {

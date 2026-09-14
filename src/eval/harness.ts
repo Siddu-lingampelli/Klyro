@@ -75,10 +75,14 @@ function scriptedAdapter(script: StreamEvent[][]): ProviderAdapter {
 
 export async function runTask(
   t: ScriptedTask,
-  opts: { judgeAdapter?: ProviderAdapter; judgeModel?: string } = {},
+  opts: { judgeAdapter?: ProviderAdapter; judgeModel?: string; workDir?: string } = {},
 ): Promise<TaskResult> {
   const start = Date.now();
-  const cwd = path.join(os.tmpdir(), 'klyro-eval-' + t.id + '-' + Math.random().toString(36).slice(2));
+  // workDir lets callers seed a repo and inspect outcomes afterwards
+  // (agent-driven fixtures); otherwise an isolated tmp dir is used and
+  // removed.
+  const owned = !opts.workDir;
+  const cwd = opts.workDir ?? path.join(os.tmpdir(), 'klyro-eval-' + t.id + '-' + Math.random().toString(36).slice(2));
   await fs.mkdir(cwd, { recursive: true });
 
   const reg = new ToolRegistry()
@@ -151,7 +155,9 @@ export async function runTask(
       ...(judge ? { judge } : {}),
     };
   } finally {
-    try { await fs.rm(cwd, { recursive: true, force: true }); } catch {}
+    if (owned) {
+      try { await fs.rm(cwd, { recursive: true, force: true }); } catch {}
+    }
   }
 }
 
@@ -204,8 +210,14 @@ export interface FileFixture {
   checkSh: string;
   meta: Record<string, unknown>;
   repo?: string;
+  /**
+   * Optional canned agent turns (StreamEvent[][], same shape as
+   * ScriptedTask.script). When present the fixture is agent-driven: the
+   * runtime executes the script with real tools in a seeded tmp repo and
+   * check.sh then asserts the filesystem outcomes.
+   */
+  script?: StreamEvent[][];
 }
-
 export async function loadFileFixture(dir: string): Promise<FileFixture> {
   const task = await fs.readFile(path.join(dir, 'task.md'), 'utf-8').catch(() => 'test task');
   const checkSh = await fs.readFile(path.join(dir, 'check.sh'), 'utf-8').catch(() => 'exit 0');
@@ -213,7 +225,12 @@ export async function loadFileFixture(dir: string): Promise<FileFixture> {
   try { meta = JSON.parse(await fs.readFile(path.join(dir, 'meta.json'), 'utf-8')); } catch { /* ignore */ }
   let repo: string | undefined;
   try { repo = await fs.readFile(path.join(dir, 'repo'), 'utf-8'); } catch { /* ignore */ }
-  return { dir, task: task.trim(), checkSh, meta, repo };
+  let script: StreamEvent[][] | undefined;
+  try {
+    const raw = JSON.parse(await fs.readFile(path.join(dir, 'script.json'), 'utf-8')) as unknown;
+    if (Array.isArray(raw)) script = raw as StreamEvent[][];
+  } catch { /* no script → static fixture */ }
+  return { dir, task: task.trim(), checkSh, meta, ...(repo ? { repo } : {}), ...(script ? { script } : {}) };
 }
 
 export async function runFileFixture(fixture: FileFixture, opts: { runs?: number; parallel?: number } = {}): Promise<TaskResult> {
@@ -252,8 +269,65 @@ export async function runFileFixture(fixture: FileFixture, opts: { runs?: number
   return result;
 }
 
-/** Hook the harness up to a session + audit log so task runs are durable. */
-export async function runHarnessWithPersistence(
+/**
+ * Agent-driven fixture: seed a tmp repo, run the fixture's canned script
+ * through the REAL runtime + tools, then assert outcomes with check.sh
+ * (plus optional meta judge rubric). This is what makes fixtures more than
+ * static `exit 0` stubs: the agent loop genuinely executes.
+ */
+export async function runAgentFixture(
+  fixture: FileFixture,
+  opts: { judgeAdapter?: ProviderAdapter; judgeModel?: string } = {},
+): Promise<TaskResult> {
+  const start = Date.now();
+  const id = path.basename(fixture.dir);
+  if (!fixture.script) {
+    return { id, status: 'fail', details: 'agent fixture needs script.json', durationMs: Date.now() - start };
+  }
+  const tmp = path.join(os.tmpdir(), 'klyro-eval-agent-' + Math.random().toString(36).slice(2));
+  await fs.mkdir(tmp, { recursive: true });
+  try {
+    if (fixture.repo) {
+      const src = path.isAbsolute(fixture.repo) ? fixture.repo : path.join(fixture.dir, fixture.repo);
+      await fs.cp(src, tmp, { recursive: true }).catch(() => undefined);
+    }
+    const meta = fixture.meta;
+    const judgeRubric = meta['judge'] && typeof meta['judge'] === 'object'
+      ? ((meta['judge'] as { rubric?: unknown }).rubric as unknown)
+      : undefined;
+    const r = await runTask(
+      {
+        id,
+        description: fixture.task.slice(0, 120),
+        task: fixture.task,
+        script: fixture.script,
+        expectStatus: (typeof meta['expectStatus'] === 'string' ? meta['expectStatus'] : 'complete') as ScriptedTask['expectStatus'],
+        ...(typeof meta['expectToolCalls'] === 'number' ? { expectToolCalls: meta['expectToolCalls'] as number } : {}),
+        ...(Array.isArray(judgeRubric) && judgeRubric.every((s) => typeof s === 'string') ? { judge: { rubric: judgeRubric as string[] } } : {}),
+      },
+      { workDir: tmp, ...(opts.judgeAdapter ? { judgeAdapter: opts.judgeAdapter, judgeModel: opts.judgeModel } : {}) },
+    );
+    if (r.status === 'fail') return { ...r, durationMs: Date.now() - start };
+    // Structural pass — now assert real filesystem outcomes.
+    const { spawn } = await import('node:child_process');
+    const out: string = await new Promise((resolve) => {
+      const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false });
+      let buf = '';
+      child.stdout?.on('data', (b: Buffer) => { buf += b.toString(); });
+      child.stderr?.on('data', (b: Buffer) => { buf += b.toString(); });
+      child.on('close', (code) => resolve(`exit=${code ?? -1} ${buf.slice(0, 500)}`));
+      child.on('error', (err) => resolve(`spawn-error: ${String(err)}`));
+    });
+    if (!out.startsWith('exit=0')) {
+      return { ...r, status: 'fail', details: `${r.details} check.sh: ${out}`.trim(), durationMs: Date.now() - start };
+    }
+    return { ...r, durationMs: Date.now() - start };
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/** Hook the harness up to a session + audit log so task runs are durable. */export async function runHarnessWithPersistence(
   tasks: ScriptedTask[],
   opts: { storeDir: string; auditPath: string },
 ): Promise<HarnessSummary> {

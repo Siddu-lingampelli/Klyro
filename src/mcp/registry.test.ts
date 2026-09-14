@@ -40,6 +40,9 @@ class FakeClient implements McpClientLike {
   async listResources() {
     return [];
   }
+  async promptsGet() {
+    return 'fake-prompt-text';
+  }
   async close(): Promise<void> {
     this.closed = true;
   }
@@ -392,6 +395,46 @@ describe('loadAndRegisterMcp project consent', () => {
     expect(res.registered).toContain('mcp__proj1__t');
     expect(res.errors.filter((e) => e.server === 'proj1')).toEqual([]);
     await res.closeAll();
+  });
+
+  it('runMcpPrompt refuses untrusted project servers (consent parity)', async () => {
+    const dir = mkProjectDir({ proj1: projSpec });
+    await expect(
+      (await import('./registry.js')).runMcpPrompt(dir, 'proj1', 'p', [], {
+        trust: { isTrusted: () => false },
+      }),
+    ).rejects.toThrow(/not trusted — run: klyro mcp trust proj1/);
+  });
+
+  it('runMcpPrompt runs trusted project servers through the factory', async () => {
+    const dir = mkProjectDir({ proj1: projSpec });
+    const { runMcpPrompt } = await import('./registry.js');
+    const text = await runMcpPrompt(dir, 'proj1', 'p', [], {
+      trust: { isTrusted: () => true },
+      clientFactory: () => new FakeClient(),
+    });
+    expect(text).toBe('fake-prompt-text');
+  });
+
+  it('runMcpPrompt maps positional tokens onto declared argument names', async () => {
+    const dir = mkProjectDir({ proj1: projSpec });
+    const { runMcpPrompt } = await import('./registry.js');
+    let seen: Record<string, string> | undefined;
+    const factory = () => new (class extends FakeClient {
+      override async promptsList() {
+        return [{ name: 'p', arguments: [{ name: 'title' }, { name: 'level' }] }];
+      }
+      override async promptsGet(_name: string, args?: Record<string, string>) {
+        seen = args;
+        return 'ok';
+      }
+    })();
+    const text = await runMcpPrompt(dir, 'proj1', 'p', ['hello', 'level=high', 'extra'], {
+      trust: { isTrusted: () => true },
+      clientFactory: factory,
+    });
+    expect(text).toBe('ok');
+    expect(seen).toMatchObject({ title: 'hello', level: 'high', input: 'extra' });
   });
 
 describe('KLYRO_MCP_DEBUG capture', () => {

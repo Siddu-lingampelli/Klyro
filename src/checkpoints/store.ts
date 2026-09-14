@@ -165,6 +165,18 @@ export async function listCheckpointInfo(cwd: string): Promise<CheckpointInfo[]>
   return out;
 }
 
+/** File paths a snapshot would restore (for `/rewind <n> preview`). */
+export async function snapshotFiles(cwd: string, id: string): Promise<string[]> {
+  try {
+    const meta = JSON.parse(await fs.readFile(path.join(ckptDir(cwd), id, '.meta.json'), 'utf-8')) as { files?: string[]; missing?: string[] };
+    const files = Array.isArray(meta.files) ? meta.files : [];
+    const missing = Array.isArray(meta.missing) ? meta.missing.map((f) => `${f} (deleted)`) : [];
+    return [...files, ...missing];
+  } catch {
+    return [];
+  }
+}
+
 export async function diff(cwd: string, id?: string): Promise<string> {
   const ckpts = await listCheckpoints(cwd);
   const target = id ?? ckpts[ckpts.length - 1];

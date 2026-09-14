@@ -709,6 +709,47 @@ describe('runtime: level-7 telemetry', () => {
     expect(r.toolCalls).toBe(1);
   });
 
+    it('stop hook continue:true extends the run by one turn (bounded)', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'klyro-stop-'));
+    mkdirSync(join(dir, '.klyro'), { recursive: true });
+    writeFileSync(
+      path.join(dir, '.klyro', 'hooks.json'),
+      JSON.stringify({ hooks: [{ name: 'cont', event: 'stop', command: `"${process.execPath}" -e "console.log(JSON.stringify({ continue: true, message: 'keep going' }))"` }] }),
+      'utf-8',
+    );
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool).register(shellExecTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'shell_exec' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{"command":"echo hi"}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'second' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'final' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const r = await run(
+      { task: 'stop-continue', cwd: dir, model: 'mock', maxSteps: 5, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('complete');
+    expect(r.steps).toBe(3);
+    expect(JSON.stringify(r.transcript)).toContain('keep going');
+  });
+
   it('never executes malformed tool calls — structured MALFORMED_TOOL_CALL instead', async () => {    const { z } = await import('zod');
     const { defineTool } = await import('../tools/types.js');
     let executed = 0;

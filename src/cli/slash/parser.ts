@@ -26,7 +26,7 @@ export type SlashCommand =
   | { kind: 'fast'; state: string }
   | { kind: 'diff' }
   | { kind: 'undo'; n?: number }
-  | { kind: 'rewind'; n?: number; summary?: boolean }
+  | { kind: 'rewind'; n?: number; mode?: 'summary' | 'preview' | 'full' }
   | { kind: 'checkpoints' }
   | { kind: 'plan'; task?: string }
   | { kind: 'todos' }
@@ -165,14 +165,17 @@ export function parse(input: string): SlashCommand {
       return { kind: 'undo', n: Number.isInteger(un) && un > 0 ? un : 1 };
     }
     case 'rewind': {
-      // /rewind [n] [summary] — nth-back snapshot (1 = latest), optional
-      // post-restore summary of the reverted changes.
+      // /rewind [n] [summary|preview|full] — nth-back snapshot (1 = latest).
+      // summary: post-restore revert report; preview: dry-run file list;
+      // full: code restore + truncate conversation after the snapshot.
       const parts = rest.split(/\s+/).filter(Boolean);
       const n = parts.length > 0 ? Number(parts[0]) : 1;
+      const modeWord = parts.slice(1).join(' ').toLowerCase();
+      const mode = modeWord === 'summary' || modeWord === 'preview' || modeWord === 'full' ? modeWord : undefined;
       return {
         kind: 'rewind',
         n: Number.isInteger(n) && (n as number) > 0 ? (n as number) : 1,
-        ...(parts.slice(1).join(' ').toLowerCase() === 'summary' ? { summary: true as const } : {}),
+        ...(mode ? { mode } : {}),
       };
     }
     case 'checkpoints': return { kind: 'checkpoints' };

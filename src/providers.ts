@@ -95,7 +95,7 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
 
   // Persisted config — the "set once, works in every terminal" layer.
   {
-    const { getStoredKey } = await import('./cli/auth.js');
+    const { getStoredKeyAsync } = await import('./cli/auth.js');
     if (cfgBase) {
       try {
         assertSafeBaseURL(cfgBase, { allowInsecure });
@@ -107,7 +107,7 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
         return null;
       }
       {
-        const key = envKey ?? cfgKey ?? getStoredKey(cfgProvider ?? 'openai') ?? getStoredKey('openai') ?? getStoredKey('anthropic') ?? '';
+        const key = envKey ?? cfgKey ?? (await getStoredKeyAsync(cfgProvider ?? 'openai')) ?? (await getStoredKeyAsync('openai')) ?? (await getStoredKeyAsync('anthropic')) ?? '';
         return {
           baseURL: normalizeBaseURL(cfgBase),
           apiKey: key,
@@ -125,8 +125,8 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
       };
     }
     // Stored keys alone (e.g. `klyro login` with defaults, or key-only setup).
-    const anthropicKey = getStoredKey('anthropic');
-    const openaiKey = getStoredKey('openai');
+    const anthropicKey = await getStoredKeyAsync('anthropic');
+    const openaiKey = await getStoredKeyAsync('openai');
     if (cfgProvider === 'anthropic' && anthropicKey) {
       return {
         baseURL: normalizeBaseURL('https://api.anthropic.com/v1'),

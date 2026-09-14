@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { expandEnv, loadMcpServers, MAX_MCP_TIMEOUT_MS, addProjectServer, removeProjectServer } from './config.js';
+import { expandEnv, loadMcpServers, MAX_MCP_TIMEOUT_MS, addProjectServer, removeProjectServer, McpServerSpecSchema } from './config.js';
 
 describe('expandEnv', () => {
   it('expands ${env:VAR} from process.env', () => {
@@ -68,6 +68,70 @@ describe('loadMcpServers', () => {
     } finally {
       delete process.env['KLYRO_MCP_TEST_KEY'];
     }
+  });
+});
+
+describe('MCP remote URL guard (G1)', () => {
+  it('accepts https remote urls', () => {
+    const r = McpServerSpecSchema.safeParse({ url: 'https://mcp.example.com/rpc' });
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts loopback http urls (local dev)', () => {
+    for (const u of ['http://127.0.0.1:8080/mcp', 'http://localhost:3000/x', 'http://[::1]:9999/y']) {
+      expect(McpServerSpecSchema.safeParse({ url: u, command: undefined }).success, u).toBe(true);
+    }
+  });
+
+  it('rejects remote plaintext http unless opted in', () => {
+    const u = 'http://evil.example.com/mcp';
+    expect(McpServerSpecSchema.safeParse({ url: u }).success).toBe(false);
+    process.env.KLYRO_ALLOW_INSECURE_MCP = '1';
+    try {
+      expect(McpServerSpecSchema.safeParse({ url: u }).success).toBe(true);
+    } finally {
+      delete process.env.KLYRO_ALLOW_INSECURE_MCP;
+    }
+  });
+
+  it('remote plaintext http never reaches the registry (loadMcpServers skips it)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-mcp-g1-'));
+    writeProject(dir, {
+      bad: { url: 'http://evil.example.com/mcp' },
+      good: { url: 'https://mcp.example.com/rpc' },
+    });
+    const cfg = loadMcpServers(dir);
+    expect(cfg.servers['bad']).toBeUndefined();
+    expect(cfg.servers['good']?.url).toBe('https://mcp.example.com/rpc');
+  });
+});
+
+describe('B2 MCP auth field (OAuth/PKCE)', () => {
+  it('accepts an auth block on a remote (url) server', () => {
+    const r = McpServerSpecSchema.safeParse({
+      url: 'https://mcp.example.com/rpc',
+      auth: { clientId: 'klyro-cli', scopes: 'read write' },
+    });
+    expect(r.success).toBe(true);
+    expect(r.data?.auth?.clientId).toBe('klyro-cli');
+  });
+
+  it('rejects an auth block on a stdio (command) server', () => {
+    const r = McpServerSpecSchema.safeParse({ command: 'node', args: ['s.js'], auth: { clientId: 'x' } });
+    expect(r.success).toBe(false);
+  });
+
+  it('requires clientId in the auth block', () => {
+    expect(McpServerSpecSchema.safeParse({ url: 'https://x.example', auth: { scopes: 'x' } }).success).toBe(false);
+  });
+
+  it('loads auth through loadMcpServers', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-mcp-auth-'));
+    writeProject(dir, {
+      oauth: { url: 'https://mcp.example.com/rpc', auth: { clientId: 'k', tokenEndpoint: 'https://mcp.example.com/token' } },
+    });
+    const cfg = loadMcpServers(dir);
+    expect(cfg.servers['oauth']?.auth?.clientId).toBe('k');
   });
 });
 

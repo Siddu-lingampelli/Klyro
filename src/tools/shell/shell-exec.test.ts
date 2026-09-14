@@ -285,6 +285,58 @@ describe('shellExecTool', () => {
     }
   });
 
+  it('filteredEnv strips allowed-prefix KEY vars (G3 fix)', async () => {
+    const { filteredEnv } = await import('./shell-exec.js');
+    process.env.NODE_MY_API_KEY = 'leak-me-not';
+    process.env.NPM_BUILD_KEY = 'nope';
+    process.env.NPM_INSTALL_FLAGS = 'keep-me';
+    try {
+      const env = filteredEnv();
+      // *_KEY-shaped names under allowed prefixes must not leak (G3).
+      expect(env.NODE_MY_API_KEY).toBeUndefined();
+      expect(env.NPM_BUILD_KEY).toBeUndefined();
+      // Benign allowed-prefix vars survive.
+      expect(env.NPM_INSTALL_FLAGS).toBe('keep-me');
+      expect(env.PATH).toBe(process.env.PATH);
+    } finally {
+      delete process.env.NODE_MY_API_KEY;
+      delete process.env.NPM_BUILD_KEY;
+      delete process.env.NPM_INSTALL_FLAGS;
+    }
+  });
+
+  it('pruneDir bounds a dir by count and bytes (G5d fix)', async () => {
+    const { pruneDir } = await import('./shell-exec.js');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'klyro-prune-'));
+    try {
+      // Create 60 files, oldest first, each ~2KB.
+      const files: string[] = [];
+      for (let i = 0; i < 60; i++) {
+        const f = path.join(tmp, `f${String(i).padStart(2, '0')}.txt`);
+        await fs.writeFile(f, 'x'.repeat(2000), 'utf-8');
+        files.push(f);
+        const st = await fs.stat(f);
+        await fs.utimes(f, new Date(1_000_000 + i), new Date(1_000_000 + i));
+      }
+      const remaining = await fs.readdir(tmp);
+      expect(remaining.length).toBe(60);
+      // Count bound: 50 max.
+      const deleted = await pruneDir(tmp, 50, 50 * 1024 * 1024);
+      expect(deleted.length).toBe(10); // newest 50 kept, oldest 10 removed
+      let after = await fs.readdir(tmp);
+      expect(after.length).toBe(50);
+      // Bytes bound: now force retention ≤ 1 file by tiny byte cap.
+      const deleted2 = await pruneDir(tmp, 50, 2000);
+      after = await fs.readdir(tmp);
+      expect(after.length).toBe(1);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
   it('resolves symlinked cwd within containment (skip on Windows)', async () => {
     if (process.platform === 'win32') return;
     const base = await fs.mkdtemp(path.join(tmpdir(), 'klyro-shell-link-'));

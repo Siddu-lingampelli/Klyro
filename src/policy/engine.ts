@@ -409,6 +409,15 @@ export const shellDenyRule: PolicyRule = {
     if (/\bStart-BitsTransfer\b/i.test(cmd)) {
       return { action: 'deny', reason: 'exfiltration: Start-BitsTransfer denied' };
     }
+    // Windows has no native sandbox backend, so PowerShell network primitives
+    // are the primary upload/exfil vectors there — denied outright (mirrors
+    // shell_exec DANGEROUS_PATTERNS).
+    if (/\b(Invoke-WebRequest|iwr)\b/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: Invoke-WebRequest/iwr denied (no win32 sandbox backend)' };
+    }
+    if (/\bSystem\.Net\.WebClient\b/i.test(cmd)) {
+      return { action: 'deny', reason: 'exfiltration: System.Net.WebClient denied (no win32 sandbox backend)' };
+    }
     // Protected-branch push deny (mirrors shell_exec DANGEROUS_PATTERNS).
     // Explicit `git push ... main|master|production` is denied outright;
     // a bare `git push` (no ref args) is denied when the checkout is on a
