@@ -1,6 +1,6 @@
 # Klyro — Complete Build Documentation
 
-**For any coding agent:** This file is the single source of truth for what has been built till now (current version: see `package.json` — v1.0.8; Levels 1-9 complete, Level 10 largely complete incl. MCP/hooks/sub-agents, 34 built-in tools incl. `web_fetch`/`web_search`). The §20 ledger below is the historical record (v0.1.39→v0.1.61); version/test-count numbers inside it are point-in-time, not current. After reading, you have the complete picture.
+**For any coding agent:** This file is the single source of truth for what has been built till now (current version: see `package.json` — v1.0.9; Levels 1-9 complete, Level 10 largely complete incl. MCP/hooks/sub-agents, 34 built-in tools incl. `web_fetch`/`web_search`, cross-turn session memory in the TUI REPL). The section-20 ledger below is the historical record (v0.1.39→v0.1.61); version/test-count numbers inside it are point-in-time, not current. After reading, you have the complete picture.
 
 ---
 

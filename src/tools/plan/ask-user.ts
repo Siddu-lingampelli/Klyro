@@ -9,7 +9,8 @@ const InputSchema = z.object({
 
 export const askUserTool = defineTool({
   name: 'ask_user',
-  description: 'Ask the user a question (multiple choice or free text). Headless fails fast unless --auto-answer.',
+  description:
+    'Ask the user a question (multiple choice or free text). Use it when a request is ambiguous between two live topics (e.g. a fetched web page vs the local codebase) rather than guessing. Headless fails fast unless --auto-answer.',
   inputSchema: InputSchema,
   permission: 'read',
   isConcurrencySafe: true,

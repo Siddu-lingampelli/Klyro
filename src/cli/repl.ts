@@ -30,6 +30,8 @@ import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE, PASTE_ENABLE, PASTE_DISABLE, 
 import { inferProviderFromBaseURL } from '../agent/registry.js';
 import { getDefaultSessionStore } from '../persistence/session.js';
 import { buildSystemPrompt, parseImageInput } from '../context/system-prompt.js';
+import type { Message } from '../agent/message.js';
+import { shouldUseSimpleChat, userMessage, appendTurn, adoptTranscript, summaryAnchor } from './session-history.js';
 import { memoryBlock } from '../context/memory.js';
 import { estimateCost } from '../providers/model-info.js';
 import { ContextTrust } from '../context/trust.js';
@@ -549,6 +551,11 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   let fastMode = false;
   let displayMode = 'default';
   let lastAssistantText = '';
+  // Cross-turn conversation memory: prior turns are fed back as
+  // initialTranscript (full runs) or message history (simple chat) so
+  // follow-ups ("what models are there") resolve against earlier turns.
+  // Bounded by session-history.ts caps; reset by /clear, /new, /compact.
+  let sessionMessages: Message[] = [];
   // P2 state (commands.md Priority 2)
   let activeAgent = 'default';
   let verboseMode = false;
@@ -770,7 +777,10 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     const { text: cleanText, images } = parseImageInput(text);
     let taskText = images.length > 0 ? `${cleanText}\n\n[images: ${images.join(', ')}]` : cleanText;
     // Only create session for non-trivial tasks (with tools/verify) — plain chat like "hello" is not a persisted session
-    const isSimpleChat = taskText.trim().split(/\s+/).length <= 5 && !taskText.toLowerCase().includes('fix') && !taskText.toLowerCase().includes('add') && !taskText.toLowerCase().includes('create');
+    // Cross-turn memory lives here: every prompt (simple or full) sees prior
+    // turns via sessionMessages. shouldUseSimpleChat keeps short chit-chat
+    // tool-free but forces URL-bearing prompts into the full loop (web_fetch).
+    const isSimpleChat = shouldUseSimpleChat(taskText);
     let sessionId: string | undefined;
     if (!isSimpleChat) {
       try {
@@ -793,7 +803,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           model,
           // Legacy chat path (no modes): plain string system, untouched by the split.
           system: resolveSystemPrompt(systemPromptFn, { cwd, telemetry: '' }).system,
-          messages: [{ role: 'user' as const, content: [{ kind: 'text' as const, text: taskText }] } as unknown as import('../agent/message.js').Message],
+          messages: [...sessionMessages, userMessage(taskText)],
           tools: [] as import('../agent/provider-adapter.js').ToolDefinition[],
           signal: ac.signal,
         };
@@ -804,6 +814,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           else if (ev.kind === 'error') throw new Error(ev.message);
         }
         lastAssistantText = simpleText;
+        sessionMessages = appendTurn(sessionMessages, taskText, simpleText);
         clearThinking();
         queuedStatus({ status: 'done' });
         return;
@@ -822,6 +833,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       const result = await run(
         {
           task: taskText,
+          initialTranscript: sessionMessages.length > 0 ? [...sessionMessages] : undefined,
           cwd,
           model,
           maxSteps: currentMaxSteps,
@@ -933,6 +945,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         },
       );
       if (result.finalText) lastAssistantText = result.finalText;
+      // Adopt the run's full transcript (prior history + this task, tools
+      // included) so the next turn resolves references against this one.
+      sessionMessages = adoptTranscript(result.transcript);
       runEndStatus = result.status;
       if (result.verification) {
         const v = result.verification;
@@ -984,6 +999,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       case 'clear':
         queuedClear();
+        sessionMessages = [];
         queuedAppend({ id: `sep-${Date.now()}`, kind: 'text', text: '--- cleared ---', role: 'assistant' });
         return;
       case 'help': {
@@ -1273,6 +1289,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         const focus = cmd.focus?.trim();
         const compactFallback = (): void => {
           queuedClear();
+          sessionMessages = [];
           queuedAppend({
             id: `compact-${Date.now()}`,
             kind: 'text',
@@ -1309,6 +1326,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             return;
           }
           queuedClear();
+          sessionMessages = summaryAnchor(summary.slice(0, 4000));
           queuedAppend({
             id: `compact-done-${Date.now()}`,
             kind: 'text',
@@ -1439,6 +1457,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
       case 'new': {
         queuedClear();
+        sessionMessages = [];
         sessionLabel = '';
         currentBranch = '';
         try {

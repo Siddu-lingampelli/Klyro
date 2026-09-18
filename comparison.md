@@ -798,3 +798,27 @@ permission class, two agent-allowlist updates, doc refreshes. Verified with
   A thinner 514-line "Architectural Comparison Report" had replaced this
   file in the working tree; it is superseded by this audit, restored
   intact from HEAD.
+
+---
+
+# SUPERSEDING ADDENDUM - 1.0.9 (cross-turn session memory)
+
+Scope: the interactive TUI REPL previously started every prompt with total
+amnesia (no `initialTranscript`, no carried messages), and short prompts
+took a tool-less fast path that could neither fetch URLs nor keep context.
+Verified with `tsc --noEmit` exit 0 and `npm test` 96 files / 999 passed
+(incl. 10 new `src/cli/session-history.test.ts` cases). [Verified-Code-Klyro]
+
+- **Session history** (`src/cli/session-history.ts`, wired in
+  `src/cli/repl.ts`): bounded `Message[]` (60 msgs / 60k chars) fed back
+  as `initialTranscript` (full runs) or message history (simple chat);
+  full runs adopt the returned transcript (tools included); trimming cuts
+  only at user boundaries with no orphaned `tool_result`; resets on
+  `/clear`, `/new`, `/compact` (compact reseeds from the retained
+  summary).
+- **URL carve-out**: any `http(s)://` or `www.` forces the full tool loop
+  so pasted links reach `web_fetch` + approval instead of the fast path.
+- **Prompt discipline** (`src/context/system-prompt.ts`,
+  `web-fetch.ts` / `web-search.ts` / `ask-user.ts` descriptions): never
+  claim a page was checked without a `web_fetch` result in-transcript;
+  disambiguate follow-ups spanning two live topics via `ask_user`.
