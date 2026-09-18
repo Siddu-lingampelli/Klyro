@@ -67,12 +67,12 @@ export interface Tool<TInput, TOutput> {
   /** Zod schema for runtime validation. */
   inputSchema: z.ZodType<TInput>;
   /**
-   * Permission class: read | edit | execute | admin.
+   * Permission class: read | edit | execute | network | admin.
    * Consumed by the runtime → policy path: the runtime passes this into
-   * `PolicyEngine.evaluate`, and `execute`/`admin` tools with no explicit
-   * allow rule fall through to ask (interactive) / deny (headless).
+   * `PolicyEngine.evaluate`, and `execute`/`network`/`admin` tools with no
+   * explicit allow rule fall through to ask (interactive) / deny (headless).
    */
-  permission?: 'read' | 'edit' | 'execute' | 'admin';
+  permission?: 'read' | 'edit' | 'execute' | 'network' | 'admin';
   /** True if tool is safe to run in parallel with others */
   isConcurrencySafe?: boolean;
   /** Render call for approval UI */

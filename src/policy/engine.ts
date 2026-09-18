@@ -20,12 +20,13 @@ export interface ToolCallLike {
   /** Parsed tool input. */
   input: Record<string, unknown>;
   /**
-   * Tool risk class from the registry (`read|edit|execute|admin`).
-   * The runtime always passes this; when present, `execute`/`admin`
-   * tools fall through to ask/deny instead of the legacy default-allow
-   * (see evaluate). Omitted in unit tests → legacy default-allow.
+   * Tool risk class from the registry (`read|edit|execute|network|admin`).
+   * The runtime always passes this; when present, `execute`/`network`/
+   * `admin` tools fall through to ask/deny instead of the legacy
+   * default-allow (see evaluate). Omitted in unit tests → legacy
+   * default-allow.
    */
-  permission?: 'read' | 'edit' | 'execute' | 'admin';
+  permission?: 'read' | 'edit' | 'execute' | 'network' | 'admin';
 }
 
 export interface PolicyContext {
@@ -101,8 +102,8 @@ export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
 
 /**
  * Compose multiple rules. The first rule to return a Decision wins.
- * If none return a Decision, privileged tools (`execute`/`admin`, when
- * the caller passes `permission`) fall through to ask (interactive) or
+ * If none return a Decision, privileged tools (`execute`/`network`/`admin`,
+ * when the caller passes `permission`) fall through to ask (interactive) or
  * deny (headless) instead of allow; everything else defaults to `allow`.
  * `auto` mode keeps the legacy allow-everything behavior.
  */
@@ -177,11 +178,11 @@ export class PolicyEngine {
       const d = rule.evaluate(call, ctx);
       if (d) return d;
     }
-    // Privileged-class default: an `execute`/`admin` tool that no rule
-    // explicitly allowed must not run silently. Interactive sessions get
-    // an approval prompt; headless sessions get a denial naming the
+    // Privileged-class default: an `execute`/`network`/`admin` tool that no
+    // rule explicitly allowed must not run silently. Interactive sessions
+    // get an approval prompt; headless sessions get a denial naming the
     // escape hatch (an explicit `tool`/`tool(glob)` allow rule).
-    if (ctx.config.mode !== 'auto' && (call.permission === 'execute' || call.permission === 'admin')) {
+    if (ctx.config.mode !== 'auto' && (call.permission === 'execute' || call.permission === 'network' || call.permission === 'admin')) {
       if (ctx.nonInteractive) {
         return { action: 'deny', reason: `${call.name} is a privileged ${call.permission} tool — pre-approve with an allow rule (e.g. "${call.name}")` };
       }

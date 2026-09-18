@@ -746,3 +746,55 @@ Streaming copies bounded by 64ms throttle (fixed 1.0.5); `scanner separator-flus
 - **Init + session merge:** first-class `klyro init` shared with `/init` (`cli/init.ts`); `session`/`sessions` now the *same* subcommands (`index.ts:433,617-624`). Partially resolves Risk #9.
 
 **Unresolved from 1.0.5:** `orchestrator.abortOnParent: undefined` (Risk #6, LOW); checkpoint caps/signatures/fsync/stub-diff (Risk #10, MED); triple runtime + ignored globals (Risk #9 tail); MCP OAuth + pure-SSE transport (Risk #7 tail). Latest residual top-10 lives at the end of `comparison.1.0.6.md`.
+
+---
+
+# SUPERSEDING ADDENDUM - 1.0.8 (web tools + `network` permission class)
+
+Scope of this delta (working tree vs HEAD `f748aeb`): two new tools, one new
+permission class, two agent-allowlist updates, doc refreshes. Verified with
+`tsc --noEmit` exit 0 and `npm test` 95 files / 987 passed (incl. 16 new
+`src/tools/web/web.test.ts` cases). [Verified-Code-Klyro]
+
+- **Tool registry 32 to 34** (`src/tools/registry.ts:100-134`): `web_fetch`
+  (`src/tools/web/web-fetch.ts`) and `web_search`
+  (`src/tools/web/web-search.ts`), both `permission: 'network'`,
+  `isConcurrencySafe: true`. The audit''s 32-tool enumerations (Phase 0
+  recon, round coverage) remain correct for 1.0.6; read them as 34 from
+  1.0.7 on.
+- **New `network` permission class** (PRD FR-PERM-01, FR-WEB-01): added to
+  the `Tool` contract (`src/tools/types.ts:70-75`) and to
+  `ToolCallLike` (`src/policy/engine.ts:23-29`). The privileged-class
+  fall-through (`engine.ts:181-190`) is now
+  `execute`/`network`/`admin` ? ask (TTY) / deny (headless) without an
+  explicit allow rule. The audit''s "`execute`/`admin`" phrasing is
+  superseded by "`execute`/`network`/`admin`".
+- **`web_fetch`** (FR-WEB-01): HTTPS-only except loopback/private hosts
+  (mirrors `chat.ts` `assertSafeBaseURL`) or `KLYRO_ALLOW_INSECURE=1`;
+  `KLYRO_WEB_ALLOWLIST`/`KLYRO_WEB_DENYLIST` host-suffix gates; manual
+  redirect chain (max 5) with **per-hop re-validation** so a benign URL
+  cannot bounce to plaintext-http or a denied host; 2 MiB download cap;
+  non-textual content-types refused (`UNSUPPORTED_TYPE`); HTML reduced to
+  text; output secret-redacted and flagged `untrusted: true`.
+- **`web_search`** (FR-WEB-02): DuckDuckGo Instant Answer backend by
+  default, `KLYRO_WEB_SEARCH_URL` override (DDG-compatible JSON
+  contract); results redacted and flagged `untrusted: true`.
+- **Agent allowlists**: `explorer` (`orchestrator.ts:87`) and `docs`
+  (`orchestrator.ts:122`) gain both web tools. Both agents are
+  `readonly: true`, and readonly strips only `writeTools` + `run_verify`
+  (`capabilities.ts:131-140`), so the web tools survive narrowing, as
+  confirmed by the `agent-tools.test.ts:57-65` allowlist-vs-registry
+  gate, which passes.
+- **Recount correction**: the audit states "18 patterns" for
+  `secret-redactor.ts`; the current file defines **17 named entries**
+  (`secret-redactor.ts:14-36`: aws-key, aws-secret, aws-secret-b64,
+  pem-block, github-token, slack-token, bearer, jwt, openai-key,
+  anthropic-key, api-key, password, secret-generic, discord-token,
+  npm-token, sendgrid-key, pypi-token). One-count discrepancy flagged,
+  not load-bearing.
+- **Doc refreshes**: `README.md` rewritten from the 2-command MVP text to
+  the actual CLI/TUI + 34-tool surface; `READ.md` header now points at
+  `package.json` v1.0.8 (the S20 ledger stays point-in-time history).
+  A thinner 514-line "Architectural Comparison Report" had replaced this
+  file in the working tree; it is superseded by this audit, restored
+  intact from HEAD.

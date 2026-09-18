@@ -1,15 +1,17 @@
 # Klyro
 
-Minimal streaming CLI for any OpenAI-compatible LLM endpoint. **Foundation piece** of the Klyro harness project.
+Autonomous AI coding harness — terminal-native agent (CLI + Ink TUI) for any OpenAI-compatible or Anthropic LLM endpoint.
 
 ## What works today
 
-- Streams from `https://<host>/v1/chat/completions`
+- Streams from `https://<host>/v1/chat/completions` (OpenAI-compatible) and Anthropic `/v1/messages`
 - HTTPS-only (with localhost exemption for local LLMs)
-- Per-request timeout
-- Interactive REPL with multi-turn history
-- Bounded error reads
-- Strict TypeScript, zero dependencies beyond `commander`
+- Per-request timeout, retry with backoff, usage/cost accounting
+- Interactive Ink TUI + REPL with multi-turn history, slash commands, approvals
+- Autonomous loop: phases, budgets, stuck detection, verification + repair
+- 34 built-in tools (fs/search/shell/git/verify/plan/web), policy engine, MCP client/server
+- Session persistence (JSON), hash-chained audit log, checkpoints/undo, eval harness
+- Strict TypeScript (`tsc`, noEmit typecheck, vitest)
 
 ## Quick start
 
@@ -82,9 +84,20 @@ node dist/index.js chat
 
 ```
 src/
-├── index.ts   # commander entry — two commands (chat, REPL)
-├── chat.ts    # single-turn streaming chat (251 LOC)
-└── repl.ts    # multi-turn REPL (168 LOC)
+├── index.ts        # commander entry — tui/run/chat/eval/session/mcp/agents/commit/audit/...
+├── agent/          # runtime loop, orchestrator, adapters, worktree, tasks
+├── cli/            # run/repl/config/doctor/hooks/eval/slash/...
+├── tools/          # 34 built-ins: fs/search/shell/git/verify/plan/web (+ registry)
+├── policy/         # engine, path-guard, approval, secret-redactor
+├── context/        # project-map, repo-map, tokenizer, compaction, memory, trust
+├── verification/   # registry, parsers, repair loop, baseline, scoped
+├── mcp/            # client (stdio/SSE/HTTP), trust, serve, OAuth
+├── persistence/    # JSON session store, hash-chained audit
+├── checkpoints/    # snapshots, undo/rewind
+├── events/ trace/ renderers/  # event bus, JSONL traces, terminal/JSON output
+├── tui/            # Ink app (transcript, approval, diff, scroll, markdown)
+├── eval/           # scripted harness, tasks, judge
+└── chat.ts / repl.ts  # legacy one-shot chat + legacy REPL
 ```
 
 ## License

@@ -84,7 +84,7 @@ export const BUILTIN_AGENTS: readonly AgentDefinition[] = [
     description: 'Read-only reconnaissance: map the repo, find symbols and tests.',
     readonly: true,
     canSpawn: false,
-    allowedTools: ['read_file', 'list_directory', 'glob', 'grep', 'search_files', 'repo_map', 'find_symbol', 'git_status', 'git_log', 'git_diff', 'recent_files', 'imports_of', 'importers_of'],
+    allowedTools: ['read_file', 'list_directory', 'glob', 'grep', 'search_files', 'repo_map', 'find_symbol', 'git_status', 'git_log', 'git_diff', 'recent_files', 'imports_of', 'importers_of', 'web_fetch', 'web_search'],
   },
   {
     id: 'implementer',
@@ -119,7 +119,7 @@ export const BUILTIN_AGENTS: readonly AgentDefinition[] = [
     description: 'Read-only documentation lookup: find and summarise docs, READMEs, and code structure.',
     readonly: true,
     canSpawn: false,
-    allowedTools: ['read_file', 'list_directory', 'glob', 'grep', 'search_files', 'repo_map', 'recent_files'],
+    allowedTools: ['read_file', 'list_directory', 'glob', 'grep', 'search_files', 'repo_map', 'recent_files', 'web_fetch', 'web_search'],
   },
 ];
 

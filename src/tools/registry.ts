@@ -26,6 +26,8 @@ import { findSymbolTool } from './symbols/find-symbol.js';
 import { lspDiagnosticsTool, lspGotoDefinitionTool } from './lsp/diagnostics.js';
 import { expandResultTool } from './expand-result.js';
 import { memoryWriteTool } from './memory-write.js';
+import { webFetchTool } from './web/web-fetch.js';
+import { webSearchTool } from './web/web-search.js';
 import { spawnAgentTool } from './agent/spawn-agent.js';
 import { taskListTool } from './agent/task-list.js';
 import { taskGetTool } from './agent/task-get.js';
@@ -123,6 +125,8 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(lspGotoDefinitionTool);
   r.register(expandResultTool);
   r.register(memoryWriteTool);
+  r.register(webFetchTool);
+  r.register(webSearchTool);
   r.register(spawnAgentTool);
   r.register(taskListTool);
   r.register(taskGetTool);
