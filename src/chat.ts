@@ -1,4 +1,12 @@
 /**
+ * COMPATIBILITY-ONLY legacy one-shot chat. Prefer `klyro run` / `klyro tui`.
+ *
+ * Security contract (shared with all current paths — do NOT diverge):
+ *   base-URL validation via assertSafeBaseURL, error-body caps via
+ *   MAX_ERROR_BODY_BYTES, and credential handling owned by providers.ts.
+ *   Covered by src/providers/contract.test.ts; any change here must update
+ *   the contract tests first.
+ *
  * One-shot chat. POSTs to an OpenAI-compatible /v1/chat/completions endpoint
  * and streams the response to stdout.
  *

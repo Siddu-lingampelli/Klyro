@@ -27,8 +27,8 @@
 | Test | `vitest 4.1` `fileParallelism:false` `10s timeout` | `node` env, deterministic mocks |
 | Build | `tsc` (not `tsup`) | `tsc --noEmit` `typecheck`, `tsc` `build` |
 | Providers | Native `fetch` (Node 20) | No SDK lock-in, 3 adapters |
-| Workspace | `pnpm-workspace.yaml` `packages/*` | `shared` `KlyroError` |
-| CI | `.github/workflows/ci.yml` `ubuntu/macos/windows × 20/22` | `pnpm install` `typecheck` `test` `build` `pack` |
+| Workspace | `packages/shared` (private, legacy, unused) | Canonical npm + `package-lock.json`; `pnpm-workspace.yaml` ignored by npm |
+| CI | `.github/workflows/ci.yml` `ubuntu/macos/windows × 20/22` | `npm ci` `typecheck` `test` `build` gating smoke + `release-check` + `pack` |
 
 **No Docker, no MCP, no browser in MVP** — deferred to post-1.0.
 
@@ -163,8 +163,7 @@ Eval: FileFixture {dir, task.md, check.sh, meta.json} loadFileFixture() src/eval
 
 ```
 klyro/
-├── package.json                 # klyro 0.1.15, bin klyro/ky, files [dist], commander/ink/zod
-├── pnpm-workspace.yaml          # packages/*
+├── package.json                 # klyro 0.1.15, bin klyro/ky, files [dist], commander/ink/zod (canonical npm + package-lock.json; legacy pnpm workspace removed)
 ├── tsconfig.json                # ES2022, NodeNext, strict, noUncheckedIndexedAccess
 ├── vitest.config.ts             # include src/**/*.test, fileParallelism:false
 ├── .github/workflows/ci.yml     # ubuntu/macos/windows × 20/22 → typecheck/test/build/eval smoke

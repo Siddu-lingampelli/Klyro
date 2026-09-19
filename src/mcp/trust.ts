@@ -65,7 +65,15 @@ export class McpTrust {
   private save(): void {
     try {
       fs.mkdirSync(path.dirname(this.storePath), { recursive: true });
-      fs.writeFileSync(this.storePath, JSON.stringify(this.store, null, 2), 'utf-8');
+      // Atomic trust write (tmp + rename) so a crash never leaves a
+      // truncated mcp-trust.json that auto-approves the wrong spec.
+      const tmp = `${this.storePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      fs.writeFileSync(tmp, JSON.stringify(this.store, null, 2), 'utf-8');
+      try {
+        const fh = fs.openSync(tmp, 'r+');
+        try { fs.fsyncSync(fh); } finally { fs.closeSync(fh); }
+      } catch { /* ignore on Windows */ }
+      fs.renameSync(tmp, this.storePath);
     } catch {
       /* best-effort — trust stays in memory for the session */
     }

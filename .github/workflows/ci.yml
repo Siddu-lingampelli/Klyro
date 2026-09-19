@@ -14,18 +14,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-          cache: pnpm
-      - run: pnpm install
-      - run: pnpm typecheck
-      - run: pnpm test
-      - run: pnpm build
+          cache: npm
+      # Canonical package manager is npm + package-lock.json (matches
+      # Dockerfile and publish.yml). pnpm-workspace.yaml is legacy for the
+      # unused packages/shared workspace and is ignored by npm.
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
       - run: node dist/index.js --version
       - run: node dist/index.js --help
-      - run: node dist/index.js eval --suite smoke --runs 1 --parallel 1 || echo "smoke eval (stub) ok"
+      # Gating smoke eval: no `|| echo` fallback — a smoke failure must fail CI.
+      - run: node dist/index.js eval --suite smoke --runs 1 --parallel 1
+      - run: node scripts/release-check.mjs
       - run: npm pack --dry-run

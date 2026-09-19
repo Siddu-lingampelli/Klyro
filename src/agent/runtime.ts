@@ -494,6 +494,12 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   // 5.2 — stuck detection state
   const callHistory: string[] = [];
   const fileEditCounts = new Map<string, number>();
+  // Exactly-once: a provider transport retry (or a resume replay) must never
+  // re-execute a tool call whose side effect already completed. Completed
+  // call ids map to their recorded observations; a repeated id re-commits
+  // the cached observation without touching tools, hooks, or the audit log
+  // a second time.
+  const completedToolCalls = new Map<string, { obs: import('../tools/types.js').ToolResult<unknown>; latencyMs: number }>();
   let stuckTriggers = 0;
   let stuckAbort = false;
   // Steerable stop: a stop hook's `{"continue":true}` verdict carries one
@@ -1254,6 +1260,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       obs: import('../tools/types.js').ToolResult<unknown>,
       latencyMs: number,
       hookContext: Array<{ hook: string; context: string }> = [],
+      replay = false,
     ): Promise<void> => {
       const output = obs.ok ? redactOutput(obs.value) : redactOutput({ error: obs.error });
       const toolMsg: Message = {
@@ -1262,6 +1269,14 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       };
       transcript.push(toolMsg);
       await checkpoint(toolMsg, { toolCallId: call.id, toolName: call.name, input: call.input, output, isError: !obs.ok });
+      if (replay) {
+        // Replay of an already-completed id (transport retry / resume):
+        // transcript continuity only. No telemetry, audit, snapshots, stuck
+        // accounting, or hooks — the side effect happened exactly once.
+        emitKlyro({ type: 'tool.result', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', callId: call.id, name: call.name, output, isError: !obs.ok, latencyMs });
+        emit?.({ kind: 'tool_result', id: call.id, name: call.name, output, isError: !obs.ok, latencyMs });
+        return;
+      }
       // Hook-injected context rides as its own user message right after the
       // tool result (uniform across output shapes — no result surgery).
       if (hookContext.length > 0) {
@@ -1337,10 +1352,19 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           }
         }
       }
+    // Exactly-once record: a later turn repeating this id (transport retry
+    // replay or resume) re-commits the cached observation instead of
+    // re-executing.
+    completedToolCalls.set(call.id, { obs, latencyMs });
     };
 
     // Sequential path: gate → execute → commit per call, in order.
     const runOne = async (call: typeof finalizedCalls[number]): Promise<void> => {
+      const cached = completedToolCalls.get(call.id);
+      if (cached) {
+        await commitResult(call, cached.obs, cached.latencyMs, [], true);
+        return;
+      }
       if (!(await gateCall(call))) return;
       const { obs, latencyMs, hookContext } = await execTool(call);
       await commitResult(call, obs, latencyMs, hookContext);
@@ -1355,6 +1379,12 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       const approved: typeof finalizedCalls = [];
       for (const call of finalizedCalls) {
         toolCallCount++;
+        // Exactly-once: replay cached observation without gate/hooks/exec.
+        const cached = completedToolCalls.get(call.id);
+        if (cached) {
+          await commitResult(call, cached.obs, cached.latencyMs, [], true);
+          continue;
+        }
         if (await gateCall(call)) approved.push(call);
         if (opts.signal?.aborted) break;
       }

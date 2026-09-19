@@ -77,15 +77,23 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
       if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') missing.push(f);
     }
   }
-  // Save meta (fsync before the checkpoint is visible — mirrors the
-  // SessionStore.writeIndex atomic pattern).
+  // Save meta (tmp + fsync + rename before the checkpoint is visible —
+  // mirrors the SessionStore.writeIndex atomic pattern so a crash never
+  // leaves a truncated .meta.json that undo() then trusts).
   const metaPath = path.join(dest, '.meta.json');
+  const metaTmp = `${metaPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   await fs.writeFile(
-    metaPath,
+    metaTmp,
     JSON.stringify({ id, files: kept, missing, ts: Date.now() }, null, 2),
   );
-  lockDown(metaPath, 0o600);
-  await fsyncFile(metaPath);
+  lockDown(metaTmp, 0o600);
+  await fsyncFile(metaTmp);
+  try {
+    await fs.rename(metaTmp, metaPath);
+  } catch {
+    await fs.unlink(metaTmp).catch(() => undefined);
+    throw new Error(`Failed to write checkpoint meta ${id}`);
+  }
   // Best-effort last.diff for the repair guard (guardRepair reads it).
   try {
     const { spawn } = await import('node:child_process');
@@ -118,11 +126,20 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
       });
     });
     if (diffText) {
-      await fs.writeFile(path.join(dir, 'last.diff'), diffText, 'utf-8');
+      const atomicWrite = async (p: string, data: string): Promise<void> => {
+        const tmp = `${p}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        await fs.writeFile(tmp, data, 'utf-8');
+        try {
+          await fs.rename(tmp, p);
+        } catch {
+          await fs.unlink(tmp).catch(() => undefined);
+        }
+      };
+      await atomicWrite(path.join(dir, 'last.diff'), diffText);
       // Per-checkpoint diff file (best-effort); the repair guard keeps
       // reading last.diff, so its behavior is unchanged.
       try {
-        await fs.writeFile(path.join(dir, `${id}.diff`), diffText, 'utf-8');
+        await atomicWrite(path.join(dir, `${id}.diff`), diffText);
       } catch { /* best-effort only */ }
     }
   } catch { /* best-effort only */ }

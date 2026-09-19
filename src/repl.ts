@@ -1,4 +1,11 @@
 /**
+ * COMPATIBILITY-ONLY legacy interactive REPL. Prefer `klyro tui`.
+ *
+ * Shares the provider contract with chat.ts/providers.ts (assertSafeBaseURL,
+ * normalizeBaseURL) — covered by src/providers/contract.test.ts.
+ * History here is in-memory only; cross-turn persistence lives in the TUI
+ * REPL path (src/cli/repl.ts + session-history).
+ *
  * Interactive REPL. Reads prompts from stdin one line at a time.
  *
  * Conversation history lives in memory only; each new prompt is sent with the

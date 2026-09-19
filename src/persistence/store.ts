@@ -18,6 +18,10 @@ import { redact } from '../policy/secret-redactor.js';
 
 export type SessionStatus = 'open' | 'complete' | 'verify_failed' | 'aborted' | 'max_steps' | 'stuck';
 
+/** Persisted session schema version. Bump when SessionRecord changes shape;
+ * readers migrate older records forward (missing version ⇒ v0). */
+export const SESSION_SCHEMA_VERSION = 1;
+
 export interface SessionConfig {
   model: string;
   maxSteps: number;
@@ -33,6 +37,16 @@ export interface SessionRecord {
   updatedAt: number;
   config: SessionConfig;
   finalText?: string;
+  /** Schema version for migrations; absent on pre-v1 records (treated as v0). */
+  schemaVersion?: number;
+}
+
+/** Migrate a persisted record forward. Unknown future versions pass through
+ * untouched so a newer CLI's sessions stay readable (forward-compatible). */
+export function migrateSessionRecord(raw: SessionRecord): SessionRecord {
+  const version = typeof raw.schemaVersion === 'number' ? raw.schemaVersion : 0;
+  if (version >= SESSION_SCHEMA_VERSION) return raw;
+  return { ...raw, schemaVersion: SESSION_SCHEMA_VERSION };
 }
 
 export interface StoredMessage {
@@ -158,9 +172,24 @@ export class SessionStore {
         createdAt: now,
         updatedAt: now,
         config: opts.config,
+        schemaVersion: SESSION_SCHEMA_VERSION,
       };
       (record as unknown as Record<string, unknown>).title = this.titleFor(task);
-      await fs.writeFile(path.join(this.dir, `${id}.json`), JSON.stringify({ record, messages: [], observations: [] }, null, 2));
+      // Atomic session create (tmp + fsync + rename) so a crash can never
+      // leave a truncated `${id}.json` that resume/import then trusts.
+      const target = path.join(this.dir, `${id}.json`);
+      const tmpCreate = `${target}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      await fs.writeFile(tmpCreate, JSON.stringify({ record, messages: [], observations: [] }, null, 2));
+      try {
+        const fh = await fs.open(tmpCreate, 'r+');
+        try { await fh.sync(); } finally { await fh.close(); }
+      } catch { /* ignore on Windows */ }
+      try {
+        await fs.rename(tmpCreate, target);
+      } catch {
+        await fs.unlink(tmpCreate).catch(() => undefined);
+        throw new Error(`Failed to write session ${id}`);
+      }
       await this.appendJsonl(id, { type: 'session.create', record, ts: now });
       const idx = await this.readIndex();
       idx[id] = record;
@@ -248,7 +277,9 @@ export class SessionStore {
 
   private async readSession(id: string): Promise<{ record: SessionRecord; messages: StoredMessage[]; observations: StoredObservation[] }> {
     const raw = await fs.readFile(path.join(this.dir, `${id}.json`), 'utf-8');
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw) as { record: SessionRecord; messages: StoredMessage[]; observations: StoredObservation[] };
+    parsed.record = migrateSessionRecord(parsed.record);
+    return parsed;
   }
 
   private async writeSession(id: string, data: { record: SessionRecord; messages: StoredMessage[]; observations: StoredObservation[] }): Promise<void> {
@@ -347,13 +378,14 @@ export class SessionStore {
 
   async list(filter?: { status?: SessionStatus }): Promise<SessionRecord[]> {
     const idx = await this.readIndex();
-    const all = Object.values(idx);
+    const all = Object.values(idx).map(migrateSessionRecord);
     return filter?.status ? all.filter((s) => s.status === filter.status) : all;
   }
 
   async get(id: string): Promise<SessionRecord | null> {
     const idx = await this.readIndex();
-    return idx[id] ?? null;
+    const rec = idx[id];
+    return rec ? migrateSessionRecord(rec) : null;
   }
 
   /** Atomic append + fsync — survives crashes; suitable for audit log. */

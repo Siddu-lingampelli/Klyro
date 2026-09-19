@@ -5,33 +5,34 @@
 
 import type { KlyroEvent } from '../events/catalog.js';
 import { renderMarkdown } from '../cli/markdown.js';
+import { sanitizeTerminalText } from '../shared/sanitize.js';
 
 export class TerminalRenderer {
   handle(ev: KlyroEvent): void {
     switch (ev.type) {
       case 'stream.delta':
-        process.stdout.write(ev.text);
+        process.stdout.write(sanitizeTerminalText(ev.text));
         break;
       case 'tool.call':
-        process.stderr.write(`\n[tool] ${ev.name} ${JSON.stringify(ev.input).slice(0, 200)}\n`);
+        process.stderr.write(`\n[tool] ${sanitizeTerminalText(ev.name)} ${sanitizeTerminalText(JSON.stringify(ev.input).slice(0, 200))}\n`);
         break;
       case 'tool.result':
         process.stderr.write(`  -> ${ev.isError ? 'ERR' : 'ok'} (${ev.latencyMs}ms)\n`);
         break;
       case 'file.changed':
-        process.stderr.write(`  ✎ ${ev.path} (${ev.op})\n`);
+        process.stderr.write(`  ✎ ${sanitizeTerminalText(ev.path)} (${ev.op})\n`);
         break;
       case 'phase.changed':
-        process.stderr.write(`\n[phase] ${ev.phase}\n`);
+        process.stderr.write(`\n[phase] ${sanitizeTerminalText(ev.phase)}\n`);
         break;
       case 'verification.started':
-        process.stderr.write(`[verify] ${ev.command}\n`);
+        process.stderr.write(`[verify] ${sanitizeTerminalText(ev.command)}\n`);
         break;
       case 'verification.failed':
-        process.stderr.write(`[verify] failed: ${ev.reason.slice(0, 200)}\n`);
+        process.stderr.write(`[verify] failed: ${sanitizeTerminalText(ev.reason.slice(0, 200))}\n`);
         break;
       case 'error':
-        process.stderr.write(`✖ ${ev.message}\n`);
+        process.stderr.write(`✖ ${sanitizeTerminalText(ev.message)}\n`);
         break;
       default:
         break;
@@ -40,6 +41,6 @@ export class TerminalRenderer {
 
   renderMarkdown(text: string): void {
     const out = renderMarkdown(text, { isTTY: !!process.stdout.isTTY });
-    process.stdout.write(out);
+    process.stdout.write(sanitizeTerminalText(out));
   }
 }

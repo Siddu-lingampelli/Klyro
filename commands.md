@@ -1,5 +1,10 @@
 # Klyro — Complete Command Roadmap
 
+> Scope: TUI **slash-commands** (e.g. `/resume`, `/cancel`) — a roadmap, not
+> an inventory. The **CLI reference** is `klyro --help` (verbs like `run`,
+> `session`, `mcp`); the two namespaces are intentionally different. Status
+> disputes resolve via `docs/STATUS.md`.
+
 A consolidated roadmap covering your commands, recommended additions, aliases, and missing capabilities.
 
 **Important additions:** authentication, cancellation/retry, explicit context attachments, workspace trust, formatting/type-checking, tool inspection, resource budgets, audit logs, and backup/restore.
