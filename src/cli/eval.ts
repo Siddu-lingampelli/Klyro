@@ -41,6 +41,9 @@
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout, stderr } from 'node:process';
 import { run, type RunResult, type VerifyMode } from '../agent/runtime.js';
@@ -79,6 +82,8 @@ export interface EvalResult {
   text: string;
   durationMs: number;
   judge?: { pass: boolean; notes: string; skipped: boolean };
+  /** Isolated workdir the scenario ran in (tmp unless --cwd). Debugging aid. */
+  workDir?: string;
 }
 
 export interface RunEvalOptions {
@@ -91,6 +96,12 @@ export interface RunEvalOptions {
   model?: string;
   /** Live model id for grading `judge.rubric` (env endpoint + key required). */
   judgeModel?: string;
+  /**
+   * Shared workdir for JSONL scenarios. When omitted each scenario runs in
+   * a fresh tmp dir (deleted afterwards) so scripted tool calls can never
+   * touch the caller's directory. Pass explicitly to inspect artifacts.
+   */
+  cwd?: string;
 }
 
 export async function runEval(opts: RunEvalOptions): Promise<number> {
@@ -190,7 +201,7 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
   const results: EvalResult[] = [];
   for (const sc of scenarios) {
     const start = Date.now();
-    const r = await runScenario(sc, judgeAdapter && opts.judgeModel ? { adapter: judgeAdapter, model: opts.judgeModel } : undefined);
+    const r = await runScenario(sc, judgeAdapter && opts.judgeModel ? { adapter: judgeAdapter, model: opts.judgeModel } : undefined, opts.cwd);
     r.durationMs = Date.now() - start;
     results.push(r);
     if (opts.output === 'json') {
@@ -281,38 +292,53 @@ function tupleToEvent(tuple: unknown[]): StreamEvent {
 export async function runScenario(
   sc: EvalScenario,
   judgeOpts?: { adapter: ProviderAdapter; model: string },
+  workDir?: string,
 ): Promise<EvalResult> {
   const failures: string[] = [];
   const model = sc.model ?? 'mock';
   const adapter = scriptedAdapterFromSpec(sc.scripted_events);
   const registry = builtinRegistry();
   const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
-  const result = await run(
-    {
-      task: sc.task,
-      cwd: process.cwd(),
-      model,
-      maxSteps: sc.maxSteps,
-      maxTokens: sc.maxTokens,
-      nonInteractive: true,
-      ...(sc.verify
-        ? {
-            verify: {
-              enabled: true as const,
-              ...(sc.verify.command !== undefined ? { command: sc.verify.command } : {}),
-              ...(sc.verify.mode !== undefined ? { mode: sc.verify.mode } : {}),
-            },
-          }
-        : {}),
-    },
-    {
-      adapter,
-      registry,
-      policy,
-      approval: new DenyAllApprovalPrompt(),
-      systemPrompt: ({ cwd }) => `You are Klyro. cwd=${cwd}.`,
-    },
-  );
+  // Isolation (fix: scripted tool calls must never run in the caller's
+  // directory — a JSONL scenario writing a.txt/b.txt used to pollute it).
+  // Explicit workDir is shared as-is (inspect artifacts); otherwise each
+  // scenario gets a fresh tmp dir that is removed afterwards.
+  const owned = !workDir;
+  const cwd = workDir ?? await fsp.mkdtemp(path.join(os.tmpdir(), 'klyro-eval-jsonl-'));
+  await fsp.mkdir(cwd, { recursive: true });
+  let result: Awaited<ReturnType<typeof run>>;
+  try {
+    result = await run(
+      {
+        task: sc.task,
+        cwd,
+        model,
+        maxSteps: sc.maxSteps,
+        maxTokens: sc.maxTokens,
+        nonInteractive: true,
+        ...(sc.verify
+          ? {
+              verify: {
+                enabled: true as const,
+                ...(sc.verify.command !== undefined ? { command: sc.verify.command } : {}),
+                ...(sc.verify.mode !== undefined ? { mode: sc.verify.mode } : {}),
+              },
+            }
+          : {}),
+      },
+      {
+        adapter,
+        registry,
+        policy,
+        approval: new DenyAllApprovalPrompt(),
+        systemPrompt: ({ cwd }) => `You are Klyro. cwd=${cwd}.`,
+      },
+    );
+  } finally {
+    if (owned) {
+      try { await fsp.rm(cwd, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }
 
   const exp = sc.expect ?? {};
   if (exp.status !== undefined && result.status !== exp.status) {
@@ -354,6 +380,7 @@ export async function runScenario(
     toolCalls: result.toolCalls,
     text: result.finalText,
     durationMs: 0,
+    workDir: cwd,
     ...(judge ? { judge } : {}),
   };
 }

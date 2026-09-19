@@ -394,7 +394,8 @@ async function main(): Promise<void> {
     .option('--parallel <n>', 'Parallelism (default 1)', (v) => parsePositiveInt('--parallel', v))
     .option('--model <id>', 'Model for eval')
     .option('--judge-model <id>', 'Live model id for grading judge.rubric (needs endpoint + key)')
-    .action(async (input: string | undefined, opts: { output?: string; suite?: string; filter?: string; runs?: number; parallel?: number; model?: string; judgeModel?: string }) => {
+    .option('--cwd <path>', 'Shared scenario workdir (default: isolated tmp per scenario)')
+    .action(async (input: string | undefined, opts: { output?: string; suite?: string; filter?: string; runs?: number; parallel?: number; model?: string; judgeModel?: string; cwd?: string }) => {
       const output = (opts.output ?? 'human') as 'human' | 'json' | 'silent';
       if (opts.suite) {
         const code = await runEval({ inputPath: input ?? '-', output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel });
@@ -404,7 +405,7 @@ async function main(): Promise<void> {
         process.stderr.write('klyro eval: missing input (provide <input> or --suite)\n');
         process.exit(2);
       }
-      const code = await runEval({ inputPath: input, output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel });
+      const code = await runEval({ inputPath: input, output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel, cwd: opts.cwd });
       process.exit(code);
     });
 
