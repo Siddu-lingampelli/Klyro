@@ -107,6 +107,19 @@ export class MouseFilter {
 export const MOUSE_ENABLE = '\x1b[?1000h\x1b[?1006h'; // button events + SGR coords
 export const MOUSE_DISABLE = '\x1b[?1000l\x1b[?1006l';
 
+/**
+ * Whether the TUI may request terminal mouse reporting (wheel scrolling).
+ *
+ * Default OFF: with button reporting enabled the terminal routes
+ * selection clicks and right-click paste to the app (which swallows them),
+ * so native select-to-copy and right-click-paste break. Native selection
+ * works out of the box; set `KLYRO_MOUSE=1` to opt into wheel scrolling
+ * (Shift+drag still selects natively in most terminals).
+ */
+export function isMouseReportingEnabled(env: Readonly<Record<string, string | undefined>> = process.env): boolean {
+  return env.KLYRO_MOUSE === '1';
+}
+
 export const PASTE_START = '\x1b[200~';
 export const PASTE_END = '\x1b[201~';
 export const PASTE_ENABLE = '\x1b[?2004h'; // bracketed paste: terminal wraps pastes

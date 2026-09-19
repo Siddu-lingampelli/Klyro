@@ -917,16 +917,16 @@ export function App(props: AppProps): React.JSX.Element {
     }
     // design.md §18: idle Ctrl+C exits.
     if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
-    // Contextual ↑/↓ (§8.3): text in buffer (or browsing) → history;
-    // empty buffer → scroll viewport one line.
+    // Contextual ↑/↓ (§8.3): history always wins when entries exist —
+    // empty input + ↑ recalls the last prompt (standard REPL behavior),
+    // typing filters by prefix is unnecessary so plain recall applies;
+    // the viewport scrolls only when there is no history to show.
     if (key.upArrow && !key.shift && !key.ctrl) {
-      if (input.trim() !== '' || histIdx !== null) {
-        if (history.length > 0) {
-          const next = histIdx === null ? history.length - 1 : Math.max(0, histIdx - 1);
-          setHistIdx(next);
-          setInput(history[next] ?? '');
-          setVimCursor(null);
-        }
+      if (history.length > 0) {
+        const next = histIdx === null ? history.length - 1 : Math.max(0, histIdx - 1);
+        setHistIdx(next);
+        setInput(history[next] ?? '');
+        setVimCursor(null);
         return;
       }
       if (isFullscreen && maxTop > 0) { commands.lineUp(); return; }

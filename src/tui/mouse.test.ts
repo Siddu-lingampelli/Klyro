@@ -2,7 +2,18 @@
  * scroll.md §15.1 — mouse splitter unit tests (no terminal).
  */
 import { describe, it, expect } from 'vitest';
-import { MouseFilter, WHEEL_LINES, PasteFilter, createReadWrapper } from './mouse.js';
+import { MouseFilter, WHEEL_LINES, PasteFilter, createReadWrapper, isMouseReportingEnabled } from './mouse.js';
+
+describe('isMouseReportingEnabled', () => {
+  it('defaults OFF so native select-to-copy and right-click paste work', () => {
+    expect(isMouseReportingEnabled({})).toBe(false);
+    expect(isMouseReportingEnabled({ KLYRO_MOUSE: '0' })).toBe(false);
+    expect(isMouseReportingEnabled({ KLYRO_MOUSE: '' })).toBe(false);
+  });
+  it('opts in with KLYRO_MOUSE=1 for wheel scrolling', () => {
+    expect(isMouseReportingEnabled({ KLYRO_MOUSE: '1' })).toBe(true);
+  });
+});
 
 describe('MouseFilter', () => {
   it('passes normal typing through untouched', () => {

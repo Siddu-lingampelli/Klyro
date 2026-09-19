@@ -26,7 +26,7 @@ import { parseUnifiedDiff } from '../tui/diff-parser.js';
 import { parse, type SlashCommand } from './slash/parser.js';
 import { resolveProvider, providerHelp, lastProviderError } from '../providers.js';
 import { readVersion } from '../version.js';
-import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE, PASTE_ENABLE, PASTE_DISABLE, PasteFilter, createReadWrapper } from '../tui/mouse.js';
+import { MouseFilter, MOUSE_ENABLE, MOUSE_DISABLE, PASTE_ENABLE, PASTE_DISABLE, PasteFilter, createReadWrapper, isMouseReportingEnabled } from '../tui/mouse.js';
 import { inferProviderFromBaseURL } from '../agent/registry.js';
 import { getDefaultSessionStore } from '../persistence/session.js';
 import { buildSystemPrompt, parseImageInput } from '../context/system-prompt.js';
@@ -387,18 +387,24 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // ── Full-screen takeover like OpenCode — always when klyro in TTY (user explicitly wants it)
   // Scroll now works correctly via internal viewport, not native terminal scroll
   const isAltScreen = useTui && !!process.stdout.isTTY && process.env.KLYRO_NO_ALT !== '1';
+  // Mouse reporting is opt-in (KLYRO_MOUSE=1): when on, the terminal sends
+  // clicks/wheel to the app (wheel scrolls ±3 lines) but native text
+  // selection and right-click paste stop working. Default off so select to
+  // copy and right-click paste work out of the box; bracketed paste
+  // (keyboard paste) is unaffected and always enabled below.
+  const mouseReporting = isAltScreen && isMouseReportingEnabled();
   const enterAlt = () => {
     if (!isAltScreen) return;
     try {
       process.stdout.write('\x1b[?1049h\x1b[?25l'); // alt screen + hide cursor
       process.stdout.write('\x1b[H\x1b[2J'); // home + clear
-      process.stdout.write(MOUSE_ENABLE); // wheel events (SGR), see tui/mouse.ts
+      if (mouseReporting) process.stdout.write(MOUSE_ENABLE); // wheel events (SGR), see tui/mouse.ts
     } catch { /* ignore */ }
   };
   const leaveAlt = () => {
     if (!isAltScreen) return;
     try {
-      process.stdout.write(MOUSE_DISABLE);
+      if (mouseReporting) process.stdout.write(MOUSE_DISABLE);
       process.stdout.write('\x1b[?25h\x1b[?1049l'); // show cursor + leave alt
     } catch { /* ignore */ }
   };
@@ -2469,8 +2475,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             '  Enter send · Shift+Enter newline · Tab complete slash · Esc drop queued / Esc×2 cancel run',
             '  Ctrl+C cancel (1st) / quit (2nd) · Ctrl+O expand last tool group · Ctrl+G jump bottom',
             '  PgUp/PgDn or Ctrl+U/Ctrl+D half-page · Ctrl+Home/End top/bottom · Home/End jump · Space jump to unread',
-            '  Ctrl+B/F page · Shift/Ctrl+↑/↓ line · ↑/↓ history (with text) else scroll · wheel ±3 lines',
-            '  Shift+drag selects · /vim toggles vim input mode · /keymap <note> saves a display note',
+            '  Ctrl+B/F page · Shift/Ctrl+↑/↓ line · ↑/↓ input history · PgUp/Dn scroll (KLYRO_MOUSE=1 adds wheel ±3 lines)',
+            '  Text selection/copy and right-click paste work natively · Shift+Enter newline · /vim toggles vim input mode · /keymap <note> saves a display note',
           ].join('\n'),
         });
         return;

@@ -6,12 +6,11 @@
 > `HarnessFlow` notes, and `READ.md` are history/requirements — when they
 > disagree with this file, this file wins.
 
-- Version: 1.0.11 (`release: klyro 1.0.11 - eval cwd isolation`). 1.0.10 closed
-  the 1.0.9 audit (gating smoke eval, npm canonical, atomic persistence,
-  schema versioning, exactly-once tools, terminal sanitization, session
-  module extraction); 1.0.11 fixes JSONL eval scenarios executing tool calls
-  in the caller's directory — each scenario now runs in an isolated tmp
-  workdir (`--cwd` opts into a shared dir), with results reporting `workDir`.
+- Version: 1.0.12 (`release: klyro 1.0.12 - TUI copy/paste + history`). 1.0.11
+  isolated JSONL eval scenarios into tmp workdirs; 1.0.12 fixes TUI input:
+  ↑ recalls history on empty input (was: scrolled), mouse reporting is now
+  opt-in via `KLYRO_MOUSE=1` so native select-to-copy and right-click paste
+  work by default, keyboard/bracketed paste unchanged.
 - Canonical package manager: **npm + `package-lock.json`** (matches CI,
   Dockerfile, publish). `pnpm-workspace.yaml` is legacy for the unused
   private `packages/shared` workspace and is ignored by npm.

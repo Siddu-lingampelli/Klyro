@@ -356,6 +356,7 @@ describe('App', () => {
   });
 
   it('↑ on empty input scrolls one line instead of history', async () => {
+    // No prompts submitted yet → history is empty → viewport scrolls.
     const { stdin, lastFrame } = render(
       <App
         initialModel="m"
@@ -374,6 +375,33 @@ describe('App', () => {
     stdin.write('\x1b[A');
     await new Promise((r) => setTimeout(r, 30));
     expect(lastFrame() ?? '').toMatch(/MSG-00-tag/);
+  });
+
+  it('↑ on empty input recalls history newest-first; ↓ browses back (user report)', async () => {
+    const onPrompt = vi.fn(async () => {});
+    const { stdin, lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={onPrompt} onSlash={async () => {}} />,
+    );
+    stdin.write('hi');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write('second prompt');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onPrompt).toHaveBeenCalledTimes(2);
+    // Input is empty after each submit; plain ↑ must recall, not scroll.
+    stdin.write('\x1b[A');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('second prompt');
+    stdin.write('\x1b[A');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('hi');
+    // ↓ walks back toward newer entries.
+    stdin.write('\x1b[B');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('second prompt');
   });
 
   it('/c shows top-6 suggestions and Tab completes', async () => {
