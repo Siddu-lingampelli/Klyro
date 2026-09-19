@@ -921,10 +921,15 @@ export function App(props: AppProps): React.JSX.Element {
     // Scrolled up reading the transcript (not at the live tail, not already
     // browsing) → plain ↑ keeps scrolling so chat scroll is never lost.
     // At the live tail (or no scroll surface) → ↑ browses input history
-    // newest-first, so send + ↑ restores the last prompt. ↓ is unchanged:
-    // browse newer while browsing, else scroll toward the tail.
-    if (key.upArrow && !key.shift && !key.ctrl) {
-      if (isFullscreen && maxTop > 0 && !atBottom && histIdx === null && input.trim() === '') {
+    // newest-first, so send + ↑ restores the last prompt. Ctrl+P / Ctrl+N
+    // are escape-free aliases for history prev/next: single-byte codes that
+    // always browse, even on terminals that mangle arrow-key sequences.
+    // ↓ is otherwise unchanged: browse newer while browsing, else scroll
+    // toward the tail.
+    const wantHistPrev = (key.upArrow && !key.shift && !key.ctrl) || (key.ctrl && inputStr === 'p');
+    const wantHistNext = (key.downArrow && !key.shift && !key.ctrl) || (key.ctrl && inputStr === 'n');
+    if (wantHistPrev) {
+      if (!key.ctrl && isFullscreen && maxTop > 0 && !atBottom && histIdx === null && input.trim() === '') {
         commands.lineUp(); return;
       }
       if (history.length > 0) {
@@ -932,11 +937,12 @@ export function App(props: AppProps): React.JSX.Element {
         setHistIdx(next);
         setInput(history[next] ?? '');
         setVimCursor(null);
-        return;
+      } else if (!key.ctrl && isFullscreen && maxTop > 0) {
+        commands.lineUp();
       }
-      if (isFullscreen && maxTop > 0) { commands.lineUp(); return; }
+      return;
     }
-    if (key.downArrow && !key.shift && !key.ctrl) {
+    if (wantHistNext) {
       if (histIdx !== null) {
         const next = histIdx + 1;
         if (next >= history.length) { setHistIdx(null); setInput(''); }
@@ -944,7 +950,7 @@ export function App(props: AppProps): React.JSX.Element {
         setVimCursor(null);
         return;
       }
-      if (input.trim() !== '') return; // single line with text, nothing newer
+      if (input.trim() !== '' || key.ctrl) return; // text present, or Ctrl+N: nothing newer
       if (isFullscreen && maxTop > 0) { commands.lineDown(); return; }
     }
     // Enter on empty input dismisses the badge (jump to bottom, §7.2)

@@ -2475,7 +2475,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             '  Enter send · Shift+Enter newline · Tab complete slash · Esc drop queued / Esc×2 cancel run',
             '  Ctrl+C cancel (1st) / quit (2nd) · Ctrl+O expand last tool group · Ctrl+G jump bottom',
             '  PgUp/PgDn or Ctrl+U/Ctrl+D half-page · Ctrl+Home/End top/bottom · Home/End jump · Space jump to unread',
-            '  Ctrl+B/F page · Shift/Ctrl+↑/↓ line · ↑ history at live tail, scrolls while reading above · PgUp/Dn scroll (KLYRO_MOUSE=1 adds wheel ±3 lines)',
+            '  Ctrl+B/F page · Shift/Ctrl+↑/↓ line · ↑ history at live tail, scrolls while reading above · Ctrl+P/N history always · PgUp/Dn or Ctrl+U/D scroll (KLYRO_MOUSE=1 adds wheel ±3 lines)',
             '  Text selection/copy and right-click paste work natively · Shift+Enter newline · /vim toggles vim input mode · /keymap <note> saves a display note',
           ].join('\n'),
         });

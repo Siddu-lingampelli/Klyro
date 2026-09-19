@@ -434,6 +434,38 @@ describe('App', () => {
     expect(lastFrame() ?? '').not.toContain('zznoscroll!');
   });
 
+  it('Ctrl+P / Ctrl+N browse history without arrow keys', async () => {
+    const onPrompt = vi.fn(async () => {});
+    const { stdin, lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={onPrompt} onSlash={async () => {}} />,
+    );
+    stdin.write('zzfirst');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write('zzsecond');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onPrompt).toHaveBeenCalledTimes(2);
+    // Ctrl+P recalls newest-first with zero escape sequences involved.
+    stdin.write('\x10');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('!');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('zzsecond!');
+    // Ctrl+P twice walks older with no typing between, Ctrl+N walks newer.
+    stdin.write('\x10');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('\x10');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('\x0e');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('#');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('zzsecond#');
+  });
+
   it('/c shows top-6 suggestions and Tab completes', async () => {
     const { stdin, lastFrame } = render(
       <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,

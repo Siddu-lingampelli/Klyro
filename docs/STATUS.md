@@ -6,10 +6,10 @@
 > `HarnessFlow` notes, and `READ.md` are history/requirements — when they
 > disagree with this file, this file wins.
 
-- Version: 1.0.13 (`release: klyro 1.0.13 - arrows scroll + recall`). 1.0.12 made
-  ↑ recall history but stole arrow-scrolling; 1.0.13 keeps both: ↑ scrolls
-  while reading scrolled-up, recalls history at the live tail. Copy/paste
-  via `KLYRO_MOUSE` opt-in (default off) unchanged.
+- Version: 1.0.14 (`release: klyro 1.0.14 - escape-free history keys`). 1.0.13
+  split ↑ between scrolling (while reading) and recall (at live tail); 1.0.14
+  adds Ctrl+P / Ctrl+N aliases for history prev/next that need no escape
+  sequences, so recall works even where terminals mangle arrow keys.
 - Canonical package manager: **npm + `package-lock.json`** (matches CI,
   Dockerfile, publish). `pnpm-workspace.yaml` is legacy for the unused
   private `packages/shared` workspace and is ignored by npm.
