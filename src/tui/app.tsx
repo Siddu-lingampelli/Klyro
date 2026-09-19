@@ -917,11 +917,16 @@ export function App(props: AppProps): React.JSX.Element {
     }
     // design.md §18: idle Ctrl+C exits.
     if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
-    // Contextual ↑/↓ (§8.3): history always wins when entries exist —
-    // empty input + ↑ recalls the last prompt (standard REPL behavior),
-    // typing filters by prefix is unnecessary so plain recall applies;
-    // the viewport scrolls only when there is no history to show.
+    // Contextual ↑/↓ (§8.3): both behaviors, split by where you are.
+    // Scrolled up reading the transcript (not at the live tail, not already
+    // browsing) → plain ↑ keeps scrolling so chat scroll is never lost.
+    // At the live tail (or no scroll surface) → ↑ browses input history
+    // newest-first, so send + ↑ restores the last prompt. ↓ is unchanged:
+    // browse newer while browsing, else scroll toward the tail.
     if (key.upArrow && !key.shift && !key.ctrl) {
+      if (isFullscreen && maxTop > 0 && !atBottom && histIdx === null && input.trim() === '') {
+        commands.lineUp(); return;
+      }
       if (history.length > 0) {
         const next = histIdx === null ? history.length - 1 : Math.max(0, histIdx - 1);
         setHistIdx(next);

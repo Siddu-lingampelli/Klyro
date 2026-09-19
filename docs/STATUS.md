@@ -6,11 +6,10 @@
 > `HarnessFlow` notes, and `READ.md` are history/requirements — when they
 > disagree with this file, this file wins.
 
-- Version: 1.0.12 (`release: klyro 1.0.12 - TUI copy/paste + history`). 1.0.11
-  isolated JSONL eval scenarios into tmp workdirs; 1.0.12 fixes TUI input:
-  ↑ recalls history on empty input (was: scrolled), mouse reporting is now
-  opt-in via `KLYRO_MOUSE=1` so native select-to-copy and right-click paste
-  work by default, keyboard/bracketed paste unchanged.
+- Version: 1.0.13 (`release: klyro 1.0.13 - arrows scroll + recall`). 1.0.12 made
+  ↑ recall history but stole arrow-scrolling; 1.0.13 keeps both: ↑ scrolls
+  while reading scrolled-up, recalls history at the live tail. Copy/paste
+  via `KLYRO_MOUSE` opt-in (default off) unchanged.
 - Canonical package manager: **npm + `package-lock.json`** (matches CI,
   Dockerfile, publish). `pnpm-workspace.yaml` is legacy for the unused
   private `packages/shared` workspace and is ignored by npm.

@@ -377,31 +377,61 @@ describe('App', () => {
     expect(lastFrame() ?? '').toMatch(/MSG-00-tag/);
   });
 
-  it('↑ on empty input recalls history newest-first; ↓ browses back (user report)', async () => {
+  it('↑ at live tail recalls history; scrolled up it scrolls (both kept)', async () => {
     const onPrompt = vi.fn(async () => {});
     const { stdin, lastFrame } = render(
-      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={onPrompt} onSlash={async () => {}} />,
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={onPrompt}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
     );
-    stdin.write('hi');
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write('zzrecallme');
     await new Promise((r) => setTimeout(r, 20));
     stdin.write('\x0d');
     await new Promise((r) => setTimeout(r, 50));
-    stdin.write('second prompt');
+    expect(onPrompt).toHaveBeenCalledWith('zzrecallme');
+    // At the live tail, empty input + ↑ recalls into the input line: typing
+    // '!' must extend the recalled text (only the input holds 'zzrecallme!').
+    stdin.write('\x1b[A');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('!');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('zzrecallme!');
+  });
+
+  it('↑ while scrolled up keeps scrolling and leaves input empty', async () => {
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m"
+        maxSteps={10}
+        cwd="/test"
+        onPrompt={async () => {}}
+        onSlash={async () => {}}
+        isFullscreen={true}
+        initialTranscript={makeInitialTranscript(25)}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write('zznoscroll');
     await new Promise((r) => setTimeout(r, 20));
     stdin.write('\x0d');
     await new Promise((r) => setTimeout(r, 50));
-    expect(onPrompt).toHaveBeenCalledTimes(2);
-    // Input is empty after each submit; plain ↑ must recall, not scroll.
+    stdin.write(KEY_HOME);
+    await new Promise((r) => setTimeout(r, 30));
+    // Scrolled up + empty input + ↑ → scroll (MSG-00 stays), input untouched:
+    // typing '!' must NOT extend the submitted prompt.
     stdin.write('\x1b[A');
     await new Promise((r) => setTimeout(r, 30));
-    expect(lastFrame() ?? '').toContain('second prompt');
-    stdin.write('\x1b[A');
+    expect(lastFrame() ?? '').toMatch(/MSG-00-tag/);
+    stdin.write('!');
     await new Promise((r) => setTimeout(r, 30));
-    expect(lastFrame() ?? '').toContain('hi');
-    // ↓ walks back toward newer entries.
-    stdin.write('\x1b[B');
-    await new Promise((r) => setTimeout(r, 30));
-    expect(lastFrame() ?? '').toContain('second prompt');
+    expect(lastFrame() ?? '').not.toContain('zznoscroll!');
   });
 
   it('/c shows top-6 suggestions and Tab completes', async () => {
