@@ -18,8 +18,14 @@ describe('buildImportGraph freshness', () => {
     await fs.writeFile(path.join(cwd, 'c.ts'), `export const c = 1;\n`, 'utf-8');
     expect(await importsOf(cwd, 'a.ts')).toContain('b');
 
-    // Edit a.ts to import ./c instead (size change guarantees stat mismatch).
-    await fs.writeFile(path.join(cwd, 'a.ts'), `import {} from './c';\n`, 'utf-8');
+    // Edit a.ts to import ./c instead. NOTE: './b' → './c' preserves byte
+    // size, and rapid rewrites can share a Windows mtimeMs tick — so force
+    // the mtime forward instead of relying on stat granularity (the
+    // production cache keys on {mtimeMs, size} by design; see import-graph.ts).
+    const aPath = path.join(cwd, 'a.ts');
+    await fs.writeFile(aPath, `import {} from './c';\n`, 'utf-8');
+    const st = await fs.stat(aPath);
+    await fs.utimes(aPath, st.atime, new Date(st.mtimeMs + 2000));
     expect(await importsOf(cwd, 'a.ts')).toContain('c');
     expect(await importsOf(cwd, 'a.ts')).not.toContain('b');
   });

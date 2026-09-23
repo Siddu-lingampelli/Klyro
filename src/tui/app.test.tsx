@@ -355,7 +355,7 @@ describe('App', () => {
     expect(lastFrame() ?? '').toContain('first recallable prompt');
   });
 
-  it('↑ on empty input scrolls one line instead of history', async () => {
+  it('↑ on empty input with no history is a no-op (arrows never scroll)', async () => {
     // No prompts submitted yet → history is empty → viewport scrolls.
     const { stdin, lastFrame } = render(
       <App
@@ -377,7 +377,7 @@ describe('App', () => {
     expect(lastFrame() ?? '').toMatch(/MSG-00-tag/);
   });
 
-  it('↑ at live tail recalls history; scrolled up it scrolls (both kept)', async () => {
+  it('↑ recalls history at the tail and while scrolled up (never scrolls)', async () => {
     const onPrompt = vi.fn(async () => {});
     const { stdin, lastFrame } = render(
       <App
@@ -405,7 +405,7 @@ describe('App', () => {
     expect(lastFrame() ?? '').toContain('zzrecallme!');
   });
 
-  it('↑ while scrolled up keeps scrolling and leaves input empty', async () => {
+  it('↑ while scrolled up recalls history instead of scrolling', async () => {
     const { stdin, lastFrame } = render(
       <App
         initialModel="m"
@@ -424,14 +424,14 @@ describe('App', () => {
     await new Promise((r) => setTimeout(r, 50));
     stdin.write(KEY_HOME);
     await new Promise((r) => setTimeout(r, 30));
-    // Scrolled up + empty input + ↑ → scroll (MSG-00 stays), input untouched:
-    // typing '!' must NOT extend the submitted prompt.
+    // Scrolled up + empty input + ↑ → recalls into the input line (viewport
+    // untouched, MSG-00 stays): typing '!' must extend the recalled prompt.
     stdin.write('\x1b[A');
     await new Promise((r) => setTimeout(r, 30));
     expect(lastFrame() ?? '').toMatch(/MSG-00-tag/);
     stdin.write('!');
     await new Promise((r) => setTimeout(r, 30));
-    expect(lastFrame() ?? '').not.toContain('zznoscroll!');
+    expect(lastFrame() ?? '').toContain('zznoscroll!');
   });
 
   it('Ctrl+P / Ctrl+N browse history without arrow keys', async () => {

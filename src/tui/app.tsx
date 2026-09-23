@@ -917,28 +917,19 @@ export function App(props: AppProps): React.JSX.Element {
     }
     // design.md §18: idle Ctrl+C exits.
     if (key.ctrl && inputStr === 'c') { void props.onSlash({ kind: 'quit' }); return; }
-    // Contextual ↑/↓ (§8.3): both behaviors, split by where you are.
-    // Scrolled up reading the transcript (not at the live tail, not already
-    // browsing) → plain ↑ keeps scrolling so chat scroll is never lost.
-    // At the live tail (or no scroll surface) → ↑ browses input history
-    // newest-first, so send + ↑ restores the last prompt. Ctrl+P / Ctrl+N
-    // are escape-free aliases for history prev/next: single-byte codes that
-    // always browse, even on terminals that mangle arrow-key sequences.
-    // ↓ is otherwise unchanged: browse newer while browsing, else scroll
-    // toward the tail.
+    // ↑/↓ are history keys, always (§8.3): ↑ browses older prompts
+    // newest-first (empty history → no-op), ↓ browses back newer. Neither
+    // ever scrolls the transcript — scrolling is PgUp/PgDn, Ctrl+U/D/B/F,
+    // Shift+↑/↓, Home/End, Space, or the wheel (KLYRO_MOUSE=1). Ctrl+P /
+    // Ctrl+N are escape-free aliases for the same history moves.
     const wantHistPrev = (key.upArrow && !key.shift && !key.ctrl) || (key.ctrl && inputStr === 'p');
     const wantHistNext = (key.downArrow && !key.shift && !key.ctrl) || (key.ctrl && inputStr === 'n');
     if (wantHistPrev) {
-      if (!key.ctrl && isFullscreen && maxTop > 0 && !atBottom && histIdx === null && input.trim() === '') {
-        commands.lineUp(); return;
-      }
       if (history.length > 0) {
         const next = histIdx === null ? history.length - 1 : Math.max(0, histIdx - 1);
         setHistIdx(next);
         setInput(history[next] ?? '');
         setVimCursor(null);
-      } else if (!key.ctrl && isFullscreen && maxTop > 0) {
-        commands.lineUp();
       }
       return;
     }
@@ -948,10 +939,8 @@ export function App(props: AppProps): React.JSX.Element {
         if (next >= history.length) { setHistIdx(null); setInput(''); }
         else { setHistIdx(next); setInput(history[next] ?? ''); }
         setVimCursor(null);
-        return;
       }
-      if (input.trim() !== '' || key.ctrl) return; // text present, or Ctrl+N: nothing newer
-      if (isFullscreen && maxTop > 0) { commands.lineDown(); return; }
+      return;
     }
     // Enter on empty input dismisses the badge (jump to bottom, §7.2)
     if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } setInput(''); setVimCursor(null); setHistIdx(null); pushHistory(v); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); resetStream(); setSubmitKey((k) => k + 1); const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
