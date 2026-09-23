@@ -6,13 +6,12 @@
 > `HarnessFlow` notes, and `READ.md` are history/requirements — when they
 > disagree with this file, this file wins.
 
-- Version: 1.0.15 (`release: klyro 1.0.15 - external audit fixes P0-P3`, built
-  on the Sept-20 tree hardening). Closes all 10 audit findings with
-  regression tests: symlink-test arg order, update downgrade/injection via
-  non-semver tags, web-fetch SSRF (metadata range + unspecified hosts),
-  project-layer apiKey stripping + public-baseUrl warnings, failover flags
-  + unified key sources, MCP stdio 8 MiB line cap, prototype-pollution
-  guards (persist + audit), short-key redaction.
+- Version: 1.0.16 (`release: klyro 1.0.16 - record Sept-20 follow-up, arrows-only
+  contract, deflake`). Records the Sept-20 follow-up as found (checkpoints
+  adopt `cappedOutput`, runtime tests opt into the hooks trust gate); TUI
+  arrows are history-only (no scroll fallbacks); import-graph freshness test
+  forces mtime forward instead of relying on FS granularity. 1.0.15 closed
+  all 10 external audit findings with regression tests.
 - Canonical package manager: **npm + `package-lock.json`** (matches CI,
   Dockerfile, publish). `pnpm-workspace.yaml` is legacy for the unused
   private `packages/shared` workspace and is ignored by npm.
