@@ -510,6 +510,18 @@ describe('providers.failover config + resolveProviderChain', () => {
     expect(chain[1]?.apiKey).toBe('fallback-secret');
     expect(chain[1]?.baseURL).toBe('https://api.anthropic.com');
   });
+
+  it('primary uses one source: flags over env (run + failover agree)', async () => {
+    process.env.KLYRO_API_KEY = 'env-key';
+    try {
+      const fromEnv = await resolveProviderChain(process.cwd(), { provider: 'openai', baseUrl: 'http://flag/v1' });
+      expect(fromEnv[0]).toMatchObject({ provider: 'openai', apiKey: 'env-key', baseURL: 'http://flag/v1' });
+      const flagged = await resolveProviderChain(process.cwd(), { provider: 'openai', baseUrl: 'http://flag/v1', apiKey: 'flag-key' });
+      expect(flagged[0]).toMatchObject({ provider: 'openai', apiKey: 'flag-key', baseURL: 'http://flag/v1' });
+    } finally {
+      delete process.env.KLYRO_API_KEY;
+    }
+  });
 });
 
 describe('loadTranscript', () => {

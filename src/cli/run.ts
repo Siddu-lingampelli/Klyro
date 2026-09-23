@@ -96,11 +96,6 @@ export interface RunCliOptions {
   maxDepth?: number;
 }
 
-function readEnv(name: string, fallback?: string): string | undefined {
-  const v = process.env[name];
-  return v && v.length > 0 ? v : fallback;
-}
-
 /**
  * Double-Ctrl+C detector (pure, exported for tests): the second SIGINT
  * within 1500ms of the first forces `process.exit(130)`. The live handler
@@ -153,10 +148,22 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     });
   };
   let adapter = opts.adapter;
+  let chain: import('./config.js').ResolvedProviderEntry[] = [];
   if (!adapter) {
-    const provider = opts.provider ?? 'openai';
-    const baseUrl = opts.baseUrl ?? readEnv('KLYRO_BASE_URL');
-    const apiKey = opts.apiKey ?? readEnv('KLYRO_API_KEY');
+    // Single source of truth: the provider chain (flags > merged config >
+    // env > defaults) resolves the primary identically everywhere, so CLI
+    // flags (--provider/--api-key/--base-url) and every key env source apply
+    // to the primary and to each failover entry alike.
+    const { resolveProviderChain } = await import('./config.js');
+    chain = await resolveProviderChain(opts.cwd, {
+      ...(opts.provider !== undefined ? { provider: opts.provider } : {}),
+      ...(opts.baseUrl !== undefined ? { baseUrl: opts.baseUrl } : {}),
+      ...(opts.apiKey !== undefined ? { apiKey: opts.apiKey } : {}),
+    });
+    const primary = chain[0]!;
+    const provider = primary.provider;
+    const baseUrl = primary.baseURL;
+    const apiKey = primary.apiKey;
     if (!apiKey) {
       stderr.write('klyro: KLYRO_API_KEY is not set (or pass --api-key)\n');
       return 2;
@@ -179,11 +186,11 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   // L15 provider failover: extra chain entries (after the primary) become
   // fallback adapters for the runtime. Custom injected adapters (tests)
   // skip chain wiring. Failures resolving the chain never block the run.
+  // (Chain already resolved above with CLI flags; reuse it — no second
+  // resolution, no divergent key sources.)
   let failoverAdapters: import('../agent/provider-adapter.js').ProviderAdapter[] | undefined;
   if (!opts.adapter) {
     try {
-      const { resolveProviderChain } = await import('./config.js');
-      const chain = await resolveProviderChain(opts.cwd);
       const fallbacks = chain.slice(1);
       if (fallbacks.length > 0) {
         const built: import('../agent/provider-adapter.js').ProviderAdapter[] = [];

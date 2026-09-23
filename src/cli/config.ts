@@ -336,6 +336,93 @@ export function loadConfigSync(): Record<string, unknown> {
   return {};
 }
 
+/**
+ * Project-layer trust boundary (P1): `.klyro/settings*.json` ship with the
+ * repo, so a hostile checkout can plant them. API keys are NEVER accepted
+ * from project layers — keys load only from ~/.klyro, env, or flags. A
+ * project baseUrl pointing at a public host (which would receive the user's
+ * key + prompts) warns loudly; loopback/RFC1918 stay silent for shared
+ * local setups (Ollama etc.).
+ */
+function isPublicHostUrl(raw: string): boolean {
+  let host = '';
+  try {
+    host = new URL(raw).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  } catch {
+    return true; // unparseable endpoint — treat as hostile, warn
+  }
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
+  if (host.endsWith('.localhost') || host.endsWith('.local')) return false;
+  if (host.startsWith('127.')) return false;
+  if (/^10\.\d+\.\d+\.\d+$/.test(host)) return false;
+  if (/^192\.168\.\d+\.\d+$/.test(host)) return false;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+$/.test(host)) return false;
+  return true;
+}
+
+function scrubProjectLayer(obj: Record<string, unknown>, file: string): Record<string, unknown> {
+  const warn = (msg: string): void => {
+    try { process.stderr.write(msg); } catch { /* ignore */ }
+  };
+  for (const k of ['apiKey', 'api_key']) {
+    if (obj[k] !== undefined) {
+      delete obj[k];
+      warn(
+        `klyro: ignoring apiKey in project config ${file} — keys load only from ~/.klyro/settings.json, env (KLYRO_API_KEY), or --api-key\n`,
+      );
+    }
+  }
+  for (const k of ['baseUrl', 'baseURL']) {
+    const v = obj[k];
+    if (typeof v === 'string' && v.length > 0 && isPublicHostUrl(v)) {
+      warn(
+        `klyro: warning: project config ${file} points the provider at ${v} — API requests (including your key) will go there\n`,
+      );
+    }
+  }
+  scrubProjectFailover(obj['providers'], file, warn);
+  return obj;
+}
+
+/**
+ * Failover entries from a project layer get the same trust treatment as the
+ * primary endpoint. Two reasons `apiKeyEnv` is dropped rather than warned
+ * about: (a) a fallback fires *without a prompt*, so a repo-chosen env var
+ * name would silently ship the user's credential to a repo-chosen host, and
+ * (b) the name can also cross providers (`provider:'openai'` + an Anthropic
+ * env var). A literal `apiKey` in project config is left alone — that is the
+ * repo's own key, not the user's secret — matching the accepted
+ * `providers.failover[].apiKey` behaviour. Keys for a project-authored
+ * fallback belong in ~/.klyro/settings.json.
+ */
+function scrubProjectFailover(
+  providers: unknown,
+  file: string,
+  warn: (msg: string) => void,
+): void {
+  if (providers === null || typeof providers !== 'object') return;
+  const failover = (providers as { failover?: unknown }).failover;
+  if (!Array.isArray(failover)) return;
+  for (const entry of failover) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    if (e['apiKeyEnv'] !== undefined) {
+      delete e['apiKeyEnv'];
+      warn(
+        `klyro: ignoring apiKeyEnv in project config ${file} — a repo must not choose which env var holds your key; configure that fallback in ~/.klyro/settings.json\n`,
+      );
+    }
+    for (const k of ['baseURL', 'baseUrl']) {
+      const v = e[k];
+      if (typeof v === 'string' && v.length > 0 && isPublicHostUrl(v)) {
+        warn(
+          `klyro: warning: project config ${file} routes a failover provider to ${v} — API requests (including your key) will go there\n`,
+        );
+      }
+    }
+  }
+}
+
 // --- Merged load with 5-layer precedence ---
 export async function loadMergedConfig(cwd = process.cwd(), flags: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
   const layers: Record<string, unknown>[] = [];
@@ -357,7 +444,7 @@ export async function loadMergedConfig(cwd = process.cwd(), flags: Record<string
   try {
     const raw = await fs.readFile(path.join(cwd, '.klyro', 'settings.json'), 'utf-8');
     const obj = parseJsonc(raw, path.join(cwd, '.klyro/settings.json'));
-    layers.push(validateConfig(obj, path.join(cwd, '.klyro/settings.json')));
+    layers.push(scrubProjectLayer(validateConfig(obj, path.join(cwd, '.klyro/settings.json')), path.join(cwd, '.klyro/settings.json')));
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { code?: string };
     if (e.code !== 'ENOENT') throw err;
@@ -366,7 +453,7 @@ export async function loadMergedConfig(cwd = process.cwd(), flags: Record<string
   try {
     const raw = await fs.readFile(path.join(cwd, '.klyro', 'settings.local.json'), 'utf-8');
     const obj = parseJsonc(raw, path.join(cwd, '.klyro/settings.local.json'));
-    layers.push(validateConfig(obj, path.join(cwd, '.klyro/settings.local.json')));
+    layers.push(scrubProjectLayer(validateConfig(obj, path.join(cwd, '.klyro/settings.local.json')), path.join(cwd, '.klyro/settings.local.json')));
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { code?: string };
     if (e.code !== 'ENOENT') throw err;

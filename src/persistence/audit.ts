@@ -12,7 +12,7 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { SessionStore } from './store.js';
+import { SessionStore, hasDangerousKeys } from './store.js';
 
 export type AuditEvent =
   | { kind: 'session_created'; sessionId: string; task: string; cwd: string; ts: number }
@@ -162,6 +162,13 @@ async function verifySegment(filePath: string, segmentLabel: string): Promise<{ 
       parsed = JSON.parse(line) as Record<string, unknown>;
     } catch {
       return { events, error: `${segmentLabel}:${i + 1}: unparseable JSON` };
+    }
+    // Fail closed on tampered shapes before any field is trusted: a line
+    // carrying prototype-pollution keys can never be a genuine record
+    // (the writer only emits AuditEvent shapes), so reject it outright
+    // rather than letting it reach the hash comparison.
+    if (hasDangerousKeys(parsed)) {
+      return { events, error: `${segmentLabel}:${i + 1}: dangerous keys (possible tampering)` };
     }
     if (parsed.prevHash !== expectedPrev) {
       return { events, error: `${segmentLabel}:${i + 1}: prevHash mismatch (chain fork or truncation)` };

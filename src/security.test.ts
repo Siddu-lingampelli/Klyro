@@ -211,9 +211,9 @@ describe('security: symlink escape', () => {
     await fs.mkdir(cwd, { recursive: true });
     try {
       await fs.symlink(realTarget, linkPath, 'file');
-      const r = await resolveAndFollowSymlinks(linkPath, cwd);
-      // Resolved path is outside cwd, so this should be flagged.
-      expect(r.ok).toBe(false);
+      // Must throw: the link resolves outside cwd. (Reversed arguments here
+      // would test nothing — signature is (cwd, requested).)
+      await expect(resolveAndFollowSymlinks(cwd, linkPath)).rejects.toThrow(/escapes cwd/i);
     } finally {
       await fs.rm(linkPath, { force: true });
       await fs.rm(realTarget, { force: true });

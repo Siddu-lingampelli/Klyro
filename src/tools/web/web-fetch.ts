@@ -58,6 +58,24 @@ const DEFAULT_MAX_CHARS = 20_000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
+ * Expand an IPv4-mapped IPv6 host to its dotted quad, else null.
+ *
+ * `::ffff:169.254.169.254` and `::ffff:a9fe:a9fe` are the SAME address, but
+ * WHATWG URL stringifies the second form in hex — so a dotted-quad regex
+ * alone is bypassable by writing the mapped form. Returns the dotted quad for
+ * both spellings so every address check below sees one canonical shape.
+ */
+export function mappedIPv4(host: string): string | null {
+  const dotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host);
+  if (dotted) return dotted[1]!;
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+  if (!hex) return null;
+  const hi = parseInt(hex[1]!, 16);
+  const lo = parseInt(hex[2]!, 16);
+  return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+}
+
+/**
  * Allow-list check for fetch targets. `https:` is always structurally OK;
  * `http:` is restricted to loopback/private hosts unless the user opts in
  * with `KLYRO_ALLOW_INSECURE=1`. Returns null when allowed, else a reason.
@@ -72,14 +90,31 @@ export function fetchUrlDenialReason(raw: string, env: Readonly<Record<string, s
   if (u.protocol !== 'https:' && u.protocol !== 'http:') {
     return `refusing non-http(s) URL scheme: ${u.protocol}`;
   }
-  const host = u.hostname.toLowerCase();
+  // WHATWG URL keeps IPv6 brackets in `hostname` (`[::1]`), so strip them
+  // once and compare bare hosts everywhere below.
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  // Address view: unmap IPv4-mapped IPv6 so `[::ffff:0.0.0.0]` and
+  // `[::ffff:169.254.169.254]` cannot slip past the checks as hex strings.
+  const addr = mappedIPv4(host) ?? host;
+  // Unspecified addresses are never valid fetch targets (SSRF evasion
+  // vector — "this host" without naming it).
+  if (addr === '0.0.0.0' || addr === '::' || addr === '0:0:0:0:0:0:0:0') {
+    return `refusing unspecified destination address: ${u.hostname}`;
+  }
+  // Cloud metadata endpoints (169.254.0.0/16, any scheme): link-local
+  // IMDS services expose IAM credentials to any local requester. An agent
+  // tricked into fetching these exfiltrates cloud identity — deny always,
+  // even over https.
+  if (/^169\.254\.\d+\.\d+$/.test(addr)) {
+    return `refusing cloud metadata address: ${u.hostname}`;
+  }
   const loopback =
     host === 'localhost' ||
-    host === '127.0.0.1' ||
-    host === '::1' ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+    addr === '127.0.0.1' ||
+    addr === '::1' ||
+    /^10\./.test(addr) ||
+    /^192\.168\./.test(addr) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(addr);
   if (u.protocol === 'http:' && !loopback && env.KLYRO_ALLOW_INSECURE !== '1') {
     return 'refusing plaintext http for non-local host (use https or set KLYRO_ALLOW_INSECURE=1)';
   }

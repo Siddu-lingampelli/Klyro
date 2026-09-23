@@ -8,11 +8,49 @@
  * (serve cannot prompt, so nothing privileged runs without an explicit
  * allow rule) — serving never bypasses policy.
  */
-import * as readline from 'node:readline';
 import { builtinRegistry, type ToolRegistry } from '../tools/registry.js';
 import type { ToolContext } from '../tools/types.js';
 import { PolicyEngine, builtinRules, DEFAULT_POLICY_CONFIG } from '../policy/engine.js';
 import { readVersion } from '../version.js';
+
+/**
+ * Max bytes of one JSON-RPC line (defense in depth: readline-style
+ * unbounded buffering lets one giant message OOM the server).
+ */
+export const MAX_MCP_LINE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Bounded newline-delimited reader. Lines longer than maxBytes are dropped
+ * (reported once as `{ tooLong: true }`) and the reader resyncs at the next
+ * newline; callers answer oversized messages with a JSON-RPC error instead
+ * of parsing unbounded input.
+ */
+export async function* readBoundedLines(
+  input: NodeJS.ReadableStream,
+  maxBytes = MAX_MCP_LINE_BYTES,
+): AsyncGenerator<string | { tooLong: true }, void, void> {
+  let buf = Buffer.alloc(0);
+  let overlong = false;
+  for await (const chunk of input as AsyncIterable<Buffer | string>) {
+    buf = Buffer.concat([buf, typeof chunk === 'string' ? Buffer.from(chunk, 'utf-8') : chunk]);
+    let nl: number;
+    while ((nl = buf.indexOf(0x0a)) !== -1) {
+      const line = buf.subarray(0, nl);
+      buf = buf.subarray(nl + 1);
+      if (overlong) {
+        overlong = false; // drop the remainder of the oversized message
+        continue;
+      }
+      yield line.toString('utf-8');
+    }
+    if (buf.length > maxBytes) {
+      buf = Buffer.alloc(0);
+      overlong = true;
+      yield { tooLong: true };
+    }
+  }
+  if (buf.length > 0 && !overlong) yield buf.toString('utf-8');
+}
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -102,9 +140,12 @@ export async function handleMcpRequest(
 /** Stdio loop: one JSON-RPC message per line on stdin, responses on stdout. */
 export async function serveStdio(cwd: string): Promise<number> {
   const deps = makeServeDeps(cwd);
-  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  for await (const line of rl) {
-    const trimmed = line.trim();
+  for await (const item of readBoundedLines(process.stdin)) {
+    if (typeof item !== 'string') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: `Request too large (limit ${MAX_MCP_LINE_BYTES} bytes)` } }) + '\n');
+      continue;
+    }
+    const trimmed = item.trim();
     if (!trimmed) continue;
     let msg: JsonRpcRequest;
     try {

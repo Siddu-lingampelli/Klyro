@@ -397,6 +397,29 @@ export class SessionStore {
 }
 
 /**
+ * Keys that must never be copied by assignment: `out['__proto__'] = …`
+ * invokes the Object.prototype setter (pollution), and `constructor` /
+ * `prototype` walks can reach live prototypes. Tampered session content
+ * carrying them is dropped at the persist boundary.
+ */
+function isDangerousKey(k: string): boolean {
+  return k === '__proto__' || k === 'constructor' || k === 'prototype';
+}
+
+/** True when any own key (at any depth) is a prototype-pollution key. */
+export function hasDangerousKeys(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(hasDangerousKeys);
+  if (value && typeof value === 'object') {
+    const rec = value as Record<string, unknown>;
+    for (const k of Object.keys(rec)) {
+      if (isDangerousKey(k)) return true;
+      if (hasDangerousKeys(rec[k])) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Redact text blocks of a stored message at the persist boundary.
  * Handles string content, `{ text }` blocks, arrays of blocks, and plain
  * objects (observation input/output) via a deep walk over string leaves.
@@ -422,6 +445,7 @@ export function redactStoredContent(content: unknown): unknown {
     }
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(rec)) {
+      if (isDangerousKey(k)) continue; // tampered key — drop, never assign
       out[k] = typeof v === 'string' ? redact(v) : (v && typeof v === 'object' ? redactStoredContent(v) : v);
     }
     return out;

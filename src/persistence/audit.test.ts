@@ -67,6 +67,23 @@ describe('AuditLog hash chain', () => {
     expect(res.error).toMatch(/prevHash mismatch/);
   });
 
+  it('rejects lines with prototype-pollution keys before trusting fields', async () => {
+    const log = new AuditLog(path.join(dir, 's1.jsonl'));
+    await log.write({ kind: 'session_created', sessionId: 's1', task: 't', cwd: '/x', ts: 1 });
+    const p = path.join(dir, 's1.jsonl');
+    const lines = (await fs.readFile(p, 'utf-8')).split('\n').filter(Boolean);
+    // defineProperty (not assignment) so __proto__ becomes a real own key
+    // in the tampered line, exactly like a hostile file would carry it.
+    const evil = { ...(JSON.parse(lines[0]!) as Record<string, unknown>) };
+    Object.defineProperty(evil, '__proto__', { value: { polluted: true }, enumerable: true, configurable: true, writable: true });
+    lines.push(JSON.stringify(evil));
+    await fs.writeFile(p, lines.join('\n') + '\n', 'utf-8');
+    const res = await verifyAuditChain(dir, 's1');
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/dangerous keys/);
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+  });
+
   it('missing file returns ok:false with error', async () => {
     const res = await verifyAuditChain(dir, 'nope');
     expect(res.ok).toBe(false);

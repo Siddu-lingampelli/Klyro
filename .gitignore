@@ -52,6 +52,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Eval run artifacts (timestamped results; baseline.json stays tracked)
+evals/results/*
+!evals/results/baseline.json
+
 # Misc
 .cache/
 tmp/

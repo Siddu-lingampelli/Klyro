@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { fetchUrlDenialReason, stripHtmlToText } from './web-fetch.js';
+import { fetchUrlDenialReason, stripHtmlToText, mappedIPv4 } from './web-fetch.js';
 import { parseDuckDuckGo } from './web-search.js';
 import { builtinRegistry } from '../registry.js';
 import { PolicyEngine, DEFAULT_POLICY_CONFIG } from '../../policy/engine.js';
@@ -30,6 +30,33 @@ describe('fetchUrlDenialReason', () => {
   it('allows http loopback', () => {
     expect(fetchUrlDenialReason('http://localhost:11434/', ENV)).toBeNull();
     expect(fetchUrlDenialReason('http://127.0.0.1:8080/x', ENV)).toBeNull();
+    // IPv6 loopback arrives bracketed from WHATWG URL — still local.
+    expect(fetchUrlDenialReason('http://[::1]:11434/', ENV)).toBeNull();
+  });
+
+  it('blocks cloud metadata endpoints on any scheme (SSRF)', () => {
+    expect(fetchUrlDenialReason('http://169.254.169.254/latest/meta-data/', ENV)).toMatch(/metadata/);
+    expect(fetchUrlDenialReason('https://169.254.169.254/', ENV)).toMatch(/metadata/);
+    expect(fetchUrlDenialReason('http://169.254.169.253/', ENV)).toMatch(/metadata/);
+    // IPv4-mapped IPv6 reaches the same IMDS address (URL hexifies it).
+    expect(fetchUrlDenialReason('http://[::ffff:169.254.169.254]/latest/meta-data/', ENV)).toMatch(/metadata/);
+  });
+
+  it('refuses unspecified destination addresses', () => {
+    expect(fetchUrlDenialReason('http://0.0.0.0/', ENV)).toMatch(/unspecified/);
+    expect(fetchUrlDenialReason('https://0.0.0.0:8080/x', ENV)).toMatch(/unspecified/);
+    expect(fetchUrlDenialReason('http://[::]/', ENV)).toMatch(/unspecified/);
+    expect(fetchUrlDenialReason('https://[::]/', ENV)).toMatch(/unspecified/);
+    expect(fetchUrlDenialReason('http://[0:0:0:0:0:0:0:0]/', ENV)).toMatch(/unspecified/);
+    expect(fetchUrlDenialReason('http://[::ffff:0.0.0.0]/', ENV)).toMatch(/unspecified/);
+  });
+
+  it('canonicalizes IPv4-mapped IPv6 to a dotted quad', () => {
+    expect(mappedIPv4('::ffff:a9fe:a9fe')).toBe('169.254.169.254');
+    expect(mappedIPv4('::ffff:7f00:1')).toBe('127.0.0.1');
+    expect(mappedIPv4('::ffff:169.254.169.254')).toBe('169.254.169.254');
+    expect(mappedIPv4('example.com')).toBeNull();
+    expect(mappedIPv4('::1')).toBeNull();
   });
 
   it('honors KLYRO_WEB_DENYLIST and ALLOWLIST', () => {

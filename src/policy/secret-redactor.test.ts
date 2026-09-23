@@ -20,6 +20,17 @@ describe('redact', () => {
     expect(redact('Authorization: Bearer abcdef0123456789abcdef0123456789')).toContain('[REDACTED]:bearer');
   });
 
+  it('redacts Bearer with a tab separator (\\s covers \\t)', () => {
+    expect(redact('Authorization: Bearer\tabcdef0123456789abcdef0123456789')).toContain('[REDACTED]:bearer');
+  });
+
+  it('redacts short generic keys (8+ chars), leaves bare words alone', () => {
+    expect(redact('api_key = abcd1234')).toContain('[REDACTED]:api-key');
+    expect(redact('token = abcdef12')).toContain('[REDACTED]:secret-generic');
+    expect(redact('the api is down')).toBe('the api is down');
+    expect(redact('check the token bucket')).toBe('check the token bucket');
+  });
+
   it('passes through clean text', () => {
     expect(redact('hello world')).toBe('hello world');
   });

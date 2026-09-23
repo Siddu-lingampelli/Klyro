@@ -187,6 +187,14 @@ describe('SessionStore', () => {
     expect(JSON.stringify(obs)).toContain('[REDACTED]');
   });
 
+  it('redactStoredContent drops prototype-polluting keys from tampered content', () => {
+    const evil = JSON.parse('{"a":1,"__proto__":{"polluted":true},"nested":{"constructor":{"x":1},"ok":"yes"}}') as unknown;
+    const out = redactStoredContent(evil) as Record<string, unknown>;
+    expect(out).toEqual({ a: 1, nested: { ok: 'yes' } });
+    expect(({} as Record<string, unknown>)['polluted']).toBeUndefined();
+    expect((Object.prototype as Record<string, unknown>)['polluted']).toBeUndefined();
+  });
+
   it('S4-at-rest: normal observation prose survives redaction', async () => {
     const r = await store.create({ cwd: '/x', task: 't', config: { model: 'm', maxSteps: 10 } });
     await store.appendObservation(r.id, {

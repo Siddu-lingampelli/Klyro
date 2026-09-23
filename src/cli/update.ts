@@ -112,9 +112,11 @@ export async function checkForUpdate(current: string): Promise<string | null> {
     const latest = json.version ?? '';
     // Downgrade protection: only ever recommend a strictly newer version.
     // A registry answering with an older-or-equal `latest` (stale mirror,
-    // cache poisoning, downgrade attack) is treated as "no update".
+    // cache poisoning, downgrade attack) — or a non-semver tag like
+    // "latest"/"next" (which would otherwise flow into `npm i -g klyro@…`)
+    // — is treated as "no update".
     const cmp = compareSemver(latest, current);
-    const isNewer = cmp === null ? latest !== current : cmp > 0;
+    const isNewer = cmp !== null && cmp > 0;
     if (latest && isNewer) {
       // Verify the tarball's integrity before caching/recommending this version.
       const verRes = await fetchWithTimeout(`${REGISTRY_BASE}/${encodeURIComponent(latest)}`);
@@ -125,9 +127,9 @@ export async function checkForUpdate(current: string): Promise<string | null> {
       await fs.writeFile(cache, JSON.stringify({ at: Date.now(), latest }), 'utf-8');
       return latest;
     }
-    if (latest && cmp !== null && cmp <= 0) {
-      // Refresh the negative cache so a poisoned answer isn't re-fetched
-      // every invocation for the next 24h.
+    if (latest && (cmp === null || cmp <= 0)) {
+      // Refresh the negative cache so a poisoned or non-semver answer isn't
+      // re-fetched every invocation for the next 24h.
       await fs.mkdir(path.dirname(cache), { recursive: true }).catch(() => undefined);
       await fs.writeFile(cache, JSON.stringify({ at: Date.now(), latest: current }), 'utf-8').catch(() => undefined);
     }
@@ -138,7 +140,6 @@ export async function checkForUpdate(current: string): Promise<string | null> {
 }
 
 export async function runUpdate(opts: { apply?: boolean } = {}): Promise<number> {
-  const here = await import('../index.js').then(() => '');
   // Get version from package.json via dynamic import
   const { readFileSync } = await import('node:fs');
   const { resolve, dirname } = await import('node:path');
@@ -151,6 +152,15 @@ export async function runUpdate(opts: { apply?: boolean } = {}): Promise<number>
     if (latest) {
       process.stdout.write(`Update available: ${cur} → ${latest} (integrity verified)\n  npm i -g klyro@latest\n`);
       if (opts.apply) {
+        // Defense in depth: the version string flows into a child process
+        // (with shell:true on Windows), so re-validate strict semver here
+        // even though checkForUpdate already gates on it. A non-semver
+        // string (registry compromise, cache tampering) must never reach
+        // the shell.
+        if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(latest)) {
+          process.stderr.write(`klyro update: refusing to install non-semver version: ${latest}\n`);
+          return 1;
+        }
         // Opt-in self-apply: the tarball was already hash-verified by
         // checkForUpdate, so npm installs exactly the verified version.
         process.stdout.write(`Applying update to klyro@${latest}...\n`);

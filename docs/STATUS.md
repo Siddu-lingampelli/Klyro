@@ -6,10 +6,13 @@
 > `HarnessFlow` notes, and `READ.md` are history/requirements — when they
 > disagree with this file, this file wins.
 
-- Version: 1.0.14 (`release: klyro 1.0.14 - escape-free history keys`). 1.0.13
-  split ↑ between scrolling (while reading) and recall (at live tail); 1.0.14
-  adds Ctrl+P / Ctrl+N aliases for history prev/next that need no escape
-  sequences, so recall works even where terminals mangle arrow keys.
+- Version: 1.0.15 (`release: klyro 1.0.15 - external audit fixes P0-P3`, built
+  on the Sept-20 tree hardening). Closes all 10 audit findings with
+  regression tests: symlink-test arg order, update downgrade/injection via
+  non-semver tags, web-fetch SSRF (metadata range + unspecified hosts),
+  project-layer apiKey stripping + public-baseUrl warnings, failover flags
+  + unified key sources, MCP stdio 8 MiB line cap, prototype-pollution
+  guards (persist + audit), short-key redaction.
 - Canonical package manager: **npm + `package-lock.json`** (matches CI,
   Dockerfile, publish). `pnpm-workspace.yaml` is legacy for the unused
   private `packages/shared` workspace and is ignored by npm.

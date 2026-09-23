@@ -97,6 +97,23 @@ describe('update.ts — integrity gate', () => {
     expect(versionFetches).toBe(0); // tarball never even fetched
   });
 
+  it.each(['latest', 'next', '1.0.4 & calc.exe', ''])(
+    'treats non-semver registry latest %p as no update (no tarball fetch, no install string)',
+    async (version) => {
+      let versionFetches = 0;
+      vi.stubGlobal('fetch', async (url: string) => {
+        if (url.endsWith('/latest') || url.includes('/latest')) {
+          return { ok: true, status: 200, json: async () => ({ version }) } as unknown as Response;
+        }
+        versionFetches++;
+        return { ok: false, status: 404 } as unknown as Response;
+      });
+      const { checkForUpdate } = await import('./update.js');
+      expect(await checkForUpdate('1.0.4')).toBeNull();
+      expect(versionFetches).toBe(0);
+    },
+  );
+
   it('rejects when shasum disagrees even if SRI matches', async () => {
     const tarballBytes = new TextEncoder().encode('fake tarball bytes');
     const { createHash } = await import('node:crypto');

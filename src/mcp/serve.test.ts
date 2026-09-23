@@ -39,3 +39,29 @@ describe('mcp serve — policy-gated stdio server', () => {
     expect(await handleMcpRequest(deps, { jsonrpc: '2.0', method: 'ping' })).toBeNull();
   });
 });
+
+
+describe('readBoundedLines - oversized message guard', () => {
+  async function collect(input: NodeJS.ReadableStream, maxBytes?: number): Promise<Array<string | { tooLong: true }>> {
+    const { readBoundedLines } = await import('./serve.js');
+    const out: Array<string | { tooLong: true }> = [];
+    for await (const item of readBoundedLines(input, maxBytes)) out.push(item);
+    return out;
+  }
+
+  it('passes normal lines through, split across chunks', async () => {
+    const { Readable } = await import('node:stream');
+    const got = await collect(Readable.from([Buffer.from('{"a"'), Buffer.from(':1}\n{"b":2}\n')]));
+    expect(got).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  it('drops an overlong line, reports once, and resyncs after it', async () => {
+    const { Readable } = await import('node:stream');
+    const big = 'x'.repeat(100);
+    const got = await collect(Readable.from([Buffer.from('ok1\n' + big), Buffer.from(big + '\nok2\n')]), 64);
+    expect(got[0]).toBe('ok1');
+    expect(got).toContainEqual({ tooLong: true });
+    expect(got[got.length - 1]).toBe('ok2');
+    expect(got.filter((g) => typeof g !== 'string')).toHaveLength(1);
+  });
+});

@@ -26,9 +26,9 @@ const PATTERNS: Array<{ name: string; re: RegExp }> = [
   // Generic provider keys — must be redacted even if not prefixed Bearer
   { name: 'openai-key', re: /sk-(?:proj-)?[A-Za-z0-9_-]{20,}/g },
   { name: 'anthropic-key', re: /sk-ant-[A-Za-z0-9_-]{20,}/g },
-  { name: 'api-key', re: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]?[A-Za-z0-9_\-]{16,}['"]?/gi },
+  { name: 'api-key', re: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]?[A-Za-z0-9_\-]{8,}['"]?/gi },
   { name: 'password', re: /(?:password|passwd|pwd)\s*[:=]\s*['"]?[^\s'"]{4,}['"]?/gi },
-  { name: 'secret-generic', re: /(?:secret|token)\s*[:=]\s*['"]?[A-Za-z0-9_\-+/=]{16,}['"]?/gi },
+  { name: 'secret-generic', re: /(?:secret|token)\s*[:=]\s*['"]?[A-Za-z0-9_\-+/=]{8,}['"]?/gi },
   { name: 'discord-token', re: /mfa\.[\w-]{84}|[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27}/g },
   { name: 'npm-token', re: /\bnpm_[A-Za-z0-9]{24,}/g },
   { name: 'sendgrid-key', re: /\bSG\.[\w-]{22}\.[\w-]{43}/g },
