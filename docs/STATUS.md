@@ -10,8 +10,9 @@
   contract, deflake`). Records the Sept-20 follow-up as found (checkpoints
   adopt `cappedOutput`, runtime tests opt into the hooks trust gate); TUI
   arrows are history-only (no scroll fallbacks); import-graph freshness test
-  forces mtime forward instead of relying on FS granularity. 1.0.15 closed
-  all 10 external audit findings with regression tests.
+  forces mtime forward instead of relying on FS granularity. Also first
+  ships the audit-fix batch (all 10 external findings with regression
+  tests; developed as 1.0.15, released here since 1.0.15 never published).
 - Canonical package manager: **npm + `package-lock.json`** (matches CI,
   Dockerfile, publish). `pnpm-workspace.yaml` is legacy for the unused
   private `packages/shared` workspace and is ignored by npm.
