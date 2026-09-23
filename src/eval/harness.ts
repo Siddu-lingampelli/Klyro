@@ -4,11 +4,16 @@
  * expected tool-call sequence, (b) the verification engine detects the
  * right failure type, and (c) the compressor preserves the goal.
  *
- * This is the MVP gate per Devolopment-plan.md / docs/plan.md §10: a
- * reproducible suite of programmatic tasks. Real repo tasks come in v1.0.
+ * This is the MVP gate per `plan.md` (§10, root of the repo — there is no
+ * `docs/plan.md`): a reproducible suite of programmatic tasks that later
+ * graduated into the fixture-backed file harness below.
  */
 
 import { run } from '../agent/runtime.js';
+import { cappedOutput } from '../shared/output-cap.js';
+
+/** Bounded capture for `check.sh` output — fixtures are project-authored. */
+const MAX_CHECK_BYTES = 64 * 1024;
 import { ToolRegistry } from '../tools/registry.js';
 import { readFileTool } from '../tools/fs/read-file.js';
 import { writeFileTool } from '../tools/fs/write-file.js';
@@ -248,15 +253,15 @@ export async function runFileFixture(fixture: FileFixture, opts: { runs?: number
   const { spawn } = await import('node:child_process');
   const result: TaskResult = await new Promise((resolve) => {
     const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false });
-    let out = '';
-    child.stdout?.on('data', (b: Buffer) => { out += b.toString(); });
-    child.stderr?.on('data', (b: Buffer) => { out += b.toString(); });
+    const sink = cappedOutput(MAX_CHECK_BYTES);
+    child.stdout?.on('data', (b: Buffer) => sink.push(b));
+    child.stderr?.on('data', (b: Buffer) => sink.push(b));
     child.on('close', (code) => {
       const pass = code === 0;
       resolve({
         id: path.basename(fixture.dir),
         status: pass ? 'pass' : 'fail',
-        details: out.slice(0, 500),
+        details: sink.text().slice(0, 500),
         observedStatus: pass ? 'complete' : 'verify_failed',
         durationMs: Date.now() - start,
       });
@@ -312,10 +317,10 @@ export async function runAgentFixture(
     const { spawn } = await import('node:child_process');
     const out: string = await new Promise((resolve) => {
       const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false });
-      let buf = '';
-      child.stdout?.on('data', (b: Buffer) => { buf += b.toString(); });
-      child.stderr?.on('data', (b: Buffer) => { buf += b.toString(); });
-      child.on('close', (code) => resolve(`exit=${code ?? -1} ${buf.slice(0, 500)}`));
+      const sink = cappedOutput(MAX_CHECK_BYTES);
+      child.stdout?.on('data', (b: Buffer) => sink.push(b));
+      child.stderr?.on('data', (b: Buffer) => sink.push(b));
+      child.on('close', (code) => resolve(`exit=${code ?? -1} ${sink.text().slice(0, 500)}`));
       child.on('error', (err) => resolve(`spawn-error: ${String(err)}`));
     });
     if (!out.startsWith('exit=0')) {

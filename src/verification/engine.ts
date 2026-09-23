@@ -12,6 +12,7 @@ import { spawn } from 'node:child_process';
 import { detect, summarize, type Failure, type FailureType } from './detect.js';
 import { filteredVerifyEnv } from './registry.js';
 import { redact } from '../policy/secret-redactor.js';
+import { cappedOutput } from '../shared/output-cap.js';
 import { globalBus } from '../events/bus.js';
 
 /** Verification mode. Canonical definition — agent/runtime.ts converges to
@@ -103,15 +104,15 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
   return new Promise((resolve) => {
     // S2: verify commands run with filtered env; servers needing keys must use explicit config.
     const child = spawn(opts.command, { cwd: opts.cwd, shell: true, env: filteredVerifyEnv() });
-    const outChunks: Buffer[] = [];
-    const errChunks: Buffer[] = [];
+    const outCap = cappedOutput(MAX_VERIFY_BYTES);
+    const errCap = cappedOutput(MAX_VERIFY_BYTES);
     let done = false;
     const timer = setTimeout(() => {
       if (done) return;
       child.kill();
       done = true;
-      const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_VERIFY_BYTES);
-      const se = Buffer.concat(errChunks).toString('utf-8').slice(0, MAX_VERIFY_BYTES);
+      const so = outCap.text();
+      const se = errCap.text();
       const raw = se + '\n' + so;
       emitFailed('[verify timeout]');
       resolve({
@@ -123,14 +124,14 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
       });
     }, timeout);
 
-    child.stdout.on('data', (b: Buffer) => { if (Buffer.concat(outChunks).length < MAX_VERIFY_BYTES) outChunks.push(b); });
-    child.stderr.on('data', (b: Buffer) => { if (Buffer.concat(errChunks).length < MAX_VERIFY_BYTES) errChunks.push(b); });
+    child.stdout.on('data', (b: Buffer) => outCap.push(b));
+    child.stderr.on('data', (b: Buffer) => errCap.push(b));
     child.on('close', (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_VERIFY_BYTES);
-      const se = Buffer.concat(errChunks).toString('utf-8').slice(0, MAX_VERIFY_BYTES);
+      const so = outCap.text();
+      const se = errCap.text();
       const exit = typeof code === 'number' ? code : -1;
       if (exit === 0) {
         emitSucceeded();

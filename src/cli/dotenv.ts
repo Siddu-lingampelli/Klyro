@@ -34,6 +34,71 @@ export function parseDotenv(text: string): Record<string, string> {
   return out;
 }
 
+/**
+ * Process-control variables a repository `.env` must never set.
+ *
+ * `.env` ships WITH the repo, so it is untrusted content, and these keys do
+ * not configure Klyro — they change how the OS and node execute every child
+ * process Klyro spawns (MCP servers, hooks, verify commands, shell_exec),
+ * because children inherit `process.env`:
+ *   - `NODE_OPTIONS=--require ./evil.js` injects a module into every node child
+ *   - `PATH`/`PATHEXT`/`LD_PRELOAD`/`DYLD_*` hijack which binary actually runs
+ *   - `EDITOR`/`VISUAL`/`PAGER` turn `klyro config edit` into a shell execution
+ *   - `npm_config_*` redirects package installs to another registry
+ * Legitimate project config (KLYRO_*, provider keys, tool settings) is
+ * unaffected — only the launcher/process-control namespace is refused.
+ */
+const BLOCKED_DOTENV_KEYS = new Set([
+  'PATH',
+  'PATHEXT',
+  'COMSPEC',
+  'SHELL',
+  'SYSTEMROOT',
+  'WINDIR',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'NODE_REPL_EXTERNAL_MODULE',
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'DYLD_INSERT_LIBRARIES',
+  'DYLD_LIBRARY_PATH',
+  'EDITOR',
+  'VISUAL',
+  'PAGER',
+  'GIT_SSH',
+  'GIT_SSH_COMMAND',
+  'GIT_EXTERNAL_DIFF',
+  'GIT_ASKPASS',
+  'SSH_ASKPASS',
+  'BASH_ENV',
+  'PROMPT_COMMAND',
+]);
+
+/**
+ * Klyro's own de-hardening switches. A repo may not loosen a security
+ * boundary for the person who clones it: these are documented as explicit
+ * user decisions (README "Environment"), so they are refused from `.env`
+ * and must come from the real environment or ~/.klyro/settings.json.
+ */
+const BLOCKED_DOTENV_SECURITY_RELAXATIONS = new Set([
+  'KLYRO_ALLOW_INSECURE',
+  'KLYRO_CREDENTIALS_INSECURE_OK',
+  'KLYRO_ALLOW_MAIN_PUSH',
+  'KLYRO_YES',
+  'KLYRO_WORKER',
+]);
+
+/** npm reads `npm_config_*` from the environment — a repo must not pick the registry. */
+const BLOCKED_DOTENV_PREFIXES = ['NPM_CONFIG_'];
+
+/** True when a `.env` key would change process behaviour or loosen a boundary. */
+export function isBlockedDotenvKey(key: string): boolean {
+  const k = key.toUpperCase();
+  if (BLOCKED_DOTENV_KEYS.has(k)) return true;
+  if (BLOCKED_DOTENV_SECURITY_RELAXATIONS.has(k)) return true;
+  return BLOCKED_DOTENV_PREFIXES.some((p) => k.startsWith(p));
+}
+
 /** Load `<cwd>/.env` into `process.env` (no-clobber). Returns loaded keys. */
 export function loadDotenv(cwd: string): string[] {
   let text: string;
@@ -44,11 +109,23 @@ export function loadDotenv(cwd: string): string[] {
   }
   const parsed = parseDotenv(text);
   const loaded: string[] = [];
+  const blocked: string[] = [];
   for (const [k, v] of Object.entries(parsed)) {
+    if (isBlockedDotenvKey(k)) {
+      blocked.push(k);
+      continue;
+    }
     if (process.env[k] === undefined) {
       process.env[k] = v;
       loaded.push(k);
     }
+  }
+  if (blocked.length > 0) {
+    try {
+      process.stderr.write(
+        `klyro: ignoring process-control vars in .env (${blocked.join(', ')}) — a repo's .env may not change how your shell, node, or editor runs\n`,
+      );
+    } catch { /* ignore */ }
   }
   return loaded;
 }

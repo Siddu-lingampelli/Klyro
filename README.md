@@ -51,6 +51,7 @@ node dist/index.js chat
 | `KLYRO_YES` / `--yes` | **Commit only** — auto-approves `klyro commit` prompts; nothing else reads it |
 | `KLYRO_NO_UPDATE_CHECK=1` | Disables the 24h update check |
 | `KLYRO_ALLOW_MAIN_PUSH=1` | Per-risk escape for protected-branch push |
+| `KLYRO_TRUST_PROJECT_HOOKS=1` | Per-shell opt-in to run repo-authored `.klyro/hooks.json` commands without pinning them via `klyro hooks trust` |
 | `KLYRO_CREDENTIALS_INSECURE_OK=1` | Warn (don't refuse) on group-readable credentials |
 | `KLYRO_LSP=0` | Force language tools off |
 | `KLYRO_SYMBOLS=0` | Force `find_symbol` off |
@@ -60,6 +61,7 @@ node dist/index.js chat
 ## New in recent releases
 
 - `klyro run --bare` — deterministic runs: skips MCP, hooks, memory/KLYRO.md/context, persistence
+- `klyro hooks trust` — project `.klyro/hooks.json` commands run only after explicit review: the file is hash-pinned in `~/.klyro/trusted-hooks.json` and any edit re-locks it (a cloned repo can no longer execute code just because you ran `klyro` in it)
 - `klyro mcp trust <name>` / `mcp prompts [server]` / `mcp add <name> <https-url>` — remote MCP + prompt trust
 - `klyro agents lint` — validate `.klyro/agents/*.md` (ids, tool names)
 - `klyro init` — scan-seeded `KLYRO.md` + `.mcp.json` (never overwrites)
@@ -72,13 +74,20 @@ node dist/index.js chat
 
 ## Documentation
 
+Progress: Klyro is **complete through Level 10** ("Klyro 1.0" milestone) of the
+20-level plan; see [`docs/STATUS.md`](docs/STATUS.md) for the audited
+level-by-level grading.
+
 | Doc | Purpose |
 |---|---|
-| [`docs/done.md`](docs/done.md) | **Status** — what's built, what's verified, what isn't |
-| [`docs/plan.md`](docs/plan.md) | **Roadmap** — 20-level plan from bare CLI to super-harness |
-| [`docs/PRD.md`](docs/PRD.md) | (authoritative) product vision |
-| [`docs/HarnessFlow.md`](docs/HarnessFlow.md) | (authoritative) system flow |
-| [`docs/MVP.md`](docs/MVP.md) | (authoritative) MVP scope |
+| [`docs/STATUS.md`](docs/STATUS.md) | **Status (authoritative)** — release state + plan level progress |
+| [`plan.md`](plan.md) | **Roadmap** — 20-level / 100-sub-level plan from bare CLI to super-harness |
+| [`PRD.md`](PRD.md) | Product vision and requirements |
+| [`READ.md`](READ.md) | Full build documentation / architecture walkthrough |
+| [`review.md`](review.md) | Point-in-time repository review (1.0.9) |
+| [`comparison.md`](comparison.md) | Architectural audit vs Claude Code (36 rounds) |
+| [`commands.md`](commands.md) | CLI + slash-command reference |
+| [`TUI_DESIGN.md`](TUI_DESIGN.md) | TUI design notes (layout, scroll model) |
 
 ## Code structure
 

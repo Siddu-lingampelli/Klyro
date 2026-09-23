@@ -71,6 +71,13 @@ const MAX_STDERR_BYTES = 8192;
 const CONNECT_TIMEOUT_MS = 15_000;
 /** Grace period between SIGTERM and SIGKILL in close(). */
 const CLOSE_SIGKILL_AFTER_MS = 2000;
+/**
+ * A single JSON-RPC frame (one newline-terminated line) is small. A server
+ * that streams megabytes with no frame boundary is broken or hostile; drop
+ * the partial line instead of buffering it without bound. The affected call
+ * then fails with its normal TIMEOUT instead of taking the harness down.
+ */
+const MAX_STDOUT_FRAME_BYTES = 8 * 1024 * 1024;
 
 export class McpClient implements McpClientLike {
   private child: ChildProcess | null = null;
@@ -274,6 +281,11 @@ export class McpClient implements McpClientLike {
 
   private onStdout(chunk: string): void {
     this.stdoutBuf += chunk;
+    if (this.stdoutBuf.length > MAX_STDOUT_FRAME_BYTES && this.stdoutBuf.indexOf('\n') === -1) {
+      // No frame boundary in megabytes: discard rather than grow the heap.
+      this.stdoutBuf = '';
+      return;
+    }
     let idx: number;
     while ((idx = this.stdoutBuf.indexOf('\n')) >= 0) {
       const line = this.stdoutBuf.slice(0, idx).trim();

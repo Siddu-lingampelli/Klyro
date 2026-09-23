@@ -104,7 +104,8 @@ export function registerSessionCommands(program: Command): void {
   async function sessionImport(file: string): Promise<void> {
     let data: unknown;
     try {
-      data = JSON.parse(await (await import('node:fs/promises')).readFile(file, 'utf-8'));
+      const { stripBom } = await import('../shared/json.js');
+      data = JSON.parse(stripBom(await (await import('node:fs/promises')).readFile(file, 'utf-8')));
     } catch (err) {
       process.stderr.write(`klyro: cannot import ${file}: ${err instanceof Error ? err.message : String(err)}\n`);
       process.exit(2);

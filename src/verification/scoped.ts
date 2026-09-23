@@ -7,6 +7,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { filteredVerifyEnv } from './registry.js';
+import { cappedOutput } from '../shared/output-cap.js';
 
 export function findRelatedTests(cwd: string, editedFiles: string[]): string[] {
   if (editedFiles.length === 0) return [];
@@ -109,33 +110,33 @@ export async function runScopedVerify(cwd: string, command: string, timeoutMs = 
   return new Promise((resolve) => {
     // S2: verify commands run with filtered env; servers needing keys must use explicit config.
     const child = spawn(command, { cwd, shell: true, env: filteredVerifyEnv() });
-    const outChunks: Buffer[] = [];
-    const errChunks: Buffer[] = [];
+    const outCap = cappedOutput(MAX_SCOPED_BYTES);
+    const errCap = cappedOutput(MAX_SCOPED_BYTES);
     let done = false;
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
       try { child.kill(); } catch { /* ignore */ }
-      const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_SCOPED_BYTES);
-      const se = Buffer.concat(errChunks).toString('utf-8').slice(0, MAX_SCOPED_BYTES);
+      const so = outCap.text();
+      const se = errCap.text();
       resolve({ ok: false, exitCode: -1, stdout: so, stderr: se + '\n[scoped timeout]' });
     }, timeoutMs);
-    child.stdout.on('data', (b: Buffer) => { if (Buffer.concat(outChunks).length < MAX_SCOPED_BYTES) outChunks.push(b); });
-    child.stderr.on('data', (b: Buffer) => { if (Buffer.concat(errChunks).length < MAX_SCOPED_BYTES) errChunks.push(b); });
+    child.stdout.on('data', (b: Buffer) => outCap.push(b));
+    child.stderr.on('data', (b: Buffer) => errCap.push(b));
     child.on('close', (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       const exit = typeof code === 'number' ? code : -1;
-      const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_SCOPED_BYTES);
-      const se = Buffer.concat(errChunks).toString('utf-8').slice(0, MAX_SCOPED_BYTES);
+      const so = outCap.text();
+      const se = errCap.text();
       resolve({ ok: exit === 0, exitCode: exit, stdout: so, stderr: se });
     });
     child.on('error', (err) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      const so = Buffer.concat(outChunks).toString('utf-8').slice(0, MAX_SCOPED_BYTES);
+      const so = outCap.text();
       resolve({ ok: false, exitCode: -1, stdout: so, stderr: String(err) });
     });
   });

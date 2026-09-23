@@ -34,7 +34,13 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { run } from './runtime.js';
+import { cappedOutput } from '../shared/output-cap.js';
 import type { RunOptions, RunResult, RuntimeDeps } from './runtime.js';
+
+/** Child results are ONE JSON line, but a misbehaving child can print forever. */
+const MAX_CHILD_STDOUT_BYTES = 8 * 1024 * 1024;
+/** stderr keeps its TAIL — callers slice(-500/-1000) for the failure reason. */
+const MAX_CHILD_STDERR_CHARS = 16_000;
 
 export interface ChildWorkerPayload {
   /** Working dir the child operates in (may be a worktree). */
@@ -121,12 +127,18 @@ export async function forkChild(
     shell: false,
   });
 
-  let stdout = '';
+  const stdoutCap = cappedOutput(MAX_CHILD_STDOUT_BYTES);
   let stderr = '';
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
-  child.stdout.on('data', (c: string) => { stdout += c; });
-  child.stderr.on('data', (c: string) => { opts.onStderr?.(c); stderr += c; });
+  // Keep the HEAD of stdout (the ChildResult line) and the TAIL of stderr
+  // (where the reason lives), so neither can grow the parent's heap without
+  // bound over the child's 10-minute budget.
+  child.stdout.on('data', (c: string) => { stdoutCap.push(Buffer.from(c, 'utf8')); });
+  child.stderr.on('data', (c: string) => {
+    opts.onStderr?.(c);
+    stderr = (stderr + c).slice(-MAX_CHILD_STDERR_CHARS);
+  });
 
   // Write the payload to stdin, then signal EOF so the child knows it has
   // the whole payload before it starts running.
@@ -155,7 +167,7 @@ export async function forkChild(
     });
     child.on('close', (code, signal) => {
       cleanup();
-      const first = stdout.split('\n').find((l) => l.trim().length > 0);
+      const first = stdoutCap.text().split('\n').find((l) => l.trim().length > 0);
       if (code === 0 && first) {
         try {
           resolve(JSON.parse(first) as ChildResult);

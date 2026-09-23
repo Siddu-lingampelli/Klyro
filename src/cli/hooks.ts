@@ -29,10 +29,12 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { z } from 'zod';
+import { stripBom } from '../shared/json.js';
 
 export const HookEventSchema = z.enum(['preToolUse', 'postToolUse', 'sessionStart', 'sessionEnd', 'stop']);
 export type HookEvent = z.infer<typeof HookEventSchema>;
@@ -80,10 +82,28 @@ const MAX_HOOK_OUTPUT_CHARS = 4000;
 const warnedPaths = new Set<string>();
 
 function warnOnce(filePath: string, detail: string): void {
-  if (warnedPaths.has(filePath)) return;
-  warnedPaths.add(filePath);
+  warnOnceRaw(`invalid:${normWarnKey(filePath)}`, `klyro: hooks: ignoring invalid file ${filePath}: ${detail}\n`);
+}
+
+/**
+ * Warn-once keys normalize the file identity (resolved absolute path +
+ * NFKC) so the same content can't re-warn via `./x`, `X/../x`, case, or
+ * slash variants — each real file warns at most once.
+ */
+function normWarnKey(filePath: string): string {
   try {
-    process.stderr.write(`klyro: hooks: ignoring invalid file ${filePath}: ${detail}\n`);
+    return path.resolve(filePath).normalize('NFKC');
+  } catch {
+    return filePath;
+  }
+}
+
+/** One stderr line per unique key (used for trust notices too). */
+function warnOnceRaw(key: string, message: string): void {
+  if (warnedPaths.has(key)) return;
+  warnedPaths.add(key);
+  try {
+    process.stderr.write(message);
   } catch { /* ignore */ }
 }
 
@@ -97,7 +117,7 @@ function readHooksFile(filePath: string): Hook[] {
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(stripBom(raw));
   } catch (err) {
     warnOnce(filePath, err instanceof Error ? err.message : String(err));
     return [];
@@ -122,19 +142,122 @@ function globalHooksPath(): string {
 /**
  * Load hooks for a run. Global first, then project — a project hook with
  * the same `name` replaces the global one. Never throws.
+ *
+ * Project hooks are repo-authored and run with `shell: true`, so they are
+ * gated on trust (see `projectHooksTrusted`): a cloned repo must not execute
+ * code just because someone ran `klyro` in it, and an untrusted project can
+ * not shadow a global hook by name.
  */
 export function loadHooks(cwd: string): Hook[] {
   let out: Hook[] = [];
   try {
     const byName = new Map<string, Hook>();
     for (const h of readHooksFile(globalHooksPath())) byName.set(h.name, h);
-    const projectFile = path.join(cwd, '.klyro', 'hooks.json');
-    for (const h of readHooksFile(projectFile)) byName.set(h.name, h);
+    const projectFile = projectHooksPath(cwd);
+    if (fs.existsSync(projectFile)) {
+      if (projectHooksTrusted(cwd)) {
+        for (const h of readHooksFile(projectFile)) byName.set(h.name, h);
+      } else {
+        warnOnceRaw(
+          `untrusted:${normWarnKey(projectFile)}`,
+          `klyro: hooks: project hooks ${projectFile} are NOT trusted — review the file, then run \`klyro hooks trust\` (or set KLYRO_TRUST_PROJECT_HOOKS=1)\n`,
+        );
+      }
+    }
     out = [...byName.values()];
   } catch {
     return [];
   }
   return out;
+}
+
+/** Absolute path of the project's hook file (may not exist). */
+export function projectHooksPath(cwd: string): string {
+  return path.join(cwd, '.klyro', 'hooks.json');
+}
+
+/** Hash-pinned trust store: `{ "<resolved absolute path>": "<sha256 hex>" }`. */
+function trustStorePath(): string {
+  return path.join(os.homedir() || process.cwd(), '.klyro', 'trusted-hooks.json');
+}
+
+function sha256File(file: string): string | null {
+  try {
+    return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function trustedHashes(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(trustStorePath(), 'utf-8')) as unknown;
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof v === 'string') out[k] = v;
+      }
+      return out;
+    }
+  } catch { /* missing or invalid — nothing trusted */ }
+  return {};
+}
+
+function writeTrustStore(store: Record<string, string>): void {
+  const p = trustStorePath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf-8');
+  fs.renameSync(tmp, p);
+}
+
+/**
+ * Is the project's hook file allowed to run? Two paths:
+ *   1. `KLYRO_TRUST_PROJECT_HOOKS=1` — explicit per-shell opt-in, or
+ *   2. the file's current sha256 is pinned in `~/.klyro/trusted-hooks.json`
+ *      (recorded by an explicit `klyro hooks trust`; any later edit changes
+ *      the hash, so the file re-locks until reviewed again).
+ */
+export function projectHooksTrusted(cwd: string): boolean {
+  if (process.env.KLYRO_TRUST_PROJECT_HOOKS === '1') return true;
+  const file = projectHooksPath(cwd);
+  if (!fs.existsSync(file)) return false;
+  const hash = sha256File(file);
+  if (!hash) return false;
+  const store = trustedHashes();
+  const resolved = path.resolve(file);
+  return store[resolved] === hash || store[file] === hash;
+}
+
+/** Describe the project's hook file for the `klyro hooks` surface. */
+export function projectHooksStatus(cwd: string): { path: string; exists: boolean; trusted: boolean } {
+  const file = projectHooksPath(cwd);
+  const exists = fs.existsSync(file);
+  return { path: file, exists, trusted: exists && projectHooksTrusted(cwd) };
+}
+
+/**
+ * Trust (or re-trust) the project's hooks file at its current contents.
+ * Throws when there is no project hooks file.
+ */
+export function trustProjectHooks(cwd: string): { path: string; hash: string } {
+  const file = projectHooksPath(cwd);
+  const hash = sha256File(file);
+  if (!hash) throw new Error(`no project hooks file at ${file}`);
+  const store = trustedHashes();
+  store[path.resolve(file)] = hash;
+  writeTrustStore(store);
+  return { path: file, hash };
+}
+
+/** Remove the project's hook file from the trust store. False when absent. */
+export function untrustProjectHooks(cwd: string): boolean {
+  const resolved = path.resolve(projectHooksPath(cwd));
+  const store = trustedHashes();
+  if (store[resolved] === undefined) return false;
+  delete store[resolved];
+  writeTrustStore(store);
+  return true;
 }
 
 /**

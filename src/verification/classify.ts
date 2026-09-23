@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { filteredVerifyEnv } from './registry.js';
+import { cappedOutput } from '../shared/output-cap.js';
 import type { Failure, FailureType } from './detect.js';
 import { detect } from './detect.js';
 import type { BaselineResult } from './baseline.js';
@@ -101,24 +102,32 @@ export async function gatherRepairContext(cwd: string, failure: Failure | undefi
   return { failingTests, hunks, blame };
 }
 
+/**
+ * `git diff -U2 | head -n 300`: the pipe bounds a well-behaved shell, this
+ * bounds one that ignores it (subshell, `;` chain, verbose stderr). Without a
+ * cap a chatty command grew the heap without limit before the 4000-char slice.
+ */
+const MAX_PIPE_BYTES = 64 * 1024;
 function execCapturePipe(cwd: string, cmd: string): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn(cmd, { cwd, shell: true, env: filteredVerifyEnv() });
-    const chunks: Buffer[] = [];
-    child.stdout.on('data', (b: Buffer) => { chunks.push(b); });
-    child.stderr.on('data', (b: Buffer) => { chunks.push(b); });
-    child.on('close', () => resolve(Buffer.concat(chunks).toString().slice(0, 4000)));
+    const sink = cappedOutput(MAX_PIPE_BYTES);
+    child.stdout.on('data', (b: Buffer) => sink.push(b));
+    child.stderr.on('data', (b: Buffer) => sink.push(b));
+    child.on('close', () => resolve(sink.text().slice(0, 4000)));
     child.on('error', () => resolve(''));
   });
 }
 
+/** `git blame` for one file — 20 output lines kept, byte-capped collection. */
+const MAX_BLAME_BYTES = 16 * 1024;
 function execCaptureArgv(cwd: string, file: string, args: string[]): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn('git', [...args, file], { cwd, shell: false, env: filteredVerifyEnv() });
-    const chunks: Buffer[] = [];
-    child.stdout.on('data', (b: Buffer) => { chunks.push(b); });
-    child.stderr.on('data', (b: Buffer) => { chunks.push(b); });
-    child.on('close', () => resolve(Buffer.concat(chunks).toString().split('\n').slice(0, 20).join('\n')));
+    const sink = cappedOutput(MAX_BLAME_BYTES);
+    child.stdout.on('data', (b: Buffer) => sink.push(b));
+    child.stderr.on('data', (b: Buffer) => sink.push(b));
+    child.on('close', () => resolve(sink.text().split('\n').slice(0, 20).join('\n')));
     child.on('error', () => resolve(''));
   });
 }

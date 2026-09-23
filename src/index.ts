@@ -557,13 +557,32 @@ async function main(): Promise<void> {
     process.exit(code);
   });
 
-  // 10.2 — Hooks: list configured preToolUse/postToolUse hooks.
-  program.command('hooks [cmd]').description('Hooks (10.2): `klyro hooks` or `klyro hooks list` prints configured hooks').action(async (cmd?: string) => {
+  // 10.2 — Hooks: list, or trust/untrust the project hooks file.
+  program.command('hooks [cmd]').description('Hooks (10.2): `klyro hooks` lists them; `klyro hooks trust` pins the project hooks file so it runs').action(async (cmd?: string) => {
+    const { loadHooks, trustProjectHooks, untrustProjectHooks, projectHooksStatus } = await import('./cli/hooks.js');
+    if (cmd === 'trust') {
+      try {
+        const { path: p, hash } = trustProjectHooks(process.cwd());
+        process.stdout.write(`trusted project hooks: ${p} (sha256 ${hash.slice(0, 12)}…, re-locks if edited)\n`);
+      } catch (err) {
+        process.stderr.write(`klyro: ${err instanceof Error ? err.message : String(err)}\n`);
+        process.exit(2);
+      }
+      return;
+    }
+    if (cmd === 'untrust') {
+      const ok = untrustProjectHooks(process.cwd());
+      process.stdout.write(ok ? 'project hooks are no longer trusted\n' : 'project hooks were not trusted\n');
+      return;
+    }
     if (cmd && cmd !== 'list') {
-      process.stderr.write(`klyro: unknown hooks command: ${cmd} (usage: klyro hooks [list])\n`);
+      process.stderr.write(`klyro: unknown hooks command: ${cmd} (usage: klyro hooks [list|trust|untrust])\n`);
       process.exit(2);
     }
-    const { loadHooks } = await import('./cli/hooks.js');
+    const st = projectHooksStatus(process.cwd());
+    if (st.exists) {
+      process.stdout.write(`project hooks: ${st.path} [${st.trusted ? 'trusted' : 'NOT TRUSTED — review, then run `klyro hooks trust`'}]\n`);
+    }
     const hooks = loadHooks(process.cwd());
     if (hooks.length === 0) {
       process.stdout.write('hooks: none configured (.klyro/hooks.json, ~/.klyro/hooks.json)\n');

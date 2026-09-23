@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { loadHooks, runHook, hooksForEvent } from './hooks.js';
+import { loadHooks, runHook, hooksForEvent, trustProjectHooks, untrustProjectHooks, projectHooksStatus, projectHooksTrusted } from './hooks.js';
 
 // Isolate HOME so the global ~/.klyro/hooks.json never leaks into tests.
 let savedHome: string | undefined;
@@ -68,7 +68,7 @@ describe('loadHooks', () => {
     }
   });
 
-  it('loads project hooks and merges global (project wins on name clash)', () => {
+  it('loads project hooks and merges global when trusted (KLYRO_TRUST_PROJECT_HOOKS=1)', () => {
     fs.mkdirSync(path.join(fakeHome, '.klyro'), { recursive: true });
     fs.writeFileSync(
       path.join(fakeHome, '.klyro', 'hooks.json'),
@@ -83,12 +83,16 @@ describe('loadHooks', () => {
         { name: 'shared', event: 'preToolUse', command: 'project-cmd' },
       ] }),
     });
+    const oldOptIn = process.env.KLYRO_TRUST_PROJECT_HOOKS;
+    process.env.KLYRO_TRUST_PROJECT_HOOKS = '1';
     try {
       const hooks = loadHooks(dir);
       expect(hooks).toHaveLength(2);
       expect(hooks.find((h) => h.name === 'shared')?.command).toBe('project-cmd');
       expect(hooks.find((h) => h.name === 'global-only')).toBeDefined();
     } finally {
+      if (oldOptIn === undefined) delete process.env.KLYRO_TRUST_PROJECT_HOOKS;
+      else process.env.KLYRO_TRUST_PROJECT_HOOKS = oldOptIn;
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -147,19 +151,84 @@ describe('hooksForEvent (v2 matchers)', () => {
     const bad = [{ name: 'bad', event: 'preToolUse' as const, command: 'x', matcher: '([' }];
     expect(hooksForEvent(bad, 'preToolUse', 'read_file')).toEqual([]);
   });
-  it('loads v2 hooks.json with matcher + lifecycle events', () => {
+  it('loads v2 hooks.json with matcher + lifecycle events (trusted)', () => {
     const dir = mkCwd({
       '.klyro/hooks.json': JSON.stringify({ hooks: [
         { name: 'scoped', event: 'preToolUse', command: 'x', matcher: 'shell_exec' },
         { name: 'bye', event: 'sessionEnd', command: 'y' },
       ] }),
     });
+    const oldOptIn = process.env.KLYRO_TRUST_PROJECT_HOOKS;
+    process.env.KLYRO_TRUST_PROJECT_HOOKS = '1';
     try {
       const loaded = loadHooks(dir);
       expect(loaded).toHaveLength(2);
       expect(loaded[0]).toMatchObject({ matcher: 'shell_exec' });
     } finally {
+      if (oldOptIn === undefined) delete process.env.KLYRO_TRUST_PROJECT_HOOKS;
+      else process.env.KLYRO_TRUST_PROJECT_HOOKS = oldOptIn;
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('project hooks trust gate', () => {
+  it('ignores untrusted project hooks but still loads global ones', () => {
+    fs.mkdirSync(path.join(fakeHome, '.klyro'), { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeHome, '.klyro', 'hooks.json'),
+      JSON.stringify({ hooks: [{ name: 'mine', event: 'stop', command: 'g' }] }),
+      'utf-8',
+    );
+    const dir = mkCwd({
+      '.klyro/hooks.json': JSON.stringify({ hooks: [
+        { name: 'evil', event: 'sessionStart', command: 'pwn' },
+      ] }),
+    });
+    try {
+      expect(process.env.KLYRO_TRUST_PROJECT_HOOKS).toBeUndefined();
+      const hooks = loadHooks(dir);
+      expect(hooks.map((h) => h.name)).toEqual(['mine']);
+      expect(projectHooksStatus(dir)).toMatchObject({ exists: true, trusted: false });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('trustProjectHooks pins the file; an edit re-locks it', () => {
+    const dir = mkCwd({
+      '.klyro/hooks.json': JSON.stringify({ hooks: [{ name: 'ok', event: 'stop', command: 'x' }] }),
+    });
+    try {
+      const file = path.join(dir, '.klyro', 'hooks.json');
+      expect(projectHooksStatus(dir)).toMatchObject({ exists: true, trusted: false });
+      const { hash } = trustProjectHooks(dir);
+      expect(hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(projectHooksTrusted(dir)).toBe(true);
+      expect(loadHooks(dir).map((h) => h.name)).toEqual(['ok']);
+      // Any edit changes the hash → re-locked until reviewed again.
+      fs.writeFileSync(file, JSON.stringify({ hooks: [{ name: 'ok2', event: 'stop', command: 'y' }] }), 'utf-8');
+      expect(projectHooksTrusted(dir)).toBe(false);
+      expect(loadHooks(dir)).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('untrustProjectHooks removes the pin; trust without a file throws', () => {
+    const dir = mkCwd({
+      '.klyro/hooks.json': JSON.stringify({ hooks: [{ name: 'ok', event: 'stop', command: 'x' }] }),
+    });
+    const empty = mkCwd();
+    try {
+      trustProjectHooks(dir);
+      expect(untrustProjectHooks(dir)).toBe(true);
+      expect(untrustProjectHooks(dir)).toBe(false);
+      expect(projectHooksTrusted(dir)).toBe(false);
+      expect(() => trustProjectHooks(empty)).toThrow(/no project hooks file/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(empty, { recursive: true, force: true });
     }
   });
 });

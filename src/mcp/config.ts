@@ -12,6 +12,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { z } from 'zod';
+import { stripBom } from '../shared/json.js';
 
 /** MCP remote URL guard — https:// (or loopback http://) only. */
 export function assertSafeMcpUrl(url: string): void {
@@ -140,7 +141,7 @@ function normalizeRaw(raw: unknown): Record<string, unknown> {
 
 function readJsonFile(p: string): unknown {
   try {
-    return JSON.parse(fs.readFileSync(p, 'utf-8')) as unknown;
+    return JSON.parse(stripBom(fs.readFileSync(p, 'utf-8'))) as unknown;
   } catch {
     return undefined;
   }
