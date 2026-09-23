@@ -15,6 +15,7 @@ import * as fs from 'node:fs/promises';
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { cappedOutput } from '../shared/output-cap.js';
 
 function ckptDir(cwd: string): string {
   return path.join(cwd, '.klyro', 'checkpoints');
@@ -100,7 +101,7 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
     const args = ['diff', '--', ...kept.slice(0, 20)];
     const diffText = await new Promise<string>((resolve) => {
       const child = spawn('git', args, { cwd, shell: false, windowsHide: true });
-      const chunks: Buffer[] = [];
+      const sink = cappedOutput(20 * 1024);
       let done = false;
       const t = setTimeout(() => {
         if (!done) {
@@ -109,14 +110,12 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
           resolve('');
         }
       }, 10_000);
-      child.stdout.on('data', (b: Buffer) => {
-        if (Buffer.concat(chunks).length < 20 * 1024) chunks.push(b);
-      });
+      child.stdout.on('data', (b: Buffer) => sink.push(b));
       child.on('close', () => {
         if (done) return;
         done = true;
         clearTimeout(t);
-        resolve(Buffer.concat(chunks).toString('utf-8').slice(0, 20 * 1024));
+        resolve(sink.text());
       });
       child.on('error', () => {
         if (done) return;
@@ -202,9 +201,9 @@ export async function diff(cwd: string, id?: string): Promise<string> {
   const { spawn } = await import('node:child_process');
   return new Promise((resolve) => {
     const child = spawn('git', ['diff', '--stat'], { cwd, shell: false, windowsHide: true });
-    let out = '';
-    child.stdout.on('data', (b: Buffer) => { out += b.toString(); });
-    child.on('close', () => resolve(out || 'No diff'));
+    const sink = cappedOutput(64 * 1024);
+    child.stdout.on('data', (b: Buffer) => sink.push(b));
+    child.on('close', () => resolve(sink.text() || 'No diff'));
     child.on('error', () => resolve('No git diff available'));
   });
 }

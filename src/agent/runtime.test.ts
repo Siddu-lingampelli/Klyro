@@ -713,6 +713,10 @@ describe('runtime: level-7 telemetry', () => {
     const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
+    // Fixture hook: author-authored test double — opt in so the production
+    // trust gate (covered in hooks.test.ts) still lets this test run it.
+    const savedOptIn = process.env.KLYRO_TRUST_PROJECT_HOOKS;
+    process.env.KLYRO_TRUST_PROJECT_HOOKS = '1';
     const dir = mkdtempSync(join(tmpdir(), 'klyro-stop-'));
     mkdirSync(join(dir, '.klyro'), { recursive: true });
     writeFileSync(
@@ -748,6 +752,8 @@ describe('runtime: level-7 telemetry', () => {
     expect(r.status).toBe('complete');
     expect(r.steps).toBe(3);
     expect(JSON.stringify(r.transcript)).toContain('keep going');
+    if (savedOptIn === undefined) delete process.env.KLYRO_TRUST_PROJECT_HOOKS;
+    else process.env.KLYRO_TRUST_PROJECT_HOOKS = savedOptIn;
   });
 
   it('never executes malformed tool calls — structured MALFORMED_TOOL_CALL instead', async () => {    const { z } = await import('zod');
@@ -1106,18 +1112,28 @@ describe('runtime: level-7 telemetry', () => {
 describe('hooks engine + model_override', () => {
   const nodeOk = `"${process.execPath}" -e "process.exit(0)"`;
 
-  function isolateHome(): () => void {
+  function isolateHome(): { restore: () => void; home: string } {
     const savedHome = process.env.HOME;
     const savedProfile = process.env.USERPROFILE;
+    const savedOptIn = process.env.KLYRO_TRUST_PROJECT_HOOKS;
     const fake = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-rt-home-'));
     process.env.HOME = fake;
     process.env.USERPROFILE = fake;
-    return () => {
-      if (savedHome === undefined) delete process.env.HOME;
-      else process.env.HOME = savedHome;
-      if (savedProfile === undefined) delete process.env.USERPROFILE;
-      else process.env.USERPROFILE = savedProfile;
-      fs.rmSync(fake, { recursive: true, force: true });
+    // Fixture hooks are author-authored test doubles; the trust gate they
+    // exercise in production is covered by hooks.test.ts — opt the fixture
+    // files in here so these tests keep running their hooks.
+    process.env.KLYRO_TRUST_PROJECT_HOOKS = '1';
+    return {
+      home: fake,
+      restore: () => {
+        if (savedHome === undefined) delete process.env.HOME;
+        else process.env.HOME = savedHome;
+        if (savedProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = savedProfile;
+        if (savedOptIn === undefined) delete process.env.KLYRO_TRUST_PROJECT_HOOKS;
+        else process.env.KLYRO_TRUST_PROJECT_HOOKS = savedOptIn;
+        fs.rmSync(fake, { recursive: true, force: true });
+      },
     };
   }
 
@@ -1162,7 +1178,7 @@ describe('hooks engine + model_override', () => {
   }
 
   it('preToolUse hook exit 0 passes and the tool executes', async () => {
-    const restore = isolateHome();
+    const { restore } = isolateHome();
     const dir = hookCwd({ hooks: [{ name: 'allow', event: 'preToolUse', command: nodeOk }] });
     try {
       const executed = { ran: false };
@@ -1181,7 +1197,7 @@ describe('hooks engine + model_override', () => {
   });
 
   it('deny hook exit 1 blocks the tool with POLICY_DENIED message', async () => {
-    const restore = isolateHome();
+    const { restore } = isolateHome();
     const denyCmd = `"${process.execPath}" -e "console.error('blocked-by-test-hook'); process.exit(1)"`;
     const dir = hookCwd({ hooks: [{ name: 'gate', event: 'preToolUse', command: denyCmd }] });
     try {
@@ -1207,7 +1223,7 @@ describe('hooks engine + model_override', () => {
   });
 
   it('postToolUse hook failure does not fail the turn', async () => {
-    const restore = isolateHome();
+    const { restore } = isolateHome();
     const failCmd = `"${process.execPath}" -e "process.exit(1)"`;
     const dir = hookCwd({ hooks: [{ name: 'flaky-post', event: 'postToolUse', command: failCmd }] });
     try {
