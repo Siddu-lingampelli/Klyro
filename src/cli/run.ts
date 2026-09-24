@@ -27,6 +27,7 @@ import { memoryBlock } from '../context/memory.js';
 import { estimateCost } from '../providers/model-info.js';
 import { resolveModelAlias } from '../providers/model-info.js';
 import { logDebug, logInfo } from '../util/log.js';
+import { applyAutoAnswer } from './args.js';
 import { resolveSessionId } from '../persistence/session.js';
 import * as fs from 'node:fs';
 
@@ -111,6 +112,11 @@ export interface RunCliOptions {
   /** P1.4 — run the task under a named child-capable orchestrator context. */
   agent?: string;
   maxDepth?: number;
+  /**
+   * 5.3 — `--auto-answer <text>`: answer `ask_user` prompts headlessly.
+   * Applied to `process.env.KLYRO_AUTO_ANSWER` at the top of `runOnce`.
+   */
+  autoAnswer?: string;
 }
 
 /**
@@ -162,6 +168,9 @@ export function shouldForceExit(lastSigintAt: number | undefined, now: number): 
 }
 
 export async function runOnce(opts: RunCliOptions): Promise<number> {
+  // 5.3 — --auto-answer sets KLYRO_AUTO_ANSWER before anything runs so
+  // headless ask_user calls resolve without prompting.
+  applyAutoAnswer(opts.autoAnswer);
   // P0.5 — load <cwd>/.env first so KLYRO_* vars resolve without `export`.
   // Never throws (missing file is a no-op); explicit env wins (no-clobber).
   try {

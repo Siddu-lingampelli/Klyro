@@ -49,3 +49,36 @@ export function getTranscriptCommand(
   if (key.end && key.ctrl) return 'messages_last';
   return undefined;
 }
+
+/**
+ * 4.4c — `# note` command: a line starting with `# ` (hash + space) is a
+ * session note, not a prompt. Returns the note text, or undefined when the
+ * line is not a note (a lone `#` or `#nospace` stays a regular prompt).
+ */
+export function parseSessionNote(line: string): string | undefined {
+  if (!line.startsWith('# ')) return undefined;
+  const note = line.slice(2).trim();
+  if (!note) return undefined;
+  return note;
+}
+
+/**
+ * Handle one input line as a potential `# note`. When it is a note, the
+ * text is appended as session-note feedback through `append` (the same
+ * channel as other command feedback — the caller's queuedAppend) and
+ * persisted via `persist` when the caller has a session-file hook.
+ * Returns true when the line was consumed as a note.
+ */
+export function handleHashNoteLine(
+  line: string,
+  append: (text: string) => void,
+  persist?: (note: string) => void | Promise<void>,
+): boolean {
+  const note = parseSessionNote(line);
+  if (note === undefined) return false;
+  append(`[note] ${note}`);
+  try {
+    void persist?.(note);
+  } catch { /* best-effort only */ }
+  return true;
+}

@@ -50,7 +50,23 @@ function containedPath(cwd: string, base: string, rel: string): string | null {
   return out;
 }
 
-export async function snapshot(cwd: string, files: string[]): Promise<string> {
+/** Optional provenance recorded into a checkpoint's .meta.json. */
+export interface SnapshotOptions {
+  sessionId?: string;
+  eventId?: string;
+}
+
+/** Checkpoint meta on disk — sessionId/eventId are absent on old metas. */
+export interface CheckpointMeta {
+  id: string;
+  files: string[];
+  missing: string[];
+  ts: number;
+  sessionId?: string;
+  eventId?: string;
+}
+
+export async function snapshot(cwd: string, files: string[], opts?: SnapshotOptions): Promise<string> {
   const dir = ckptDir(cwd);
   await fs.mkdir(dir, { recursive: true });
   lockDown(dir, 0o700);
@@ -83,9 +99,12 @@ export async function snapshot(cwd: string, files: string[]): Promise<string> {
   // leaves a truncated .meta.json that undo() then trusts).
   const metaPath = path.join(dest, '.meta.json');
   const metaTmp = `${metaPath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const meta: CheckpointMeta = { id, files: kept, missing, ts: Date.now() };
+  if (opts?.sessionId !== undefined) meta.sessionId = opts.sessionId;
+  if (opts?.eventId !== undefined) meta.eventId = opts.eventId;
   await fs.writeFile(
     metaTmp,
-    JSON.stringify({ id, files: kept, missing, ts: Date.now() }, null, 2),
+    JSON.stringify(meta, null, 2),
   );
   lockDown(metaTmp, 0o600);
   await fsyncFile(metaTmp);

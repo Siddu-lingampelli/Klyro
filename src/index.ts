@@ -350,6 +350,7 @@ async function main(): Promise<void> {
     .option('--agent <name>', 'Run under an orchestrator context enabling spawn_agent/task_list/task_get (explorer|implementer|tester|reviewer)')
     .option('--max-depth <n>', 'Max spawn depth for child agents (default 1)', (v) => parsePositiveInt('--max-depth', v))
     .option('--bare', 'Deterministic runs: skip MCP, hooks, memory/KLYRO.md/context, persistence')
+    .option('--auto-answer <text>', 'Headless answer for ask_user prompts (sets KLYRO_AUTO_ANSWER)')
     .action(async (prompt: string, opts: {
       model?: string; maxSteps?: number; maxTurns?: number; maxTokens?: number; temperature?: number;
       reasoningEffort?: string; systemPrompt?: string; appendSystemPrompt?: string;
@@ -357,7 +358,7 @@ async function main(): Promise<void> {
       timeout?: number; baseUrl?: string; apiKey?: string;
       output?: string; dryRun?: boolean; provider?: string; resume?: string;
       resumeSession?: string; verify?: boolean; verifyCommand?: string; verifyMode?: string; maxRepairs?: number; persist?: boolean; requireVerify?: boolean;
-      agent?: string; maxDepth?: number; bare?: boolean;
+      agent?: string; maxDepth?: number; bare?: boolean; autoAnswer?: string;
     }) => {
       const model = opts.model ?? process.env.KLYRO_MODEL;
       if (!model) {
@@ -418,6 +419,7 @@ async function main(): Promise<void> {
           agent: opts.agent,
           maxDepth: opts.maxDepth,
           bare: !!opts.bare,
+          autoAnswer: opts.autoAnswer,
         });
         process.exit(code);
       } catch (err) {
@@ -451,17 +453,18 @@ async function main(): Promise<void> {
     .option('--model <id>', 'Model for eval')
     .option('--judge-model <id>', 'Live model id for grading judge.rubric (needs endpoint + key)')
     .option('--cwd <path>', 'Shared scenario workdir (default: isolated tmp per scenario)')
-    .action(async (input: string | undefined, opts: { output?: string; suite?: string; filter?: string; runs?: number; parallel?: number; model?: string; judgeModel?: string; cwd?: string }) => {
+    .option('--auto-answer <text>', 'Headless answer for ask_user prompts (sets KLYRO_AUTO_ANSWER)')
+    .action(async (input: string | undefined, opts: { output?: string; suite?: string; filter?: string; runs?: number; parallel?: number; model?: string; judgeModel?: string; cwd?: string; autoAnswer?: string }) => {
       const output = (opts.output ?? 'human') as 'human' | 'json' | 'silent';
       if (opts.suite) {
-        const code = await runEval({ inputPath: input ?? '-', output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel });
+        const code = await runEval({ inputPath: input ?? '-', output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel, cwd: opts.cwd, autoAnswer: opts.autoAnswer });
         process.exit(code);
       }
       if (!input) {
         process.stderr.write('klyro eval: missing input (provide <input> or --suite)\n');
         process.exit(2);
       }
-      const code = await runEval({ inputPath: input, output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel, cwd: opts.cwd });
+      const code = await runEval({ inputPath: input, output, suite: opts.suite, filter: opts.filter, runs: opts.runs, parallel: opts.parallel, model: opts.model, judgeModel: opts.judgeModel, cwd: opts.cwd, autoAnswer: opts.autoAnswer });
       process.exit(code);
     });
 

@@ -1329,3 +1329,87 @@ describe('hooks engine + model_override', () => {
     expect(seen).toEqual([{ requested: 'mock', effective: 'other-model' }]);
   });
 });
+
+describe('runtime: shell snapshots + turn summaries (4.5a/4.5c)', () => {
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const d of tmpDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  });
+  function freshDir(): string {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-rt45-'));
+    tmpDirs.push(d);
+    return d;
+  }
+
+  it('takes a pre-execution snapshot for shell_exec', async () => {
+    const dir = freshDir();
+    const { listCheckpoints } = await import('../checkpoints/store.js');
+    const reg = new ToolRegistry().register(shellExecTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'shell_exec' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{"command":"echo hi"}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls' },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'done' },
+        { kind: 'message_end', finishReason: 'stop' },
+      ],
+    ]);
+    const before = await listCheckpoints(dir);
+    const r = await run(
+      { task: 'run echo', cwd: dir, model: 'mock', maxSteps: 3, nonInteractive: true },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('complete');
+    const after = await listCheckpoints(dir);
+    expect(after.length).toBeGreaterThan(before.length);
+  });
+
+  it('emits one turn.summary per turn with cumulative counts + transcript lines', async () => {
+    const dir = freshDir();
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const adapter = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'tool_call_start', id: 'c1', name: 'write_file' },
+        { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"x.txt","content":"hi"}' },
+        { kind: 'tool_call_end', id: 'c1' },
+        { kind: 'message_end', finishReason: 'tool_calls', usage: { input: 100, output: 20 } },
+      ],
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'done' },
+        { kind: 'message_end', finishReason: 'stop', usage: { input: 50, output: 10 } },
+      ],
+    ]);
+    const summaries: Array<{ turn: number; toolCalls: number; inputTokens: number; outputTokens: number; durationMs: number }> = [];
+    const r = await run(
+      {
+        task: 'write then done', cwd: dir, model: 'mock', maxSteps: 3, nonInteractive: true,
+        onEvent: (ev) => {
+          if (ev.kind === 'turn.summary') {
+            summaries.push({ turn: ev.turn, toolCalls: ev.toolCalls, inputTokens: ev.inputTokens, outputTokens: ev.outputTokens, durationMs: ev.durationMs });
+          }
+        },
+      },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('complete');
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]).toMatchObject({ turn: 1, toolCalls: 1, inputTokens: 100, outputTokens: 20 });
+    expect(summaries[1]).toMatchObject({ turn: 2, toolCalls: 1, inputTokens: 150, outputTokens: 30 });
+    expect(typeof summaries[0]!.durationMs).toBe('number');
+    const lines = r.transcript
+      .flatMap((m) => m.content)
+      .filter((b): b is { kind: 'text'; text: string } => (b as { kind?: string }).kind === 'text')
+      .map((b) => b.text)
+      .filter((t) => t.includes('[turn '));
+    expect(lines).toHaveLength(2);
+  });
+});

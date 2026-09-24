@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { runScenario, runEval, scriptedAdapterFromSpec, type EvalScenario } from './eval.js';
+import { runScenario, runEval, scriptedAdapterFromSpec, collectFilesTouched, selectCoreFixtures, CORE_SUITE_FIXTURES, type EvalScenario } from './eval.js';
+import { applyAutoAnswer } from './args.js';
+import { runOnce } from './run.js';
+import { collectBaselineMetadata, buildEvalBaseline, writeEvalBaseline } from '../eval/baseline.js';
+import { estimateCost as runtimeEstimateCost } from '../agent/runtime.js';
+import type { ProviderAdapter } from '../agent/provider-adapter.js';
 import { Writable } from 'node:stream';
 
 async function captureStdout<T>(fn: () => Promise<T>): Promise<{ out: string; value: T }> {
@@ -284,5 +289,187 @@ describe('runEval', () => {
     // We can't easily test stdin in vitest without overriding, so we just
     // confirm that a "-" path is accepted (the readAll branch is exercised).
     expect(runEval).toBeTypeOf('function');
+  });
+});
+
+describe('auto-answer wiring (5.3)', () => {
+  const prev = process.env.KLYRO_AUTO_ANSWER;
+  afterEach(() => {
+    if (prev === undefined) delete process.env.KLYRO_AUTO_ANSWER;
+    else process.env.KLYRO_AUTO_ANSWER = prev;
+  });
+
+  it('applyAutoAnswer sets the env var, leaves it alone when omitted', () => {
+    delete process.env.KLYRO_AUTO_ANSWER;
+    applyAutoAnswer('yes-please');
+    expect(process.env.KLYRO_AUTO_ANSWER).toBe('yes-please');
+    applyAutoAnswer(undefined);
+    expect(process.env.KLYRO_AUTO_ANSWER).toBe('yes-please');
+  });
+
+  it('runEval applies opts.autoAnswer before running', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-eval-auto-'));
+    try {
+      const file = path.join(dir, 's.jsonl');
+      fs.writeFileSync(file, JSON.stringify({
+        name: 'a', task: 'x',
+        scripted_events: [[['message_start'], ['text_delta', 'hi'], ['message_end', 'stop']]],
+        expect: { status: 'complete' },
+      }) + '\n');
+      delete process.env.KLYRO_AUTO_ANSWER;
+      const { value } = await captureStdout(() => runEval({ inputPath: file, output: 'silent', autoAnswer: 'flag-text' }));
+      expect(value).toBe(0);
+      expect(process.env.KLYRO_AUTO_ANSWER).toBe('flag-text');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runOnce applies opts.autoAnswer before the run starts', async () => {
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream() {
+        yield { kind: 'message_start' };
+        yield { kind: 'text_delta', text: 'done' };
+        yield { kind: 'message_end', finishReason: 'stop' };
+      },
+    };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-run-auto-'));
+    try {
+      delete process.env.KLYRO_AUTO_ANSWER;
+      const code = await runOnce({
+        task: 'hi', cwd: dir, model: 'mock', adapter,
+        bare: true, output: 'silent', autoAnswer: 'proceed',
+      });
+      expect(code).toBe(0);
+      expect(process.env.KLYRO_AUTO_ANSWER).toBe('proceed');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('rich records (5.4a)', () => {
+  it('runScenario result contains tokens/cost/files fields', async () => {
+    const sc: EvalScenario = {
+      name: 'rich',
+      task: 'write notes',
+      model: 'gpt-4o-mini',
+      maxSteps: 4,
+      scripted_events: [
+        [
+          ['message_start'],
+          ['tool_call_start', 'c1', 'write_file'],
+          ['tool_call_delta', 'c1', JSON.stringify({ path: 'notes.txt', content: 'hi' })],
+          ['tool_call_end', 'c1'],
+          ['message_end', 'tool_calls'],
+        ],
+        [
+          ['message_start'],
+          ['text_delta', 'done'],
+          ['message_end', 'stop', { input: 1000, output: 500 }],
+        ],
+      ],
+      expect: { status: 'complete', toolCallsAtLeast: 1 },
+    };
+    const r = await runScenario(sc);
+    expect(r.passed).toBe(true);
+    // Provider-reported usage (1000/500) plus estimates for the tool turn.
+    expect(r.tokens!.input).toBeGreaterThanOrEqual(1000);
+    expect(r.tokens!.output).toBeGreaterThanOrEqual(500);
+    // Cost reuses the runtime pricing helper on the same usage block.
+    expect(r.costUsd).toBe(runtimeEstimateCost('gpt-4o-mini', r.tokens!));
+    expect(r.filesTouched).toContain('notes.txt');
+    expect(r.repairs).toBe(0);
+  });
+
+  it('runScenario maps verification outcome when a verify command runs', async () => {
+    const sc: EvalScenario = {
+      name: 'rich-verify',
+      task: 'write probe',
+      maxSteps: 4,
+      verify: { mode: 'advisory', command: 'node -e "process.exit(1)"' },
+      scripted_events: [
+        [
+          ['message_start'],
+          ['tool_call_start', 'c1', 'write_file'],
+          ['tool_call_delta', 'c1', JSON.stringify({ path: 'probe.txt', content: 'x' })],
+          ['tool_call_end', 'c1'],
+          ['message_end', 'tool_calls'],
+        ],
+        [
+          ['message_start'],
+          ['text_delta', 'done'],
+          ['message_end', 'stop'],
+        ],
+      ],
+      expect: { status: 'complete' },
+    };
+    const r = await runScenario(sc);
+    expect(r.status).toBe('complete');
+    expect(r.verification).toMatchObject({ ok: false, attempts: 1 });
+  });
+
+  it('collectFilesTouched dedupes and sorts path-ish inputs', () => {
+    expect(collectFilesTouched([
+      { role: 'assistant', content: [{ kind: 'tool_use', id: 'a', name: 'write_file', input: { path: 'b.txt', content: 'x' } }] },
+      { role: 'assistant', content: [{ kind: 'tool_use', id: 'b', name: 'read_file', input: { path: 'a.txt' } }] },
+      { role: 'assistant', content: [{ kind: 'tool_use', id: 'c', name: 'read_file', input: { path: 'a.txt' } }] },
+      { role: 'assistant', content: [{ kind: 'text', text: 'hi' }] },
+    ])).toEqual(['a.txt', 'b.txt']);
+  });
+});
+
+describe('core suite (5.5a)', () => {
+  it('resolves to exactly the curated list', () => {
+    expect(CORE_SUITE_FIXTURES).toEqual(['read-answer', 'add-fn-test', 'fix-failing-test', 'rename', 'cli-flag']);
+    const entries = [...CORE_SUITE_FIXTURES, 'zzz-other', 'smoke-agent-write'];
+    expect(selectCoreFixtures(entries)).toEqual(CORE_SUITE_FIXTURES);
+    expect(selectCoreFixtures(['zzz-other'])).toEqual([]);
+  });
+
+  it('every core fixture has task.md + check.sh', () => {
+    for (const id of CORE_SUITE_FIXTURES) {
+      const dir = path.join(process.cwd(), 'evals', 'fixtures', id);
+      expect(fs.existsSync(path.join(dir, 'task.md'))).toBe(true);
+      expect(fs.existsSync(path.join(dir, 'check.sh'))).toBe(true);
+    }
+  });
+});
+
+describe('baseline writer (5.5b)', () => {
+  it('emits model/node/platform/commit/timestamp metadata', () => {
+    const meta = collectBaselineMetadata({ model: 'test-model' });
+    expect(meta.model).toBe('test-model');
+    expect(meta.node).toBe(process.version);
+    expect(meta.platform).toBe(process.platform);
+    expect(typeof meta.commit).toBe('string');
+    expect(meta.commit.length).toBeGreaterThan(0);
+    expect(Number.isNaN(Date.parse(meta.timestamp))).toBe(false);
+  });
+
+  it('buildEvalBaseline combines metadata + counts', () => {
+    const meta = collectBaselineMetadata({ model: 'm' });
+    const rec = buildEvalBaseline(meta, { suite: 'core', total: 5, passed: 4, failed: 1, durationMs: 7 });
+    expect(rec.suite).toBe('core');
+    expect(rec.passRate).toBeCloseTo(0.8, 8);
+    expect(rec.model).toBe('m');
+  });
+
+  it('writeEvalBaseline round-trips baseline.json', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klyro-baseline-'));
+    try {
+      const rec = buildEvalBaseline(collectBaselineMetadata({ model: 'm' }), {
+        suite: 'core', total: 1, passed: 1, failed: 0, durationMs: 1,
+      });
+      const out = await writeEvalBaseline(dir, rec);
+      expect(out).toBe(path.join(dir, 'baseline.json'));
+      const back = JSON.parse(fs.readFileSync(out, 'utf-8')) as Record<string, unknown>;
+      expect(back.model).toBe('m');
+      expect(back.node).toBe(process.version);
+      expect(back.commit).toBe(rec.commit);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

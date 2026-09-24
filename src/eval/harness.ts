@@ -238,10 +238,52 @@ export async function loadFileFixture(dir: string): Promise<FileFixture> {
   return { dir, task: task.trim(), checkSh, meta, ...(repo ? { repo } : {}), ...(script ? { script } : {}) };
 }
 
-export async function runFileFixture(fixture: FileFixture, _opts: { runs?: number; parallel?: number } = {}): Promise<TaskResult> {
+/**
+ * 5.4b — sanitized env for `check.sh`: PATH + home/locale + temp vars
+ * (+ Windows shell vars so the shell can spawn). Everything else —
+ * secrets, `KLYRO_*` config, caller sentinels — is dropped. Exported for tests.
+ */
+const FIXTURE_ENV_ALLOW = new Set([
+  'PATH', 'PATHEXT', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'TEMP', 'TMP',
+  'SYSTEMROOT', 'SYSTEMDRIVE', 'COMSPEC',
+]);
+export function sanitizedFixtureEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const k of FIXTURE_ENV_ALLOW) {
+    const v = base[k];
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * 5.4b — guard: fixture workdirs must stay inside `os.tmpdir()` (the
+ * harness relies on that isolation). Throws otherwise unless the caller
+ * explicitly passes `allowWorkdirOutsideTmp`. Exported for tests.
+ */
+export function assertTmpWorkdir(dir: string, opts: { allowWorkdirOutsideTmp?: boolean } = {}): void {
+  if (opts.allowWorkdirOutsideTmp) return;
+  const root = path.resolve(os.tmpdir());
+  const resolved = path.resolve(dir);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new Error(`fixture workdir escapes os.tmpdir(): ${resolved} (pass allowWorkdirOutsideTmp to override)`);
+  }
+}
+
+export interface FileFixtureOptions {
+  runs?: number;
+  parallel?: number;
+  allowWorkdirOutsideTmp?: boolean;
+}
+
+export async function runFileFixture(fixture: FileFixture, _opts: FileFixtureOptions = {}): Promise<TaskResult> {
   const start = Date.now();
   const tmp = path.join(os.tmpdir(), 'klyro-eval-file-' + Math.random().toString(36).slice(2));
+  assertTmpWorkdir(tmp, _opts);
   await fs.mkdir(tmp, { recursive: true });
+  // Restrictive creation (umask-style): the tmp workdir is owner-only.
+  // Best-effort — chmod is a no-op for ACLs on Windows but harmless.
+  await fs.chmod(tmp, 0o700).catch(() => undefined);
   // Copy repo if exists
   if (fixture.repo) {
     const src = path.isAbsolute(fixture.repo) ? fixture.repo : path.join(fixture.dir, fixture.repo);
@@ -252,7 +294,7 @@ export async function runFileFixture(fixture: FileFixture, _opts: { runs?: numbe
   // Run check.sh via shell
   const { spawn } = await import('node:child_process');
   const result: TaskResult = await new Promise((resolve) => {
-    const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false });
+    const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false, env: sanitizedFixtureEnv() });
     const sink = cappedOutput(MAX_CHECK_BYTES);
     child.stdout?.on('data', (b: Buffer) => sink.push(b));
     child.stderr?.on('data', (b: Buffer) => sink.push(b));
@@ -282,7 +324,7 @@ export async function runFileFixture(fixture: FileFixture, _opts: { runs?: numbe
  */
 export async function runAgentFixture(
   fixture: FileFixture,
-  opts: { judgeAdapter?: ProviderAdapter; judgeModel?: string } = {},
+  opts: { judgeAdapter?: ProviderAdapter; judgeModel?: string; allowWorkdirOutsideTmp?: boolean } = {},
 ): Promise<TaskResult> {
   const start = Date.now();
   const id = path.basename(fixture.dir);
@@ -290,7 +332,9 @@ export async function runAgentFixture(
     return { id, status: 'fail', details: 'agent fixture needs script.json', durationMs: Date.now() - start };
   }
   const tmp = path.join(os.tmpdir(), 'klyro-eval-agent-' + Math.random().toString(36).slice(2));
+  assertTmpWorkdir(tmp, opts);
   await fs.mkdir(tmp, { recursive: true });
+  await fs.chmod(tmp, 0o700).catch(() => undefined);
   try {
     if (fixture.repo) {
       const src = path.isAbsolute(fixture.repo) ? fixture.repo : path.join(fixture.dir, fixture.repo);
@@ -316,7 +360,7 @@ export async function runAgentFixture(
     // Structural pass — now assert real filesystem outcomes.
     const { spawn } = await import('node:child_process');
     const out: string = await new Promise((resolve) => {
-      const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false });
+      const child = spawn('bash', ['-c', fixture.checkSh], { cwd: tmp, shell: false, env: sanitizedFixtureEnv() });
       const sink = cappedOutput(MAX_CHECK_BYTES);
       child.stdout?.on('data', (b: Buffer) => sink.push(b));
       child.stderr?.on('data', (b: Buffer) => sink.push(b));

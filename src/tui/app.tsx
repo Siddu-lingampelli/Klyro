@@ -6,6 +6,8 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Box, Text, useInput, useStdout } from 'ink';
 import Spinner from 'ink-spinner';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import * as path from 'node:path';
 import type { StatusSnapshot } from './status.js';
 import type { TranscriptItem, ToolResultPatch } from './transcript.js';
 import { TuiApprovalBridge, ApprovalModal } from './approval.js';
@@ -68,6 +70,45 @@ function Header({ cwd, model, version, width }: { cwd: string; model: string; ve
       </Box>
       <Text color={tokens.colors.dim as string}>{model}  ·  {cwd}</Text>
       {branch ? <Text color={tokens.colors.dim as string}>⎇  {branch}</Text> : null}
+    </Box>
+  );
+}
+
+/**
+ * 5.5c — compact todo checklist. Live `plan` state (`todo_write` →
+ * `plan_update` events → `updatePlan`) wins; when it is empty, best-effort
+ * read of `.klyro/plans/todos.json` so a reloaded TUI still shows the list.
+ */
+const TODO_STATUSES = ['pending', 'in_progress', 'done', 'failed', 'skipped'] as const;
+function loadTodosFromDisk(cwd: string): PlanStep[] {
+  try {
+    const raw = readFileSync(path.join(cwd, '.klyro', 'plans', 'todos.json'), 'utf-8');
+    const arr = JSON.parse(raw) as Array<{ id?: unknown; title?: unknown; status?: unknown }>;
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((t) => typeof t.title === 'string' && (t.title as string).length > 0)
+      .map((t, i) => ({
+        id: typeof t.id === 'string' ? t.id : `disk-${i}`,
+        title: t.title as string,
+        status: (TODO_STATUSES as readonly string[]).includes(t.status as string)
+          ? (t.status as PlanStep['status'])
+          : ('pending' as PlanStep['status']),
+      }));
+  } catch {
+    return [];
+  }
+}
+function TodoChecklist({ plan, cwd }: { plan: PlanStep[]; cwd: string }): React.JSX.Element | null {
+  // Disk fallback only when live state is empty (never masks live updates).
+  const disk = useMemo(() => (plan.length > 0 ? [] : loadTodosFromDisk(cwd)), [plan.length, cwd]);
+  const items = plan.length > 0 ? plan : disk;
+  if (items.length === 0) return null;
+  return (
+    <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
+      <Box><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {items.filter((p) => p.status === 'done').length}/{items.length}</Text></Box>
+      {items.slice(0, 8).map((p, i) => (
+        <Box key={p.id}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.colors.ok as string : p.status === 'in_progress' ? tokens.colors.accent as string : tokens.colors.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {i + 1}. {redact(p.title)}</Text></Box>
+      ))}
     </Box>
   );
 }
@@ -1113,14 +1154,7 @@ export function App(props: AppProps): React.JSX.Element {
           {showThinking && status.status === 'running' && !streamingIdRef.current ? (
             <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.accent as string}><Spinner type="dots" /> </Text><Text color={tokens.colors.dim as string}>Thinking... (esc ×2 to cancel)</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
           ) : null}
-          {showPlan && plan.length > 0 ? (
-            <Box flexDirection="column" paddingLeft={2} marginTop={0} marginBottom={1}>
-              <Box><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text bold>{g('todoPlan')} Plan  {plan.filter((p) => p.status === 'done').length}/{plan.length}</Text></Box>
-              {plan.slice(0, 8).map((p, i) => (
-                <Box key={p.id}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={p.status === 'done' ? tokens.colors.ok as string : p.status === 'in_progress' ? tokens.colors.accent as string : tokens.colors.dim as string}>{p.status === 'done' ? g('todoDone') : p.status === 'in_progress' ? g('todoActive') : g('todoPending')} {i + 1}. {redact(p.title)}</Text></Box>
-              ))}
-            </Box>
-          ) : null}
+          {showPlan ? <TodoChecklist plan={plan} cwd={props.cwd} /> : null}
           {showQueued && queuedInputs.length > 0 ? (
             <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
               {queuedInputs.map((q, i) => (

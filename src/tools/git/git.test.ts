@@ -5,6 +5,9 @@ import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { gitStatusTool } from './git-status.js';
 import { gitLogTool } from './git-log.js';
+import { gitDiffTool } from './git-diff.js';
+import { gitBlameTool } from './git-blame.js';
+import { gitShowTool } from './git-show.js';
 
 describe('git tools', () => {
   let tmp: string;
@@ -27,5 +30,25 @@ describe('git tools', () => {
   it('git_log', async () => {
     const r = await gitLogTool.execute({ limit: 5 }, { cwd: tmp, env: {} });
     expect(r.ok).toBe(true);
+  });
+
+  it('git_diff', async () => {
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'hello world', 'utf-8');
+    const r = await gitDiffTool.execute({}, { cwd: tmp, env: {} }) as { ok: true; value: { diff: string; patchedFiles: string[] } };
+    expect(r.ok).toBe(true);
+    expect(r.value.patchedFiles).toContain('a.txt');
+    expect(r.value.diff).toContain('+hello world');
+  });
+
+  it('git_blame', async () => {
+    const r = await gitBlameTool.execute({ path: 'a.txt' }, { cwd: tmp, env: {} });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.blame).toContain('hello');
+  });
+
+  it('git_show', async () => {
+    const r = await gitShowTool.execute({ target: 'HEAD' }, { cwd: tmp, env: {} });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value.content).toContain('hello');
   });
 });

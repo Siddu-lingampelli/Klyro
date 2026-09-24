@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { resolveWithinCwd } from '../../policy/path-guard.js';
 import { safe } from '../normalize.js';
+import { IgnoreFilter } from './ignore.js';
 
 const InputSchema = z.object({
   pattern: z.string().min(1).describe('Glob pattern, e.g. "**/*.ts" or "src/**/*.json"'),
@@ -36,7 +37,8 @@ export const globTool = defineTool({
       const max = input.maxResults ?? DEFAULT_MAX;
       const matches: string[] = [];
       let truncated = false;
-      await walk(base, base, matcher, max + 1, matches, () => (truncated = true));
+      const ignore = await IgnoreFilter.load(ctx.cwd);
+      await walk(base, base, matcher, max + 1, matches, () => (truncated = true), ignore, ctx.cwd);
       // Normalize to relative, forward-slash paths from ctx.cwd (so
       // tool inputs/outputs are stable across Windows and POSIX).
       const rel = matches.slice(0, max).map((m) =>
@@ -71,6 +73,8 @@ async function walk(
   cap: number,
   out: string[],
   onCap: () => void,
+  ignore: IgnoreFilter,
+  cwd: string,
 ): Promise<void> {
   if (out.length >= cap) return;
   let names: string[];
@@ -83,6 +87,8 @@ async function walk(
     if (out.length >= cap) return;
     if (SKIP_DIRS.has(name)) continue;
     const full = path.join(dir, name);
+    const relToCwd = path.relative(cwd, full);
+    if (ignore.ignores(relToCwd)) continue;
     let isDir = false;
     try {
       const s = await fs.lstat(full);
@@ -96,7 +102,7 @@ async function walk(
       out.push(full);
       if (out.length >= cap) onCap();
     }
-    if (isDir) await walk(root, full, matcher, cap, out, onCap);
+    if (isDir) await walk(root, full, matcher, cap, out, onCap, ignore, cwd);
   }
 }
 

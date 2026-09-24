@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { safe } from '../normalize.js';
-import { spawn } from 'node:child_process';
+import { runGit } from './run-git.js';
 
 const InputSchema = z.object({
   limit: z.number().int().min(1).max(100).optional().describe('Number of commits'),
@@ -18,23 +18,9 @@ export const gitLogTool = defineTool({
     return safe(async () => {
       const args = ['log', '--oneline', `-${input.limit ?? 20}`];
       if (input.path) args.push('--', input.path);
-      const out = await runGit(args, ctx.cwd);
-      return { log: out } as const;
+      const res = await runGit(args, ctx.cwd);
+      if (res.code !== 0) throw new Error(res.err || `git log failed`);
+      return { log: res.out } as const;
     });
   },
 });
-
-function runGit(args: string[], cwd: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { cwd, shell: false, windowsHide: true });
-    let out = '';
-    let err = '';
-    child.stdout.on('data', (b: Buffer) => { out += b.toString(); });
-    child.stderr.on('data', (b: Buffer) => { err += b.toString(); });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) resolve(out);
-      else reject(new Error(err || `git ${args[0]} failed`));
-    });
-  });
-}

@@ -38,12 +38,58 @@ export async function loadKlyroMdFiles(cwd: string): Promise<KlyroMdFile[]> {
   // Klyro's own instruction file is KLYRO.md. The rest are read-only
   // fallbacks for imported repos that follow other conventions — Klyro
   // never writes them. KLYRO.md wins by load order.
-  for (const name of ['KLYRO.md', 'KLYRO.local.md', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '.cursorrules']) {
+  for (const name of INSTRUCTION_NAMES) {
     const p = path.join(cwd, name);
     try {
       const t = await fs.readFile(p, 'utf-8');
-      files.push({ path: p, content: cap(await resolveImports(t, path.dirname(p), cwd), MAX_FILE_CHARS) });
+      files.push({ path: p, content: cap(await resolveImports(t, path.dirname(p), cwd, 0, [p]), MAX_FILE_CHARS) });
     } catch { /* ignore */ }
+  }
+  return files;
+}
+
+/** Instruction file names read at every level (root + subdirectories). */
+const INSTRUCTION_NAMES = ['KLYRO.md', 'KLYRO.local.md', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '.cursorrules'];
+
+/**
+ * 4.4a — Subdirectory instructions: root files PLUS instruction files found
+ * in ancestor directories of targetPath from cwd down to targetPath's dir
+ * (nearest-wins order root→leaf, each capped like cap()).
+ *
+ * Laziness preserved: plain loadKlyroMdFiles(cwd) never reads subdirs —
+ * callers pass the relevant active path explicitly.
+ *
+ * Containment: a targetPath escaping cwd is rejected (root files only).
+ */
+export async function loadKlyroMdForPath(cwd: string, targetPath: string): Promise<KlyroMdFile[]> {
+  const files = await loadKlyroMdFiles(cwd);
+  const root = path.resolve(cwd);
+  const absTarget = path.resolve(root, targetPath);
+  const relTarget = path.relative(root, absTarget);
+  if (relTarget.startsWith('..') || path.isAbsolute(relTarget)) return files;
+  // Target dir: the target itself when it is an existing directory,
+  // otherwise its parent dir (i.e. the target is a file being edited).
+  let targetDir = absTarget;
+  try {
+    const st = await fs.stat(absTarget);
+    if (!st.isDirectory()) targetDir = path.dirname(absTarget);
+  } catch {
+    targetDir = path.dirname(absTarget);
+  }
+  const relDir = path.relative(root, targetDir);
+  if (relDir.startsWith('..') || path.isAbsolute(relDir)) return files;
+  const segs = relDir.split(path.sep).filter((s) => s && s !== '.');
+  let prefix = root;
+  for (const seg of segs) {
+    prefix = path.join(prefix, seg);
+    const dir = prefix;
+    for (const name of INSTRUCTION_NAMES) {
+      const p = path.join(dir, name);
+      try {
+        const t = await fs.readFile(p, 'utf-8');
+        files.push({ path: p, content: cap(await resolveImports(t, path.dirname(p), root, 0, [p]), MAX_FILE_CHARS) });
+      } catch { /* ignore */ }
+    }
   }
   return files;
 }
@@ -64,7 +110,7 @@ export async function loadKlyroMd(cwd: string): Promise<string> {
   return parts.join('\n\n---\n\n');
 }
 
-async function resolveImports(text: string, base: string, root: string, depth = 0): Promise<string> {
+async function resolveImports(text: string, base: string, root: string, depth = 0, chain: string[] = []): Promise<string> {
   if (depth > 5) return text;
   const importRe = /^@import\s+(.+)$/gm;
   let out = text;
@@ -75,9 +121,15 @@ async function resolveImports(text: string, base: string, root: string, depth = 
     // Containment: never follow imports outside the project root.
     const relToRoot = path.relative(root, p);
     if (relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) continue;
+    // Cycle guard: an @import target already on the current chain resolves
+    // to a marker instead of recursing (depth cap stays as backstop).
+    if (chain.includes(p)) {
+      out = out.replace(m[0], `<!-- klyro: import cycle skipped: ${rel} -->`);
+      continue;
+    }
     try {
       const t = await fs.readFile(p, 'utf-8');
-      const resolved = await resolveImports(cap(t, MAX_FILE_CHARS), path.dirname(p), root, depth + 1);
+      const resolved = await resolveImports(cap(t, MAX_FILE_CHARS), path.dirname(p), root, depth + 1, [...chain, p]);
       out = out.replace(m[0], resolved);
     } catch { /* ignore missing */ }
   }

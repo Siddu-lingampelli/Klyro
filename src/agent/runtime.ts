@@ -228,7 +228,8 @@ export type RuntimeEvent =
   | { kind: 'status'; message: string }
   | { kind: 'budget_warning'; ratio: number; threshold: number }
   | { kind: 'provider_failover'; from: string; to: string; reason: string }
-  | { kind: 'model_override'; requested: string; effective: string };
+  | { kind: 'model_override'; requested: string; effective: string }
+  | { kind: 'turn.summary'; turn: number; toolCalls: number; inputTokens: number; outputTokens: number; durationMs: number };
 
 export interface RunResult {
   status: 'complete' | 'max_steps' | 'aborted' | 'no_final' | 'verify_failed' | 'limit' | 'blocked' | 'stuck';
@@ -336,6 +337,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     }
   };
   let steps = 0;
+  // 4.5c — per-turn start time for turn.summary durationMs.
+  let turnStartMs = Date.now();
   let lastRemindTurn = 0;
   let toolCallCount = 0;
   let finalText = '';
@@ -466,6 +469,24 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     }
   }
 
+  /**
+   * 4.5c — end-of-turn summary: emit a turn.summary event (cumulative
+   * toolCalls + token counts, per-turn durationMs) and record a compact
+   * one-line summary in the transcript.
+   */
+  async function emitTurnSummary(): Promise<void> {
+    const durationMs = Date.now() - turnStartMs;
+    emit?.({ kind: 'turn.summary', turn: steps, toolCalls: toolCallCount, inputTokens: usage.input, outputTokens: usage.output, durationMs });
+    const msg: Message = {
+      role: 'user',
+      content: [text(`[turn ${steps} summary] ${toolCallCount} tool call(s), ${usage.input} in / ${usage.output} out tokens, ${durationMs}ms`)],
+    };
+    transcript.push(msg);
+    await checkpoint(msg);
+    // Invalidate token cache since transcript changed
+    tokenCache = { lastRef: null, lastSystem: undefined, lastCount: 0 };
+  }
+
   // Persist initial user message
   if (store && sessionId && transcript.length > 0) {
     // Fire-and-forget initial checkpoint (don't await to block loop start)
@@ -538,6 +559,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined, phase: 'blocked' };
     }
     steps++;
+    turnStartMs = Date.now();
     // 8.4 — stale-todo reminder: every 20 turns, re-inject pending plan
     // items from `.klyro/plans/todos.json` (written by todo_write) so a
     // long run cannot silently drop its checklist. Best-effort + tiny.
@@ -810,6 +832,9 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       return { status: 'aborted', steps, toolCalls: toolCallCount, finalText, transcript, hasEdits, usage, repairs, verification: hasEdits ? withRepairTokens({ ok: false, attempts: verificationAttempts }) : undefined };
     }
     if (finalizedCalls.length === 0) {
+      // 4.5c — the turn completed (final text, malformed-only, or
+      // stop-hook continuation): summarize before the verify branching.
+      await emitTurnSummary();
       // Steerable stop: a stop hook asked for one more turn instead of
       // completing. Consumed once per verdict, max 3 per run.
       if (stopCont !== null && stopContUsed < 3) {
@@ -1230,6 +1255,17 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           }
         }
       }
+      // 4.5a — shell/git mutations bypass file-change inference: take a
+      // pre-execution snapshot so the turn stays restorable. Best-effort.
+      if (call.name === 'shell_exec' || call.name.startsWith('git_')) {
+        try {
+          const { snapshot } = await import('../checkpoints/store.js');
+          await snapshot(opts.cwd, [...fileEditCounts.keys()].slice(-20), {
+            ...(sessionId !== undefined ? { sessionId } : {}),
+            eventId: call.id,
+          });
+        } catch { /* ignore */ }
+      }
       let obs: import('../tools/types.js').ToolResult<unknown>;
       try {
         obs = await deps.registry.execute(call.name, call.input, toolCtx);
@@ -1319,7 +1355,10 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           // 4.5 — checkpoint snapshot after each mutation
           try {
             const { snapshot } = await import('../checkpoints/store.js');
-            await snapshot(opts.cwd, [fileChanged.path]);
+            await snapshot(opts.cwd, [fileChanged.path], {
+              ...(sessionId !== undefined ? { sessionId } : {}),
+              eventId: call.id,
+            });
           } catch { /* ignore */ }
           // 5.2 file edit count
           const cnt = (fileEditCounts.get(fileChanged.path) ?? 0) + 1;
@@ -1422,6 +1461,8 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         if (opts.signal?.aborted) break;
       }
     }
+    // 4.5c — the tool turn completed: summarize (cumulative counts).
+    await emitTurnSummary();
     // P0 — drain finished sub-agent completions into parent visibility.
     // drainCompletions is OPTIONAL on the bridge — guarded with `?.` so
     // older bridges without it simply yield nothing.

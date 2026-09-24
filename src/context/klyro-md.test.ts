@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { loadKlyroMd } from './klyro-md.js';
+import { loadKlyroMd, loadKlyroMdFiles, loadKlyroMdForPath } from './klyro-md.js';
 
 describe('klyro-md', () => {
   let tmp: string;
@@ -52,5 +52,44 @@ describe('klyro-md', () => {
     await fs.writeFile(path.join(tmp, 'KLYRO.md'), 'x'.repeat(20000), 'utf-8');
     const md = await loadKlyroMd(tmp);
     expect(md.length).toBeLessThanOrEqual(9000);
+  });
+
+  it('A<->B import cycle terminates with a cycle-skipped marker', async () => {
+    await fs.writeFile(path.join(tmp, 'KLYRO.md'), '@import b.md', 'utf-8');
+    await fs.writeFile(path.join(tmp, 'b.md'), '@import KLYRO.md', 'utf-8');
+    const md = await loadKlyroMd(tmp);
+    expect(md).toContain('import cycle skipped');
+  });
+
+  it('self-import terminates with a cycle-skipped marker', async () => {
+    await fs.writeFile(path.join(tmp, 'KLYRO.md'), '@import KLYRO.md', 'utf-8');
+    const md = await loadKlyroMd(tmp);
+    expect(md).toContain('import cycle skipped');
+  });
+
+  it('loadKlyroMdForPath loads subdir instructions for the relevant path', async () => {
+    await fs.writeFile(path.join(tmp, 'KLYRO.md'), '# root', 'utf-8');
+    await fs.mkdir(path.join(tmp, 'sub', 'leaf'), { recursive: true });
+    await fs.writeFile(path.join(tmp, 'sub', 'KLYRO.md'), '# sub-level', 'utf-8');
+    await fs.writeFile(path.join(tmp, 'sub', 'leaf', 'AGENTS.md'), '# leaf-level', 'utf-8');
+    const files = await loadKlyroMdForPath(tmp, path.join(tmp, 'sub', 'leaf', 'file.ts'));
+    const texts = files.map((f) => f.content).join('\n');
+    expect(texts).toContain('root');
+    expect(texts).toContain('sub-level');
+    expect(texts).toContain('leaf-level');
+  });
+
+  it('plain loadKlyroMdFiles does NOT load subdir files (laziness)', async () => {
+    await fs.mkdir(path.join(tmp, 'sub'), { recursive: true });
+    await fs.writeFile(path.join(tmp, 'sub', 'KLYRO.md'), '# sub-only', 'utf-8');
+    const files = await loadKlyroMdFiles(tmp);
+    expect(files.map((f) => f.content).join('\n')).not.toContain('sub-only');
+  });
+
+  it('loadKlyroMdForPath rejects a targetPath escaping cwd', async () => {
+    await fs.mkdir(path.join(tmp, 'sub'), { recursive: true });
+    await fs.writeFile(path.join(tmp, 'sub', 'KLYRO.md'), '# sub-only', 'utf-8');
+    const files = await loadKlyroMdForPath(tmp, path.join(os.tmpdir(), 'escape-target.txt'));
+    expect(files.map((f) => f.content).join('\n')).not.toContain('sub-only');
   });
 });

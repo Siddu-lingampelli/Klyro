@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { resolveWithinCwd } from '../../policy/path-guard.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
+import { IgnoreFilter } from './ignore.js';
 
 const InputSchema = z.object({
   pattern: z.string().min(1).describe('JavaScript regular expression (not ripgrep syntax)'),
@@ -66,41 +67,47 @@ export const grepTool = defineTool({
       const hits: GrepHit[] = [];
       let searched = 0;
       let truncated = false;
-      await walk(base, async (file) => {
-        if (hits.length >= max) {
-          truncated = true;
-          return;
-        }
-        if (incRe && !incRe.test(path.relative(base, file).split(path.sep).join('/'))) return;
-        const ext = path.extname(file).toLowerCase();
-        if (SKIP_EXT.has(ext)) return;
-        const stat = await fs.stat(file).catch(() => null);
-        if (!stat || stat.size > DEFAULT_MAX_FILE_BYTES) return;
-        searched++;
-        const text = await fs.readFile(file, 'utf-8').catch(() => null);
-        if (text === null) return;
-        if (text.includes('\0')) return; // binary
-        const lines = text.split(/\r\n|\r|\n/);
-        for (let i = 0; i < lines.length && hits.length < max; i++) {
-          const line = lines[i];
-          if (line === undefined) continue;
-          re.lastIndex = 0;
-          if (re.test(line)) {
-            const hit: GrepHit = {
-              file: path.relative(ctx.cwd, file),
-              line: i + 1,
-              text: line,
-            };
-            if (ctxLines > 0) {
-              hit.context = {
-                before: lines.slice(Math.max(0, i - ctxLines), i),
-                after: lines.slice(i + 1, i + 1 + ctxLines),
-              };
-            }
-            hits.push(hit);
+      const ignore = await IgnoreFilter.load(ctx.cwd);
+      await walk(
+        base,
+        async (file) => {
+          if (hits.length >= max) {
+            truncated = true;
+            return;
           }
-        }
-      });
+          if (incRe && !incRe.test(path.relative(base, file).split(path.sep).join('/'))) return;
+          const ext = path.extname(file).toLowerCase();
+          if (SKIP_EXT.has(ext)) return;
+          const stat = await fs.stat(file).catch(() => null);
+          if (!stat || stat.size > DEFAULT_MAX_FILE_BYTES) return;
+          searched++;
+          const text = await fs.readFile(file, 'utf-8').catch(() => null);
+          if (text === null) return;
+          if (text.includes('\0')) return; // binary
+          const lines = text.split(/\r\n|\r|\n/);
+          for (let i = 0; i < lines.length && hits.length < max; i++) {
+            const line = lines[i];
+            if (line === undefined) continue;
+            re.lastIndex = 0;
+            if (re.test(line)) {
+              const hit: GrepHit = {
+                file: path.relative(ctx.cwd, file),
+                line: i + 1,
+                text: line,
+              };
+              if (ctxLines > 0) {
+                hit.context = {
+                  before: lines.slice(Math.max(0, i - ctxLines), i),
+                  after: lines.slice(i + 1, i + 1 + ctxLines),
+                };
+              }
+              hits.push(hit);
+            }
+          }
+        },
+        ignore,
+        ctx.cwd,
+      );
       return { pattern: input.pattern, hits, truncated, searchedFiles: searched } satisfies GrepOutput;
     });
   },
@@ -116,7 +123,7 @@ function globToRegex(g: string): RegExp {
   return new RegExp(`^${escaped}$`);
 }
 
-async function walk(dir: string, visit: (f: string) => Promise<void>): Promise<void> {
+async function walk(dir: string, visit: (f: string) => Promise<void>, ignore?: IgnoreFilter, cwd?: string): Promise<void> {
   let names: string[];
   try {
     names = await fs.readdir(dir);
@@ -126,6 +133,10 @@ async function walk(dir: string, visit: (f: string) => Promise<void>): Promise<v
   for (const name of names) {
     if (SKIP_DIRS.has(name)) continue;
     const full = path.join(dir, name);
+    if (ignore && cwd) {
+      const relToCwd = path.relative(cwd, full);
+      if (ignore.ignores(relToCwd)) continue;
+    }
     let isDir = false;
     try {
       const s = await fs.lstat(full);
@@ -134,7 +145,7 @@ async function walk(dir: string, visit: (f: string) => Promise<void>): Promise<v
     } catch {
       continue;
     }
-    if (isDir) await walk(full, visit);
+    if (isDir) await walk(full, visit, ignore, cwd);
     else await visit(full);
   }
 }

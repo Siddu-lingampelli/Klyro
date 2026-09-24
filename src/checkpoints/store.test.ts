@@ -130,6 +130,32 @@ describe('checkpoints', () => {
     expect(await listCheckpoints(tmp)).not.toContain(`${id}.diff`);
   });
 
+  it('persists sessionId/eventId into .meta.json when provided', async () => {
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'v1', 'utf-8');
+    const id = await snapshot(tmp, ['a.txt'], { sessionId: 'sess-1', eventId: 'evt-9' });
+    const meta = JSON.parse(
+      await fs.readFile(path.join(tmp, '.klyro', 'checkpoints', id, '.meta.json'), 'utf-8'),
+    ) as { sessionId?: string; eventId?: string };
+    expect(meta.sessionId).toBe('sess-1');
+    expect(meta.eventId).toBe('evt-9');
+  });
+
+  it('old metas without ids still load (undo/list/snapshotFiles)', async () => {
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'v1', 'utf-8');
+    const id = await snapshot(tmp, ['a.txt']);
+    // Simulate a pre-ids meta: strip any id fields.
+    const metaPath = path.join(tmp, '.klyro', 'checkpoints', id, '.meta.json');
+    const meta = JSON.parse(await fs.readFile(metaPath, 'utf-8')) as Record<string, unknown>;
+    delete meta.sessionId;
+    delete meta.eventId;
+    await fs.writeFile(metaPath, JSON.stringify(meta), 'utf-8');
+    expect(await snapshotFiles(tmp, id)).toContain('a.txt');
+    expect((await listCheckpointInfo(tmp)).length).toBe(1);
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'v2', 'utf-8');
+    await undo(tmp, 1);
+    expect(await fs.readFile(path.join(tmp, 'a.txt'), 'utf-8')).toBe('v1');
+  });
+
   it('locks down snapshot content + meta to 0600 and ckpt dir to 0700 (POSIX)', async () => {
     const p = path.join(tmp, 'a.txt');
     await fs.writeFile(p, 'v1', 'utf-8');

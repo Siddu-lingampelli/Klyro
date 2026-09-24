@@ -17,6 +17,7 @@ import { defineTool } from '../types.js';
 import { resolveWithinCwd } from '../../policy/path-guard.js';
 import { safe } from '../normalize.js';
 import { globToRegex } from './glob.js';
+import { IgnoreFilter } from './ignore.js';
 
 const InputSchema = z.object({
   query: z.string().optional().describe('Substring or regex to match against file paths (case-insensitive)'),
@@ -46,19 +47,23 @@ function queryToRegex(query: string): RegExp {
   return new RegExp(escaped, 'i');
 }
 
-async function walk(root: string, dir: string, onFile: (full: string) => Promise<void>): Promise<void> {
+async function walk(root: string, dir: string, onFile: (full: string) => Promise<void>, ignore?: IgnoreFilter, cwd?: string): Promise<void> {
   let names: string[];
   try { names = await fs.readdir(dir); } catch { return; }
   for (const name of names) {
     if (SKIP_DIRS.has(name)) continue;
     const full = path.join(dir, name);
+    if (ignore && cwd) {
+      const relToCwd = path.relative(cwd, full);
+      if (ignore.ignores(relToCwd)) continue;
+    }
     let isDir = false;
     try {
       const s = await fs.lstat(full);
       if (s.isSymbolicLink()) continue;
       isDir = s.isDirectory();
     } catch { continue; }
-    if (isDir) await walk(root, full, onFile);
+    if (isDir) await walk(root, full, onFile, ignore, cwd);
     else await onFile(full);
   }
 }
@@ -77,11 +82,15 @@ export const searchFilesTool = defineTool({
 
       const candidates: RankedFile[] = [];
       const now = Date.now();
+      const ignore = await IgnoreFilter.load(ctx.cwd);
 
-      await walk(base, base, async (full) => {
-        const rel = path.relative(ctx.cwd, full).split(path.sep).join('/');
-        if (globRe && !globRe.test(rel)) return;
-        if (matcher && !matcher.test(rel)) return;
+      await walk(
+        base,
+        base,
+        async (full) => {
+          const rel = path.relative(ctx.cwd, full).split(path.sep).join('/');
+          if (globRe && !globRe.test(rel)) return;
+          if (matcher && !matcher.test(rel)) return;
 
         let mtimeMs = 0;
         try {
@@ -104,7 +113,7 @@ export const searchFilesTool = defineTool({
         score += Math.max(0, 30 - ageDays);
 
         candidates.push({ path: rel, score, mtimeMs, firstParty });
-      });
+      }, ignore, ctx.cwd);
 
       candidates.sort((a, b) => b.score - a.score);
       const truncated = candidates.length > max;

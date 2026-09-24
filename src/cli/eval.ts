@@ -46,8 +46,9 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout, stderr } from 'node:process';
-import { run, type RunResult, type VerifyMode } from '../agent/runtime.js';
+import { run, estimateCost, type RunResult, type VerifyMode } from '../agent/runtime.js';
 import type { ProviderAdapter, StreamEvent } from '../agent/provider-adapter.js';
+import { applyAutoAnswer } from './args.js';
 import { builtinRegistry } from '../tools/registry.js';
 import { builtinRules, DEFAULT_POLICY_CONFIG, PolicyEngine } from '../policy/engine.js';
 import { DenyAllApprovalPrompt } from '../policy/approval.js';
@@ -84,6 +85,16 @@ export interface EvalResult {
   judge?: { pass: boolean; notes: string; skipped: boolean };
   /** Isolated workdir the scenario ran in (tmp unless --cwd). Debugging aid. */
   workDir?: string;
+  /** 5.4a — provider token usage for the scenario run. */
+  tokens?: { input: number; output: number };
+  /** 5.4a — estimated USD cost (runtime pricing helper, same rates as budgets). */
+  costUsd?: number;
+  /** 5.4a — distinct file paths referenced by tool-call inputs (best-effort). */
+  filesTouched?: string[];
+  /** 5.4a — verification outcome passthrough. */
+  verification?: { ok: boolean; attempts: number };
+  /** 5.4a — repair count passthrough. */
+  repairs?: number;
 }
 
 export interface RunEvalOptions {
@@ -102,9 +113,30 @@ export interface RunEvalOptions {
    * touch the caller's directory. Pass explicitly to inspect artifacts.
    */
   cwd?: string;
+  /**
+   * 5.3 — `--auto-answer <text>`: sets `KLYRO_AUTO_ANSWER` before the run
+   * starts so headless `ask_user` calls resolve without prompting.
+   */
+  autoAnswer?: string;
+}
+
+/**
+ * 5.5a — curated stable subset of `evals/fixtures` for `--suite core`.
+ * Every entry has task.md + check.sh (verified 2026-09-24).
+ */
+export const CORE_SUITE_FIXTURES = ['read-answer', 'add-fn-test', 'fix-failing-test', 'rename', 'cli-flag'];
+
+/**
+ * Filter directory names down to the core suite (in curated order).
+ * Exported for tests.
+ */
+export function selectCoreFixtures(entries: string[]): string[] {
+  return CORE_SUITE_FIXTURES.filter((id) => entries.includes(id));
 }
 
 export async function runEval(opts: RunEvalOptions): Promise<number> {
+  // 5.3 — --auto-answer sets KLYRO_AUTO_ANSWER before anything runs.
+  applyAutoAnswer(opts.autoAnswer);
   // Live judge adapter (shared by suite + JSONL paths) for `judge.rubric`.
   let judgeAdapter: ProviderAdapter | undefined;
   if (opts.judgeModel) {
@@ -120,6 +152,7 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
   }
   // 5.4 — suite mode: load from evals/fixtures
   if (opts.suite) {
+    const suiteStart = Date.now();
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
     // For smoke, use the 10 fixtures directly
@@ -129,8 +162,11 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
       const entries = await fs.readdir(fixturesDir);
       for (const e of entries) {
         if (opts.filter && !e.includes(opts.filter)) continue;
+        // 5.5a — core = curated stable subset (see CORE_SUITE_FIXTURES).
+        if (opts.suite === 'core') {
+          if (!CORE_SUITE_FIXTURES.includes(e)) continue;
         // 6.5 — suite filter: smoke = type smoke, l6 = prefix l6-introduce
-        if (opts.suite && opts.suite !== 'smoke') {
+        } else if (opts.suite && opts.suite !== 'smoke') {
           if (!e.startsWith(opts.suite) && !e.includes(opts.suite)) continue;
         } else if (opts.suite === 'smoke') {
           try {
@@ -184,6 +220,16 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
       await fs.mkdir(outDir, { recursive: true });
       const ts = new Date().toISOString().replace(/[:.]/g, '-');
       await fs.writeFile(path.join(outDir, `${ts}.json`), JSON.stringify({ suite: opts.suite, results }, null, 2));
+      // 5.5b — refresh the tracked baseline with environment metadata.
+      const { collectBaselineMetadata, buildEvalBaseline, writeEvalBaseline } = await import('../eval/baseline.js');
+      const meta = collectBaselineMetadata({ model: opts.model });
+      await writeEvalBaseline(outDir, buildEvalBaseline(meta, {
+        suite: opts.suite ?? '',
+        total: results.length,
+        passed,
+        failed: results.length - passed,
+        durationMs: Date.now() - suiteStart,
+      }));
     } catch { /* ignore */ }
     return passed === results.length ? 0 : 1;
   }
@@ -208,6 +254,13 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
       const tag = r.passed ? 'PASS' : 'FAIL';
       stdout.write(`[${tag}] ${r.name} (${r.durationMs}ms, ${r.steps} steps, ${r.toolCalls} tools)\n`);
       for (const f of r.failures) stdout.write(`         - ${f}\n`);
+      // 5.4a — rich record extras (tokens/cost/files/verification).
+      const extras: string[] = [];
+      if (r.tokens) extras.push(`${r.tokens.input} in/${r.tokens.output} out`);
+      if (r.costUsd !== undefined) extras.push(`$${r.costUsd.toFixed(4)}`);
+      if (r.filesTouched && r.filesTouched.length > 0) extras.push(`${r.filesTouched.length} files`);
+      if (r.verification) extras.push(`verify:${r.verification.ok ? 'ok' : 'fail'}`);
+      if (extras.length > 0) stdout.write(`         · ${extras.join(' · ')}\n`);
     }
   }
 
@@ -380,5 +433,38 @@ export async function runScenario(
     durationMs: 0,
     workDir: cwd,
     ...(judge ? { judge } : {}),
+    // 5.4a — rich records mapped from RunResult (cost reuses the runtime
+    // pricing helper, the same rates the budget code uses).
+    tokens: { input: result.usage.input, output: result.usage.output },
+    costUsd: estimateCost(model, result.usage),
+    filesTouched: collectFilesTouched(result.transcript),
+    ...(result.verification
+      ? { verification: { ok: result.verification.ok, attempts: result.verification.attempts } }
+      : {}),
+    ...(result.repairs !== undefined ? { repairs: result.repairs } : {}),
   };
+}
+
+/**
+ * 5.4a — best-effort distinct file paths from tool-call inputs in a run
+ * transcript. Looks for common path-ish keys on `tool_use` blocks.
+ * Exported for tests.
+ */
+const FILE_PATH_KEYS = ['path', 'file', 'filePath', 'filename', 'target'];
+export function collectFilesTouched(transcript: RunResult['transcript']): string[] {
+  const seen = new Set<string>();
+  for (const m of transcript) {
+    for (const b of m.content) {
+      if (b.kind !== 'tool_use') continue;
+      const input = b.input as Record<string, unknown>;
+      for (const k of FILE_PATH_KEYS) {
+        const v = input[k];
+        if (typeof v === 'string' && v.length > 0) seen.add(v);
+        else if (Array.isArray(v)) {
+          for (const e of v) if (typeof e === 'string' && e.length > 0) seen.add(e);
+        }
+      }
+    }
+  }
+  return [...seen].sort();
 }

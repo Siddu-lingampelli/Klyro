@@ -3,6 +3,7 @@ import React from 'react';
 import { render } from 'ink-testing-library';
 import { App } from './app.js';
 import type { TranscriptItem } from './transcript.js';
+import type { PlanStep } from '../agent/runtime.js';
 import type { StatusSnapshot } from './status.js';
 import type { SlashCommand } from '../cli/slash/parser.js';
 
@@ -320,9 +321,9 @@ describe('App', () => {
         initialTranscript={makeInitialTranscript(25)}
       />,
     );
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 200));
     stdin.write(KEY_HOME);
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 200));
     const g = globalThis as unknown as { __klyroAppAppend?: (i: TranscriptItem) => void };
     g.__klyroAppAppend!({
       id: 'late-1',
@@ -334,7 +335,7 @@ describe('App', () => {
     expect(lastFrame() ?? '').not.toMatch(/LATE-1-tag/);
     // End re-engages follow-tail and shows the new content.
     stdin.write(KEY_END);
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 200));
     const frame = lastFrame() ?? '';
     expect(frame).toMatch(/LATE-1-tag/);
   });
@@ -1127,6 +1128,22 @@ describe('App', () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(f2() ?? '').toContain(readVersion());
     expect(f2() ?? '').not.toContain('0.1.27');
+  });
+
+  it('shows the todo checklist when plan updates arrive (5.5c)', async () => {
+    const { lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
+    );
+    const g = globalThis as unknown as { __klyroAppPlan?: (p: PlanStep[]) => void };
+    for (let i = 0; i < 40 && !g.__klyroAppPlan; i++) await new Promise((r) => setTimeout(r, 25));
+    expect(g.__klyroAppPlan).toBeDefined();
+    g.__klyroAppPlan?.([
+      { id: '1', title: 'Read files', status: 'done' },
+      { id: '2', title: 'Edit code', status: 'in_progress' },
+    ]);
+    const frame = await waitForMatch(lastFrame, /Read files/);
+    expect(frame).toMatch(/Plan/);
+    expect(frame).toMatch(/Edit code/);
   });
 
   it('Shift+Up / Shift+Down scroll by one line', async () => {

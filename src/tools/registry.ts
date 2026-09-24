@@ -17,6 +17,8 @@ import { shellExecTool } from './shell/shell-exec.js';
 import { gitStatusTool } from './git/git-status.js';
 import { gitDiffTool } from './git/git-diff.js';
 import { gitLogTool } from './git/git-log.js';
+import { gitBlameTool } from './git/git-blame.js';
+import { gitShowTool } from './git/git-show.js';
 import { runVerifyTool } from './verify/run-verify.js';
 import { todoWriteTool } from './plan/todo-write.js';
 import { askUserTool } from './plan/ask-user.js';
@@ -114,6 +116,8 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(gitStatusTool);
   r.register(gitDiffTool);
   r.register(gitLogTool);
+  r.register(gitBlameTool);
+  r.register(gitShowTool);
   r.register(runVerifyTool);
   r.register(todoWriteTool);
   r.register(askUserTool);
