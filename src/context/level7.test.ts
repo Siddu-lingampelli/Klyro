@@ -85,4 +85,18 @@ describe('RuntimeTelemetry', () => {
     expect(s.lastToolCalls).toHaveLength(1);
     expect(s.lastToolCalls[0]?.isError).toBe(true);
   });
+
+  it('mute() disables accumulation and reporting (KLYRO_TELEMETRY=0)', () => {
+    const t = new RuntimeTelemetry();
+    t.mute();
+    expect(t.isMuted()).toBe(true);
+    const call = toolUse('c1', 'shell_exec', { command: 'echo hi' });
+    t.recordStepStart(3);
+    t.recordUsage(100, 50);
+    t.recordToolCall(call, 12, false);
+    t.recordError('boom');
+    expect(t.format()).toBe(emptyTelemetryBlock());
+    expect(t.snapshot().toolCallCount).toBe(0);
+    expect(t.snapshot().lastError).toBeNull();
+  });
 });

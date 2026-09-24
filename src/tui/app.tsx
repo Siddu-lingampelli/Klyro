@@ -291,6 +291,14 @@ export function App(props: AppProps): React.JSX.Element {
     setHistory((prev) => (prev[prev.length - 1] === v ? prev : [...prev.slice(-99), v]));
     setHistIdx(null);
   }, []);
+  // Ctrl+R reverse-i-search over input history (1.4): {query, saved, idx}
+  // with idx into newest-first matches (-1 = query only, nothing chosen).
+  const [histSearch, setHistSearch] = useState<{ query: string; saved: string; idx: number } | null>(null);
+  const searchMatches = useCallback((q: string): string[] => {
+    const query = q.toLowerCase();
+    const matches = (query === '' ? history : history.filter((h) => h.toLowerCase().includes(query)));
+    return matches.slice().reverse();
+  }, [history]);
   // design.md §18: Ctrl+C cancels the run first, exits on second press.
   const ctrlCArmed = useRef(false);
   useEffect(() => {
@@ -516,7 +524,6 @@ export function App(props: AppProps): React.JSX.Element {
       out.push({ key: 'tail:queued', desc: { kind: 'queued', count: queuedInputs.length }, groupIndex: null, tail: 'queued' });
     }
     return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [grouped, plan, status.status, queuedInputs.length, expandedGroups, width]);
 
   const blockKeys = useMemo(() => blocks.map((b) => b.key), [blocks]);
@@ -767,6 +774,48 @@ export function App(props: AppProps): React.JSX.Element {
       setVimCursor(null);
       return;
     }
+    // Ctrl+R reverse-i-search over input history (1.4). While active, typing
+    // filters newest-first, ↑/↓ (or repeated Ctrl+R) cycle matches, Enter
+    // accepts into the buffer, Esc/Ctrl+C restores the saved input.
+    if (histSearch && !awaitingApproval) {
+      // idx into newest-first matches; -1 shows the raw query text.
+      const applyQuery = (query: string, idx: number): void => {
+        const m = searchMatches(query);
+        const i = m.length === 0 ? -1 : Math.max(-1, Math.min(idx, m.length - 1));
+        setHistSearch({ query, saved: histSearch.saved, idx: i });
+        setInput(i === -1 ? query : (m[i] ?? query));
+        setVimCursor(null);
+      };
+      if (key.escape || (key.ctrl && inputStr === 'c')) {
+        setInput(histSearch.saved);
+        setHistIdx(null);
+        setHistSearch(null);
+        setVimCursor(null);
+        return;
+      }
+      if (key.return) { setHistSearch(null); setHistIdx(null); setVimCursor(null); return; }
+      if ((key.upArrow && !key.shift && !key.ctrl) || (key.ctrl && (inputStr === 'p' || inputStr === 'r'))) {
+        applyQuery(histSearch.query, histSearch.idx + 1); // older (clamped)
+        return;
+      }
+      if ((key.downArrow && !key.shift && !key.ctrl) || (key.ctrl && inputStr === 'n')) {
+        applyQuery(histSearch.query, histSearch.idx - 1); // newer, -1 → query
+        return;
+      }
+      if (key.backspace || key.delete) {
+        applyQuery(histSearch.query.slice(0, -1), 0);
+        return;
+      }
+      if (!key.ctrl && !key.meta && inputStr) { applyQuery(histSearch.query + inputStr, 0); return; }
+      return;
+    }
+    if (key.ctrl && inputStr === 'r' && !awaitingApproval && vimMode === 'insert') {
+      setHistSearch({ query: '', saved: input, idx: -1 });
+      setInput('');
+      setHistIdx(null);
+      setVimCursor(null);
+      return;
+    }
     // Scroll keys (work in any mode, including while running).
     // scroll.md §6 flow: Keyboard → getTranscriptCommand → handle.
     // design.md §11: PageUp/Ctrl+U half-up, PageDown/Ctrl+D half-down,
@@ -883,6 +932,13 @@ export function App(props: AppProps): React.JSX.Element {
         return;
       }
     }
+    // Ctrl+L (1.4): clear the input buffer if typing, else jump to the live
+    // tail. Never touches the transcript — use /clear for that.
+    if (key.ctrl && inputStr === 'l') {
+      if (input.trim() !== '') { setInput(''); setVimCursor(null); setHistIdx(null); }
+      else if (isFullscreen && maxTop > 0) { commands.jumpBottom(); }
+      return;
+    }
     if (status.status === 'running') {
       // design.md §18: first Ctrl+C cancels the run, second quits.
       if (key.ctrl && inputStr === 'c') {        if (!ctrlCArmed.current) {
@@ -920,7 +976,7 @@ export function App(props: AppProps): React.JSX.Element {
     // ↑/↓ are history keys, always (§8.3): ↑ browses older prompts
     // newest-first (empty history → no-op), ↓ browses back newer. Neither
     // ever scrolls the transcript — scrolling is PgUp/PgDn, Ctrl+U/D/B/F,
-    // Shift+↑/↓, Home/End, Space, or the wheel (KLYRO_MOUSE=1). Ctrl+P /
+    // Shift+↑/↓, Home/End, Space, or the wheel. Ctrl+P /
     // Ctrl+N are escape-free aliases for the same history moves.
     const wantHistPrev = (key.upArrow && !key.shift && !key.ctrl) || (key.ctrl && inputStr === 'p');
     const wantHistNext = (key.downArrow && !key.shift && !key.ctrl) || (key.ctrl && inputStr === 'n');
@@ -952,7 +1008,6 @@ export function App(props: AppProps): React.JSX.Element {
 
   // Single source of truth: package.json via version.ts — never hardcoded.
   const ver = props.version ?? readVersion();
-  const rule = g('rule').repeat(Math.max(10, width - 2));
   // Single cost/context source: model-aware registry rates + window.
   const cost = estimateCost(status.model, status.usageInput, status.usageOutput);
   const totalTokens = status.usageInput + status.usageOutput;
@@ -960,12 +1015,15 @@ export function App(props: AppProps): React.JSX.Element {
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / ctxWindow) * 100) : 0;
   // Narrow terminals: compact hints so the status bar never wraps mid-word.
   // An armed first-Esc surfaces here so the operator knows the second cancels.
-  const baseHints = escArmed && status.status === 'running'
+  const baseHints = histSearch !== null
+    ? `reverse-i-search \`${histSearch.query}\` · type to filter · ↑/↓ cycle · enter accept · esc cancel`
+    : escArmed && status.status === 'running'
     ? 'press esc again to cancel'
     : width < 90
       ? status.status === 'running' ? 'ctrl+c stop · enter queue' : 'enter send · / commands'
       : status.status === 'running' ? 'ctrl+c to stop  ·  enter to queue  ·  ctrl+o expand' : transcript.length === 0 ? 'shift+tab to cycle  ·  ↑/↓ for history  ·  / for commands' : 'enter to send  ·  shift+enter newline  ·  @ to attach';
-  const hints = maxTop > 0 && isFullscreen ? `${baseHints}  ·  PgUp/Dn scroll` : baseHints;
+
+  // I1 structural guard:
 
   // I1 structural guard: the frame can never exceed terminal rows. Even if a
   // child mis-measures, the root clips — the input/status stay on screen and

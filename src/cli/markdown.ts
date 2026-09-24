@@ -40,7 +40,7 @@ export function renderMarkdown(md: string, opts: { width?: number; isTTY?: boole
   const lines = md.split('\n');
   let inCodeBlock = false;
   let fenceLang = '';
-  for (let line of lines) {
+  for (const line of lines) {
     if (line.startsWith('```')) {
       if (!inCodeBlock) fenceLang = line.replace(/^```/, '').trim().toLowerCase();
       inCodeBlock = !inCodeBlock;

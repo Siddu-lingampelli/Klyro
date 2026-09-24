@@ -73,3 +73,22 @@ describe('provider URL contract', () => {
     expect(inferProviderId('https://unknown.example/v1')).toBeUndefined();
   });
 });
+
+describe('model aliases + OpenRouter preset (2.2)', () => {
+  it('resolves short names against the registry, passes others through', async () => {
+    const { resolveModelAlias } = await import('./model-info.js');
+    expect(resolveModelAlias('sonnet')).toBe('claude-3-5-sonnet-20240620');
+    expect(resolveModelAlias('opus')).toBe('claude-3-5-sonnet-20240620');
+    expect(resolveModelAlias('haiku')).toBe('claude-3-haiku-20240307');
+    expect(resolveModelAlias('gpt')).toBe('gpt-4o-mini');
+    expect(resolveModelAlias('local')).toBe('local-model');
+    expect(resolveModelAlias('SONNET')).toBe('claude-3-5-sonnet-20240620');
+    expect(resolveModelAlias('gpt-4o')).toBe('gpt-4o');
+    expect(resolveModelAlias('some-future-model')).toBe('some-future-model');
+  });
+
+  it('registers the OpenRouter preset', async () => {
+    const { getEndpoint } = await import('./endpoints.js');
+    expect(getEndpoint('openrouter')?.baseURL).toBe('https://openrouter.ai/api/v1');
+  });
+});

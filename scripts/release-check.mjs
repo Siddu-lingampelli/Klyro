@@ -45,9 +45,14 @@ run(['--help']);
 // so this gate checks the CLI against itself to catch accidental command
 // loss during refactors (e.g. module extraction dropping a registration).
 const help = run(['--help']);
-const requiredVerbs = ['tui', 'run', 'chat', 'eval', 'eval:compare', 'session', 'sessions', 'resume', 'scan', 'project', 'mcp', 'hooks', 'agents', 'commit', 'audit', 'benchmark', 'doctor', 'config', 'login', 'logout', 'init', 'completion', 'update'];
+const requiredVerbs = ['tui', 'run', 'chat', 'eval', 'eval:compare', 'session', 'sessions', 'resume', 'scan', 'project', 'mcp', 'hooks', 'agents', 'commit', 'audit', 'benchmark', 'doctor', 'config', 'login', 'logout', 'init', 'completion', 'update', 'version', 'help'];
 const missing = requiredVerbs.filter((v) => !new RegExp(`^\\s{2}${v.replace(':', ':')}(?:\\s|\\[|<|$)`, 'm').test(help));
 if (missing.length > 0) fail(`CLI registration drift: missing ${missing.join(', ')}`);
+
+// `version` command must agree with `--version` (1.2); implicit `help`
+// command must render a command's help.
+if (run(['version']).trim() !== version) fail('`klyro version` disagrees with `--version`');
+if (!run(['help', 'run']).includes('one-shot')) fail('implicit `help` command broken');
 
 run(['eval', '--suite', 'smoke', '--runs', '1', '--parallel', '1']);
 

@@ -149,7 +149,9 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
   if (ext === '.ts' || ext === '.js' || ext === '.mjs' || ext === '.cjs') {
     // Use tsc transpileModule if available, else node --check for js
     try {
-      const content = fs.readFileSync(full, 'utf-8');
+      // Existence/readability probe — the tsc/node check below reports
+      // real diagnostics; a missing file fails there, not here.
+      fs.readFileSync(full, 'utf-8');
       // minimal check: try to parse via new Function (for js) or just check no obvious syntax error via tsc
       // For now, use tsc --noEmit --skipLibCheck on single file quickly
       if (ext === '.ts') {
@@ -157,7 +159,7 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
           // S2: verify commands run with filtered env; servers needing keys must use explicit config.
           const child = spawn('npx', ['tsc', '--noEmit', '--skipLibCheck', full], { cwd, shell: false, env: filteredVerifyEnv() });
           let done = false;
-          const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 10_000);
+          const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch { /* ignore — best-effort kill */ } resolve(false); } }, 10_000);
           child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
           child.on('error', () => { if (done) return; done = true; clearTimeout(t); resolve(false); });
         });
@@ -168,7 +170,7 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
         // S2: verify commands run with filtered env; servers needing keys must use explicit config.
         const child = spawn(process.execPath, ['--check', full], { cwd, shell: false, env: filteredVerifyEnv() });
         let done = false;
-        const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 5000);
+        const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch { /* ignore — best-effort kill */ } resolve(false); } }, 5000);
         child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
         child.on('error', () => { if (done) return; done = true; clearTimeout(t); resolve(false); });
       });
@@ -183,7 +185,7 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
       // S2: verify commands run with filtered env; servers needing keys must use explicit config.
       const child = spawn('python', ['-m', 'py_compile', full], { cwd, shell: false, env: filteredVerifyEnv() });
       let done = false;
-      const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch {} resolve(false); } }, 5000);
+      const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch { /* ignore — best-effort kill */ } resolve(false); } }, 5000);
       child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
       child.on('error', () => { if (done) return; done = true; clearTimeout(t); resolve(true); });
     });

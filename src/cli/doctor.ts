@@ -7,7 +7,7 @@
 import * as fs from 'node:fs/promises';
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { getConfigPath, loadConfig } from './config.js';
 import { resolveProvider, providerHelp } from '../providers.js';
 import { getDefaultSessionsDir } from '../persistence/session.js';
@@ -125,6 +125,47 @@ async function checkSandbox(): Promise<Check> {
   }
 }
 
+function checkPackageManager(): Check {
+  try {
+    const npm = execFileSync('npm', ['--version'], { encoding: 'utf-8', timeout: 5000 }).trim();
+    return { name: 'npm', ok: true, detail: `npm ${npm} ✓` };
+  } catch {
+    return { name: 'npm', ok: false, detail: 'npm not on PATH — install Node ≥20' };
+  }
+}
+
+function checkPath(): Check {
+  const pathVar = process.env.PATH ?? process.env.Path ?? '';
+  const nodeDir = process.execPath.includes('\\') || process.execPath.includes('/')
+    ? process.execPath.slice(0, Math.max(process.execPath.lastIndexOf('\\'), process.execPath.lastIndexOf('/')))
+    : '';
+  const onPath = !!pathVar && !!nodeDir && pathVar.toLowerCase().split(path.delimiter).some((p) => p.toLowerCase() === nodeDir.toLowerCase());
+  return { name: 'PATH', ok: true, detail: onPath ? `node dir on PATH ✓` : `node dir not on PATH (${nodeDir || 'unknown'}) — child shells may miss node` };
+}
+
+function checkRipgrep(): Check {
+  try {
+    const v = execFileSync('rg', ['--version'], { encoding: 'utf-8', timeout: 5000 }).trim().split('\n')[0] ?? '';
+    return { name: 'ripgrep', ok: true, detail: `${v} ✓` };
+  } catch {
+    return { name: 'ripgrep', ok: true, detail: 'not found — built-in grep tool is used instead' };
+  }
+}
+
+function checkTerminal(): Check {
+  const isTTY = !!process.stdout.isTTY;
+  const term = process.env.TERM ?? '(unset)';
+  const cols = process.stdout.columns ?? 0;
+  return { name: 'Terminal', ok: true, detail: `${isTTY ? 'TTY' : 'non-TTY (headless/pipe mode)'}, TERM=${term}, cols=${cols}` };
+}
+
+function checkProxy(): Check {
+  const vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy']
+    .filter((k) => process.env[k] && (process.env[k] as string).length > 0);
+  if (vars.length === 0) return { name: 'Proxy', ok: true, detail: 'no proxy env — direct connections' };
+  return { name: 'Proxy', ok: true, detail: `${vars.join(', ')} set — honored for provider/web/update fetches` };
+}
+
 async function checkMcp(cwd: string): Promise<Check> {
   try {
     const { loadMcpServers } = await import('../mcp/config.js');
@@ -171,14 +212,97 @@ async function checkTrust(): Promise<Check> {
   }
 }
 
+/**
+ * Pure byte interpreter for `doctor --keys` (unit-tested): names what a
+ * terminal delivered so broken arrow/paste/scroll input becomes provable
+ * fact instead of guesswork. Covers arrows, paging/home/end, Ctrl codes,
+ * bracketed-paste markers, and SGR/X10 mouse sequences.
+ */
+export function describeKeyBytes(chunk: Buffer): string {
+  const s = chunk.toString('latin1');
+  switch (s) {
+    case '\x1b[A': return 'Up arrow (history prev)';
+    case '\x1b[B': return 'Down arrow (history next)';
+    case '\x1b[C': return 'Right arrow';
+    case '\x1b[D': return 'Left arrow';
+    case '\x1b[5~': return 'PageUp (scroll half-page up)';
+    case '\x1b[6~': return 'PageDown (scroll half-page down)';
+    case '\x1b[H': case '\x1b[1~': return 'Home (jump top)';
+    case '\x1b[F': case '\x1b[4~': return 'End (jump bottom)';
+    case '\x1b[Z': return 'Shift+Tab';
+    case '\r': case '\n': return 'Enter';
+    case '\x7f': return 'Backspace';
+    case '\x1b': return 'Escape (lone — arrow/paste sequences arrive joined; lone ESC means the terminal split them or you pressed Esc)';
+    case '\x1b[200~': return 'Bracketed-paste START (terminal supports bulk paste)';
+    case '\x1b[201~': return 'Bracketed-paste END';
+    case '\x03': return 'Ctrl+C';
+    case '\x10': return 'Ctrl+P (history prev, escape-free)';
+    case '\x0e': return 'Ctrl+N (history next, escape-free)';
+    case '\x15': return 'Ctrl+U (scroll half-page up)';
+    case '\x04': return 'Ctrl+D (scroll half-page down)';
+    case '\x09': return 'Tab';
+  }
+  // eslint-disable-next-line no-control-regex -- intentional: parsing SGR mouse sequences requires ESC matching
+  if (/^\x1b\[<\d+;\d+;\d+[Mm]$/.test(s)) {
+    const cb = Number(s.slice(3).split(';')[0]);
+    return (cb & 64) !== 0
+      ? `Mouse wheel ${(cb & 1) === 0 ? 'up' : 'down'} (reporting active)`
+      : 'Mouse click/drag (reporting active — plain selection needs Shift+drag)';
+  }
+  // eslint-disable-next-line no-control-regex -- intentional: parsing X10 mouse sequences requires ESC matching
+  if (/^\x1b\[M...$/.test(s)) return 'Mouse event, X10 encoding (reporting active)';
+  if (/^[\x20-\x7e]+$/.test(s)) return `Printable text (${s.length} chars — typing/paste-as-typing works)`;
+  return 'Unrecognized sequence (terminal-specific — paste the bytes line into a bug report)';
+}
+
+/**
+ * Interactive key probe: raw-mode stdin echo of every chunk with its
+ * meaning. Proves what THIS terminal delivers for arrows, Ctrl+P/N,
+ * paste, and wheel — run it when TUI input misbehaves.
+ */
+export async function runKeysProbe(): Promise<number> {
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') {
+    process.stderr.write('klyro: doctor --keys needs an interactive terminal (stdin is not a TTY)\n');
+    return 2;
+  }
+  stdout.write('klyro doctor --keys — press keys, see exactly what your terminal sends.\n');
+  stdout.write('Try: ↑ ↓ PgUp PgDn Home End Ctrl+P Ctrl+N, then paste text, then scroll the wheel. Ctrl+C quits.\n');
+  stdin.setRawMode(true);
+  stdin.resume();
+  try {
+    await new Promise<void>((resolve) => {
+      const onData = (chunk: Buffer): void => {
+        const bytes = [...chunk].map((b) => (b as number).toString(16).padStart(2, '0')).join(' ');
+        stdout.write(`bytes: ${bytes}  →  ${describeKeyBytes(chunk)}\n`);
+        if (chunk.length === 1 && chunk[0] === 0x03) {
+          stdin.off('data', onData);
+          resolve();
+        }
+      };
+      stdin.on('data', onData);
+    });
+  } finally {
+    try { stdin.setRawMode(false); } catch { /* ignore */ }
+    try { stdin.pause(); } catch { /* ignore */ }
+  }
+  return 0;
+}
+
 export async function runDoctor(opts: { json?: boolean; cwd?: string } = {}): Promise<number> {
   const cwd = opts.cwd ?? process.cwd();
   const checks: Check[] = [];
   checks.push(checkNode());
+  checks.push(checkPackageManager());
+  checks.push(checkPath());
   checks.push(await checkConfig());
   checks.push(await checkProvider());
   checks.push(await checkSessions());
   checks.push(await checkGit());
+  checks.push(checkRipgrep());
+  checks.push(checkTerminal());
+  checks.push(checkProxy());
   checks.push(await checkTools());
   checks.push(checkPlatform());
   checks.push(await checkSandbox());

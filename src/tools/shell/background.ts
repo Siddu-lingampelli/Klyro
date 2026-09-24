@@ -3,7 +3,6 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import * as path from 'node:path';
 import { findBlockedReason, filteredEnv } from './shell-exec.js';
 
 interface Job {

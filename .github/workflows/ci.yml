@@ -23,6 +23,7 @@ jobs:
       # unused packages/shared workspace and is ignored by npm.
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run lint
       - run: npm test
       - run: npm run build
       - run: node dist/index.js --version

@@ -150,6 +150,29 @@ async function main(): Promise<void> {
     });
 
   program
+    .command('version')
+    .description('Print the version number')
+    .action(() => {
+      process.stdout.write(`${VERSION}\n`);
+    });
+
+  program
+    .command('help [command]')
+    .description('Print help (same as --help)')
+    .action(async (cmd?: string) => {
+      if (cmd) {
+        const target = program.commands.find((c) => c.name() === cmd);
+        if (!target) {
+          process.stderr.write(`klyro: unknown command: ${cmd}\n`);
+          process.exit(2);
+        }
+        target.outputHelp();
+        return;
+      }
+      program.outputHelp();
+    });
+
+  program
     .command('login')
     .description('Login and store API key (masked, 0600) — provider auto-select')
     .action(async () => {
@@ -195,7 +218,12 @@ async function main(): Promise<void> {
     .command('doctor')
     .description('Run diagnostics (node, config, provider, sessions, git, tools)')
     .option('--json', 'Output JSON')
-    .action(async (opts: { json?: boolean }) => {
+    .option('--keys', 'Interactive key probe: show raw bytes your terminal sends (arrows, paste, wheel)')
+    .action(async (opts: { json?: boolean; keys?: boolean }) => {
+      if (opts.keys) {
+        const { runKeysProbe } = await import('./cli/doctor.js');
+        process.exit(await runKeysProbe());
+      }
       const code = await runDoctor({ json: !!opts.json });
       process.exit(code);
     });
@@ -295,8 +323,16 @@ async function main(): Promise<void> {
     .description('Run a one-shot autonomous task. Streams text to stdout; tool calls to stderr.')
     .option('-m, --model <id>', 'Model id (default: env KLYRO_MODEL)')
     .option('--max-steps <n>', 'Max agent steps (default 30)', (v) => parsePositiveInt('--max-steps', v))
+    .option('--max-turns <n>', 'Alias for --max-steps (smaller wins when both are set)', (v) => parsePositiveInt('--max-turns', v))
     .option('--max-tokens <n>', 'Max output tokens per step', (v) => parsePositiveInt('--max-tokens', v))
     .option('--temperature <n>', 'Sampling temperature (0-2)', parseTemperature)
+    .option('--reasoning-effort <level>', 'Reasoning effort for reasoning models: low|medium|high')
+    .option('--system-prompt <text>', 'Replace the assembled system prompt wholesale')
+    .option('--append-system-prompt <text>', 'Extra instructions appended after the system prompt')
+    .option('--permission-mode <mode>', 'Policy mode: default|accept-edits|plan|auto')
+    .option('--allowed-tools <list>', 'Comma-separated tool names pre-approved for this run')
+    .option('--disallowed-tools <list>', 'Comma-separated tool names denied for this run (deny always wins)')
+    .option('--add-dir <path>', 'Extra sandbox directory (repeatable/comma-separated), like /add-dir')
     .option('--timeout <ms>', 'Request timeout in ms (default: env KLYRO_TIMEOUT_MS or 60000)', (v) => parsePositiveInt('--timeout', v))
     .option('--base-url <url>', 'Override KLYRO_BASE_URL')
     .option('--api-key <key>', 'Override KLYRO_API_KEY')
@@ -315,7 +351,9 @@ async function main(): Promise<void> {
     .option('--max-depth <n>', 'Max spawn depth for child agents (default 1)', (v) => parsePositiveInt('--max-depth', v))
     .option('--bare', 'Deterministic runs: skip MCP, hooks, memory/KLYRO.md/context, persistence')
     .action(async (prompt: string, opts: {
-      model?: string; maxSteps?: number; maxTokens?: number; temperature?: number;
+      model?: string; maxSteps?: number; maxTurns?: number; maxTokens?: number; temperature?: number;
+      reasoningEffort?: string; systemPrompt?: string; appendSystemPrompt?: string;
+      permissionMode?: string; allowedTools?: string; disallowedTools?: string; addDir?: string;
       timeout?: number; baseUrl?: string; apiKey?: string;
       output?: string; dryRun?: boolean; provider?: string; resume?: string;
       resumeSession?: string; verify?: boolean; verifyCommand?: string; verifyMode?: string; maxRepairs?: number; persist?: boolean; requireVerify?: boolean;
@@ -336,6 +374,16 @@ async function main(): Promise<void> {
         process.stderr.write(`klyro: invalid --verify-mode: ${opts.verifyMode} (expected strict|advisory|off)\n`);
         process.exit(2);
       }
+      const reasoningEffort = opts.reasoningEffort as 'low' | 'medium' | 'high' | undefined;
+      if (reasoningEffort !== undefined && reasoningEffort !== 'low' && reasoningEffort !== 'medium' && reasoningEffort !== 'high') {
+        process.stderr.write(`klyro: invalid --reasoning-effort: ${opts.reasoningEffort} (expected low|medium|high)\n`);
+        process.exit(2);
+      }
+      const permissionMode = opts.permissionMode as 'default' | 'accept-edits' | 'plan' | 'auto' | undefined;
+      if (permissionMode !== undefined && permissionMode !== 'default' && permissionMode !== 'accept-edits' && permissionMode !== 'plan' && permissionMode !== 'auto') {
+        process.stderr.write(`klyro: invalid --permission-mode: ${opts.permissionMode} (expected default|accept-edits|plan|auto)\n`);
+        process.exit(2);
+      }
       // Provider validation is handled inside runOnce (single source of truth)
       try {
         const code = await runOnce({
@@ -343,8 +391,16 @@ async function main(): Promise<void> {
           cwd: process.cwd(),
           model,
           maxSteps: opts.maxSteps,
+          maxTurns: opts.maxTurns,
           maxTokens: opts.maxTokens,
           temperature: opts.temperature,
+          reasoningEffort,
+          systemPromptText: opts.systemPrompt,
+          appendSystemPrompt: opts.appendSystemPrompt,
+          permissionMode,
+          allowedTools: opts.allowedTools,
+          disallowedTools: opts.disallowedTools,
+          addDir: opts.addDir,
           timeoutMs: opts.timeout,
           baseUrl: opts.baseUrl,
           apiKey: opts.apiKey,
@@ -716,7 +772,7 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   // Last-resort: anything that escaped the command handlers lands here.
-  // eslint-disable-next-line no-console
+   
   console.error(`klyro: ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 });

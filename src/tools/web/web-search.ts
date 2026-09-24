@@ -15,6 +15,7 @@ import { defineTool } from '../types.js';
 import { safe } from '../normalize.js';
 import { redact } from '../../policy/secret-redactor.js';
 import { fetchUrlDenialReason } from './web-fetch.js';
+import { proxiedFetch } from '../../shared/proxy.js';
 
 const InputSchema = z.object({
   query: z.string().min(1).max(500).describe('Search query'),
@@ -110,9 +111,10 @@ export const webSearchTool = defineTool({
       const onAbort = (): void => ctrl.abort(ctx.signal?.reason ?? new Error('aborted'));
       ctx.signal?.addEventListener('abort', onAbort, { once: true });
       try {
-        const res = await fetch(endpoint, {
+        const res = await proxiedFetch(endpoint, {
           signal: ctrl.signal,
           headers: { 'user-agent': 'klyro-web-search/1.0', accept: 'application/json' },
+          timeoutMs,
         });
         if (!res.ok) {
           return {

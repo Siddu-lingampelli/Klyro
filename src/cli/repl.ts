@@ -112,6 +112,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // sanitizeForPrompt in sibling-owned policy/approval.ts — intentionally
   // not imported; kept local to avoid coupling the REPL to that module).
   function sanitizeForPrompt(s: string): string {
+    // eslint-disable-next-line no-control-regex -- intentional: stripping C0 controls + CSI sequences
     return s.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\x1b\[[0-9;]*[A-Za-z]/g, '').slice(0, 120);
   }
   async function loadMcpTools(): Promise<void> {
@@ -197,7 +198,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // become fallback adapters for agent runs in this session. Live
   // /provider switches rebuild a single adapter (buildAdapter) and bypass
   // the chain — documented, not a bug.
-  let replFailoverAdapters: ReturnType<typeof buildAdapter>[] = [];
+  const replFailoverAdapters: ReturnType<typeof buildAdapter>[] = [];
   try {
     const { resolveProviderChain } = await import('./config.js');
     const chain = await resolveProviderChain(cwd);
@@ -387,11 +388,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   // ── Full-screen takeover like OpenCode — always when klyro in TTY (user explicitly wants it)
   // Scroll now works correctly via internal viewport, not native terminal scroll
   const isAltScreen = useTui && !!process.stdout.isTTY && process.env.KLYRO_NO_ALT !== '1';
-  // Mouse reporting is opt-in (KLYRO_MOUSE=1): when on, the terminal sends
-  // clicks/wheel to the app (wheel scrolls ±3 lines) but native text
-  // selection and right-click paste stop working. Default off so select to
-  // copy and right-click paste work out of the box; bracketed paste
-  // (keyboard paste) is unaffected and always enabled below.
+  // Mouse reporting is ON by default (opencode parity): the wheel scrolls
+  // the chat, clicks are swallowed by the app. That means plain mouse
+  // selection/right-click go to the app, not the terminal — use Shift+drag
+  // to select and Shift+right-click to paste, or set KLYRO_MOUSE=0 for fully
+  // native selection (then scroll with PgUp/PgDn, Ctrl+U/D, Shift+↑/↓,
+  // Home/End, Space). Bracketed (keyboard) paste is unaffected and always on.
   const mouseReporting = isAltScreen && isMouseReportingEnabled();
   const enterAlt = () => {
     if (!isAltScreen) return;
@@ -508,8 +510,9 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       consoleRing.push(line);
       if (consoleRing.length > 200) consoleRing.splice(0, consoleRing.length - 200);
       try {
+        // KLYRO_LOG_DIR relocates the debug log (1.5); default is ~/.klyro.
         const home = process.env.HOME ?? process.env.USERPROFILE ?? cwd;
-        const dir = nodePath.join(home, '.klyro');
+        const dir = process.env.KLYRO_LOG_DIR ?? nodePath.join(home, '.klyro');
         fsSync.mkdirSync(dir, { recursive: true });
         const logFile = nodePath.join(dir, 'debug.log');
         // Rotation: never let the debug log grow without bound (2 MiB cap).
@@ -709,6 +712,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
     } catch { /* silent */ }
   })();
 
+  // eslint-disable-next-line prefer-const -- single assignment, but `let` is required: declaration precedes this for TDZ-safe handler wiring.
   app = render(
     React.createElement(App, {
       initialModel: model,
@@ -758,6 +762,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
 
   // Install SIGINT handler only after app exists (avoids TDZ) and use once
   // On Ctrl+C in alt-screen, leave alt before exit so shell is restored
+  // eslint-disable-next-line prefer-const -- see above: declaration order is load-bearing.
   sigintHandler = () => {
     ac.abort();
     queuedStatus({ status: 'aborted' });
@@ -831,9 +836,6 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
         return;
       }
     }
-    let activeCallId: string | null = null;
-    let activeCallName: string | null = null;
-    let activeCallArgs = '';
     let runEndStatus = 'error';
     try {
       const result = await run(
@@ -866,12 +868,6 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
               queuedStatus({ status: 'running', errorMessage: undefined });
             } else if (ev.kind === 'checkpoint_saved') {
               queuedStatus({ status: 'running' });
-            } else if (ev.kind === 'tool_call_start') {
-              activeCallId = ev.id;
-              activeCallName = ev.name;
-              activeCallArgs = '';
-            } else if (ev.kind === 'tool_call_delta') {
-              activeCallArgs += ev.argsJson;
             } else if (ev.kind === 'tool_call_end') {
               pendingToolIds.add(ev.id);
               queuedAppend({
@@ -882,9 +878,6 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
                 args: JSON.stringify(ev.input, null, 2),
                 status: 'running',
               });
-              activeCallId = null;
-              activeCallName = null;
-              activeCallArgs = '';
             } else if (ev.kind === 'policy_decision') {
               queuedAppend({
                 id: `pol-${ev.id}-${Date.now()}`,
@@ -1281,8 +1274,6 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
       }
       case 'context': {
         const { renderContextBreakdown } = await import('./context.js');
-        // use last transcript via closure? approximate with empty
-        const { accounting } = await import('../context/accounting.js');
         const sys = '' ; // system prompt approx
         const breakdown = renderContextBreakdown(sys, []);
         queuedAppend({ id: `ctx-${Date.now()}`, kind: 'text', text: breakdown, role: 'assistant' });
@@ -2475,7 +2466,7 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
             '  Enter send · Shift+Enter newline · Tab complete slash · Esc drop queued / Esc×2 cancel run',
             '  Ctrl+C cancel (1st) / quit (2nd) · Ctrl+O expand last tool group · Ctrl+G jump bottom',
             '  PgUp/PgDn or Ctrl+U/Ctrl+D half-page · Ctrl+Home/End top/bottom · Home/End jump · Space jump to unread',
-            '  Ctrl+B/F page · Shift/Ctrl+↑/↓ line · ↑/↓ and Ctrl+P/N browse input history only · PgUp/Dn or Ctrl+U/D scroll · wheel scrolls with KLYRO_MOUSE=1',
+            '  Ctrl+B/F page · Shift/Ctrl+↑/↓ line · ↑/↓ and Ctrl+P/N browse input history only · wheel scrolls · PgUp/Dn or Ctrl+U/D scroll · KLYRO_MOUSE=0 for native selection',
             '  Text selection/copy and right-click paste work natively · Shift+Enter newline · /vim toggles vim input mode · /keymap <note> saves a display note',
           ].join('\n'),
         });

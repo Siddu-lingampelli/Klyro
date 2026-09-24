@@ -466,6 +466,59 @@ describe('App', () => {
     expect(lastFrame() ?? '').toContain('zzsecond#');
   });
 
+  it('Ctrl+R reverse-searches history; Enter accepts, Esc restores (1.4)', async () => {
+    const onPrompt = vi.fn(async () => {});
+    const { stdin, lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={onPrompt} onSlash={async () => {}} />,
+    );
+    stdin.write('fix login bug');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write('add logout button');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(onPrompt).toHaveBeenCalledTimes(2);
+    // Search for 'logout' + Enter accepts the match into the buffer
+    // (no submit); typing '!' must extend it in the input line only.
+    stdin.write('\x12');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('logout');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('\x0d');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('!');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').toContain('add logout button!');
+    // Esc cancels a fresh search and restores the pre-search buffer.
+    stdin.write('\x12');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('zzz');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('\x1b');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('?');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').not.toContain('zzz?');
+    expect(onPrompt).toHaveBeenCalledTimes(2); // searching never submits
+  });
+
+  it('Ctrl+L clears a non-empty input without submitting (1.4)', async () => {
+    const onPrompt = vi.fn(async () => {});
+    const { stdin, lastFrame } = render(
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={onPrompt} onSlash={async () => {}} />,
+    );
+    stdin.write('scratch that');
+    await new Promise((r) => setTimeout(r, 20));
+    stdin.write('\x0c');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('?');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(lastFrame() ?? '').not.toContain('scratch that');
+    expect(onPrompt).not.toHaveBeenCalled();
+  });
+
   it('/c shows top-6 suggestions and Tab completes', async () => {
     const { stdin, lastFrame } = render(
       <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
@@ -667,7 +720,7 @@ describe('App', () => {
     await waitForAbsent(lastFrame, /MSG-24-tag/);
     await waitForMatch(lastFrame, /MSG-14-tag/);
     handle!.runTranscriptCommand('messages_first');
-    let frame = await waitForMatch(lastFrame, /MSG-00-tag/);
+    const frame = await waitForMatch(lastFrame, /MSG-00-tag/);
     expect(frame).not.toMatch(/MSG-24-tag/);
     handle!.runTranscriptCommand('messages_last');
     await waitForMatch(lastFrame, /MSG-24-tag/);

@@ -9,7 +9,6 @@ import { cappedOutput } from '../shared/output-cap.js';
 import type { Failure, FailureType } from './detect.js';
 import { detect } from './detect.js';
 import type { BaselineResult } from './baseline.js';
-import type { VerifyResult } from './engine.js';
 
 export type FailureClass = 'introduced' | 'pre_existing' | 'flaky' | 'env';
 
@@ -65,7 +64,7 @@ export async function rerunOnce(cwd: string, command: string, timeoutMs = 45_000
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, shell: true, env: filteredVerifyEnv() });
     let done = false;
-    const t = setTimeout(() => { if (!done) { done = true; try { child.kill('SIGKILL'); } catch {} resolve(false); } }, timeoutMs);
+    const t = setTimeout(() => { if (!done) { done = true; try { child.kill('SIGKILL'); } catch { /* ignore — best-effort kill */ } resolve(false); } }, timeoutMs);
     child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
     child.on('error', () => { if (done) return; done = true; clearTimeout(t); resolve(false); });
   });
@@ -136,7 +135,7 @@ function execCaptureArgv(cwd: string, file: string, args: string[]): Promise<str
 const ASSERT_RE = /(?:expect\s*\(|assert\.|assert\(|should\.|chai\.)/;
 const SKIP_RE = /(?:\.skip\(|\.todo\(|xdescribe\(|xit\(|xtest\(|@pytest\.mark\.skip|pytest\.skip|:\s*skip\b)/i;
 
-export function guardRepair(diff: string, editedFiles: string[]): { blocked: boolean; reason?: string } {
+export function guardRepair(diff: string, _editedFiles: string[]): { blocked: boolean; reason?: string } {
   if (!diff) return { blocked: false };
   const addedLines = diff.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++'));
   const touchesAssert = addedLines.some((l) => ASSERT_RE.test(l));

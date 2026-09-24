@@ -49,7 +49,7 @@ export const readFileTool = defineTool<z.infer<typeof InputSchema>, ReadFileOutp
   renderResult: (output) => `${output.path} (${output.totalLines} lines, ${output.bytesRead} bytes${output.truncated ? ' truncated' : ''})`,
   execute: async (input, ctx) => {
     return safe(async () => {
-      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
       const stat = await fs.stat(resolved);
       if (!stat.isFile()) {

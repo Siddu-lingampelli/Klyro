@@ -44,33 +44,58 @@ function normalizeForCompare(p: string): string {
 /**
  * Resolve a (possibly relative) path against cwd and assert it stays inside.
  * Does NOT follow symlinks — call `resolveAndFollowSymlinks` for that.
+ * `extraRoots` (--add-dir / agent sandbox extensions, relative entries
+ * resolve against cwd) are tried in order when the path escapes cwd.
  */
-export function resolveWithinCwd(cwd: string, requested: string): PathGuardResult {
+export function resolveWithinCwd(cwd: string, requested: string, extraRoots?: readonly string[]): PathGuardResult {
+  return resolveWithinRoots(cwd, requested, extraRoots);
+}
+
+interface RootedResolution extends PathGuardResult {
+  /** The sandbox root the path resolved inside (cwd or one of extraRoots). */
+  root: string;
+}
+
+function tryContain(root: string, requested: string): { resolved: string } | { drive: true } | null {
+  const resolved = path.isAbsolute(requested) ? path.resolve(requested) : path.resolve(root, requested);
+  // Use relative to test containment. path.relative throws on different
+  // drives on Windows; normalize to handle that.
+  const rel = path.relative(root, resolved);
+  if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) return { resolved };
+  // Different drive on Windows: relative starts with a drive letter
+  if (isWindows() && /^[A-Za-z]:[\\/]/.test(rel)) return { drive: true };
+  return null;
+}
+
+function resolveWithinRoots(cwd: string, requested: string, extraRoots?: readonly string[] | undefined): RootedResolution {
+  const roots = extraRoots ?? [];
   if (!requested || requested.length === 0) {
     throw new PathGuardError(TOOL_ERROR_CODES.INVALID_INPUT, 'Path is empty');
   }
   const absCwd = path.resolve(cwd);
-  const resolved = path.isAbsolute(requested) ? path.resolve(requested) : path.resolve(absCwd, requested);
-
-  // Use relative to test containment. path.relative throws on different
-  // drives on Windows; normalize to handle that.
-  const rel = path.relative(absCwd, resolved);
-  if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
-    return { resolved };
+  const first = tryContain(absCwd, requested);
+  if (first && !('drive' in first)) return { resolved: first.resolved, root: absCwd };
+  for (const extra of roots) {
+    const root = path.isAbsolute(extra) ? path.resolve(extra) : path.resolve(absCwd, extra);
+    if (root === absCwd) continue;
+    const hit = tryContain(root, requested);
+    if (hit && !('drive' in hit)) return { resolved: hit.resolved, root };
   }
-  // Different drive on Windows: relative starts with a drive letter
-  if (isWindows() && /^[A-Za-z]:[\\/]/.test(rel)) {
+  if (first && 'drive' in first) {
     throw new PathGuardError(TOOL_ERROR_CODES.PATH_ESCAPE, `Path escapes cwd (different drive): ${requested}`);
   }
   throw new PathGuardError(TOOL_ERROR_CODES.PATH_ESCAPE, `Path escapes cwd: ${requested}`);
 }
 
 /**
- * Resolve, follow symlinks, and assert the target stays inside cwd.
- * Use this for read_file / write_file to defeat symlink-based escapes.
+ * Resolve, follow symlinks, and assert the target stays inside cwd (or one
+ * of `extraRoots`). Use this for read_file / write_file to defeat
+ * symlink-based escapes. Symlink checks run against the winning root, so a
+ * link inside an added dir pointing outside it is refused exactly like a
+ * cwd escape.
  */
-export async function resolveAndFollowSymlinks(cwd: string, requested: string): Promise<PathGuardResult> {
-  const { resolved } = resolveWithinCwd(cwd, requested);
+export async function resolveAndFollowSymlinks(cwd: string, requested: string, extraRoots?: readonly string[]): Promise<PathGuardResult> {
+  const { resolved, root } = resolveWithinRoots(cwd, requested, extraRoots);
   let real: string;
   let realParent: string;
   try {
@@ -88,24 +113,24 @@ export async function resolveAndFollowSymlinks(cwd: string, requested: string): 
       return { resolved };
     }
   }
-  const absCwd = await fs.realpath(cwd).catch(() => path.resolve(cwd));
+  const absRoot = await fs.realpath(root).catch(() => path.resolve(root));
   const cmpReal = normalizeForCompare(real);
-  const cmpCwd = normalizeForCompare(absCwd);
-  if (cmpReal !== cmpCwd && !cmpReal.startsWith(cmpCwd + path.sep)) {
+  const cmpRoot = normalizeForCompare(absRoot);
+  if (cmpReal !== cmpRoot && !cmpReal.startsWith(cmpRoot + path.sep)) {
     throw new PathGuardError(
       TOOL_ERROR_CODES.PATH_ESCAPE,
       `Symlink target escapes cwd: ${requested} -> ${real}`,
     );
   }
   // Defense-in-depth: ensure the parent directory of the resolved target
-  // is also inside cwd. This catches the case where the requested path
-  // walks through a symlinked parent (e.g. `<cwd>/evil-link/../escape`)
-  // and `real` happens to land back inside cwd but the parent was outside.
-  // Skip when the target itself is cwd (realParent would be the parent of
-  // cwd, which is necessarily outside).
-  if (real !== absCwd) {
+  // is also inside the winning root. This catches the case where the
+  // requested path walks through a symlinked parent (e.g. `<root>/evil-link/../escape`)
+  // and `real` happens to land back inside the root but the parent was outside.
+  // Skip when the target itself is the root (realParent would be the parent of
+  // the root, which is necessarily outside).
+  if (real !== absRoot) {
     const cmpRealParent = normalizeForCompare(realParent);
-    if (cmpRealParent !== cmpCwd && !cmpRealParent.startsWith(cmpCwd + path.sep)) {
+    if (cmpRealParent !== cmpRoot && !cmpRealParent.startsWith(cmpRoot + path.sep)) {
       throw new PathGuardError(
         TOOL_ERROR_CODES.PATH_ESCAPE,
         `Path escapes cwd via parent symlink: ${requested} -> ${realParent}`,

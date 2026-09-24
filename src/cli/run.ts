@@ -9,8 +9,7 @@
  */
 
 import * as path from 'node:path';
-import * as readline from 'node:readline/promises';
-import { stdin as input, stdout, stderr } from 'node:process';
+import { stdout, stderr } from 'node:process';
 import { httpChatAdapter } from '../agent/provider-adapter.js';
 import type { VerifyMode } from '../agent/runtime.js';
 import { anthropicAdapter } from '../agent/anthropic-adapter.js';
@@ -26,7 +25,9 @@ import { redact } from '../policy/secret-redactor.js';
 import { buildLevel6Context } from '../context/level6.js';
 import { memoryBlock } from '../context/memory.js';
 import { estimateCost } from '../providers/model-info.js';
-import { getDefaultSessionStore, resolveSessionId } from '../persistence/session.js';
+import { resolveModelAlias } from '../providers/model-info.js';
+import { logDebug, logInfo } from '../util/log.js';
+import { resolveSessionId } from '../persistence/session.js';
 import * as fs from 'node:fs';
 
 export interface RunCliOptions {
@@ -34,9 +35,25 @@ export interface RunCliOptions {
   cwd: string;
   model: string;
   maxSteps?: number;
+  /** Alias for maxSteps (3.5) — when both are set, the smaller wins. */
+  maxTurns?: number;
   maxTokens?: number;
   temperature?: number;
+  /** Reasoning effort for reasoning models (OpenAI `reasoning_effort`). */
+  reasoningEffort?: 'low' | 'medium' | 'high';
   systemPrompt?: SystemPromptFn;
+  /** Replace the assembled system prompt wholesale (2.3). */
+  systemPromptText?: string;
+  /** Extra instructions appended after the assembled system prompt (2.3). */
+  appendSystemPrompt?: string;
+  /** Permission mode override (3.4): default|accept-edits|plan|auto. */
+  permissionMode?: import('../policy/engine.js').PermissionMode;
+  /** Tool names pre-approved for this run (added to allow rules). */
+  allowedTools?: string[] | string;
+  /** Tool names denied for this run (deny always wins). */
+  disallowedTools?: string[] | string;
+  /** Extra sandbox directories, as with /add-dir. */
+  addDir?: string[] | string;
   baseUrl?: string;
   apiKey?: string;
   timeoutMs?: number;
@@ -97,6 +114,45 @@ export interface RunCliOptions {
 }
 
 /**
+ * Split a comma-separated tool/dir list (string or string[]) into names.
+ * Exported for tests.
+ */
+export function splitToolList(v: string[] | string | undefined): string[] {
+  const arr = v === undefined ? [] : Array.isArray(v) ? v : [v];
+  return arr.flatMap((s) => String(s).split(',')).map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/** Smaller of two optional caps (--max-turns aliases --max-steps). Exported for tests. */
+export function minDefined(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.min(a, b);
+}
+
+/**
+ * Layer --system-prompt/--append-system-prompt over the assembled prompt
+ * (2.3): replace wins wholesale, append rides after the assembled system
+ * (preserving any suffix the base carries). Exported for tests.
+ */
+export function withSystemPromptOverrides(
+  base: SystemPromptFn,
+  opts: { replace?: string; append?: string },
+): SystemPromptFn {
+  if (opts.replace === undefined && opts.append === undefined) return base;
+  return (ctx) => {
+    if (opts.replace !== undefined) {
+      return opts.append ? `${opts.replace}\n\n${opts.append}` : opts.replace;
+    }
+    const r = base(ctx);
+    const system = typeof r === 'string' ? r : r.system;
+    const suffix = typeof r === 'string' ? undefined : r.suffix;
+    const out: { system: string; suffix?: string } = { system: `${system}\n\n${opts.append}` };
+    if (suffix !== undefined) out.suffix = suffix;
+    return out;
+  };
+}
+
+/**
  * Double-Ctrl+C detector (pure, exported for tests): the second SIGINT
  * within 1500ms of the first forces `process.exit(130)`. The live handler
  * below owns the timestamp closure; tests exercise only this predicate.
@@ -112,6 +168,9 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     const { loadDotenv } = await import('./dotenv.js');
     loadDotenv(opts.cwd);
   } catch { /* ignore */ }
+  // Model aliases (2.2: sonnet/opus/haiku/gpt/local) resolve once here so
+  // the session store, cost math, and every adapter agree on the id.
+  opts = { ...opts, model: resolveModelAlias(opts.model) };
   const output = opts.output ?? 'human';
 
   if (opts.dryRun) {
@@ -211,7 +270,14 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     } catch { /* best-effort — single-provider run proceeds */ }
   }
   const registry = builtinRegistry();
-  const policy = new PolicyEngine(builtinRules(), clonePolicyConfig());
+  const policyConfig = clonePolicyConfig();
+  // Explicit CLI overrides (3.4). Persisted rules load next via applyRules;
+  // the engine's deny-first precedence keeps any denial terminal.
+  if (opts.permissionMode !== undefined) policyConfig.mode = opts.permissionMode;
+  for (const t of splitToolList(opts.allowedTools)) policyConfig.allow!.push(t);
+  for (const t of splitToolList(opts.disallowedTools)) policyConfig.deny!.push(t);
+  for (const d of splitToolList(opts.addDir)) policyConfig.additionalDirs!.push(path.resolve(opts.cwd, d));
+  const policy = new PolicyEngine(builtinRules(), policyConfig);
   // Persisted "always allow" patterns apply to one-shot runs too.
   try {
     const { loadPermissionRules } = await import('./config.js');
@@ -250,7 +316,10 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
     closeMcp = mcp.closeAll;
   } catch { /* ignore — MCP is optional */ }
   }
-  const systemPrompt = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt, opts.bare);
+  const systemPrompt = withSystemPromptOverrides(
+    await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt, opts.bare),
+    { replace: opts.systemPromptText, append: opts.appendSystemPrompt },
+  );
 
   // Level 9 — session setup (create or resume). --bare skips persistence.
   const persistEnabled = opts.persist !== false && !opts.bare;
@@ -286,8 +355,6 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       if (rec) {
         stderr.write(`klyro: resuming session ${sessionId.slice(0, 8)} — task: "${rec.task}"\n`);
       }
-    } else if (opts.resumePath) {
-      // already handled
     } else {
       // Create new session
       const rec = await store.create({ cwd: opts.cwd, task: opts.task, config: { model: opts.model, maxSteps: opts.maxSteps ?? 30 } });
@@ -380,6 +447,10 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       model: opts.model,
     });
   }
+  // 2.5 latency tracking: TTFT = first model event after run start.
+  const runStartMs = Date.now();
+  let ttftMs: number | undefined;
+  logDebug('run start', { model: opts.model, maxSteps: opts.maxSteps, bare: !!opts.bare });
   try {
     result = await run(
     {
@@ -387,17 +458,24 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
       cwd: opts.cwd,
       model: opts.model,
       ...(opts.bare ? { bare: true as const } : {}),
-      maxSteps: opts.maxSteps,
+      maxSteps: minDefined(opts.maxSteps, opts.maxTurns),
       maxTokens: opts.maxTokens,
       temperature: opts.temperature,
+      reasoningEffort: opts.reasoningEffort,
       signal: ac.signal,
       nonInteractive: true,
       initialTranscript,
+      // Sandbox roots for file tools: cwd plus --add-dir extras (resolved
+      // absolute). checkAllowedPaths narrows to exactly this set.
+      allowedPaths: [path.resolve(opts.cwd), ...(policyConfig.additionalDirs ?? [])],
       verify: verifyOpts,
       persist: store && sessionId ? { store, sessionId } : undefined,
       ...(agentBridge ? { agentBridge } : {}),
       ...(parentContext ? { parentContext } : {}),
       onEvent: (ev) => {
+        if (ttftMs === undefined && (ev.kind === 'text_delta' || ev.kind === 'tool_call_start')) {
+          ttftMs = Date.now() - runStartMs;
+        }
         if (output === 'json') {
           stdout.write(JSON.stringify(ev) + '\n');
           return;
@@ -485,9 +563,12 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
   // [budget] warnings. Human/silent → stderr one-liner; json → additive
   // cost_usd/usage fields on the final object (purely additive, no shape break).
   const finalCost = estimateCost(opts.model, result.usage.input, result.usage.output);
-  const costLine = `$${finalCost.toFixed(4)} · ${result.usage.input} in / ${result.usage.output} out${result.usage.estimated ? ' (estimated)' : ''}`;
+  const totalMs = Date.now() - runStartMs;
+  logInfo('run finish', { status: result.status, steps: result.steps, toolCalls: result.toolCalls, totalMs });
+  const ttftPart = ttftMs !== undefined ? ` · ttft ${ttftMs}ms` : '';
+  const costLine = `$${finalCost.toFixed(4)} · ${result.usage.input} in / ${result.usage.output} out${result.usage.estimated ? ' (estimated)' : ''}${ttftPart} · total ${totalMs}ms`;
   if (output === 'json') {
-    stdout.write(JSON.stringify({ kind: 'cost', cost_usd: finalCost, usage: result.usage }) + '\n');
+    stdout.write(JSON.stringify({ kind: 'cost', cost_usd: finalCost, usage: result.usage, ttft_ms: ttftMs ?? null, total_ms: totalMs }) + '\n');
   } else {
     stderr.write(`klyro: cost ${costLine}\n`);
   }
@@ -505,6 +586,8 @@ export async function runOnce(opts: RunCliOptions): Promise<number> {
         toolCalls: result.toolCalls,
         cost_usd: finalCost,
         usage: result.usage,
+        ttft_ms: ttftMs ?? null,
+        total_ms: totalMs,
         ...(result.verification ? { verification: result.verification } : {}),
         ...(sessionId ? { session_id: sessionId } : {}),
         ...extra,
@@ -562,6 +645,7 @@ interface DryRunReport {
   maxSteps?: number;
   maxTokens?: number;
   temperature?: number;
+  reasoningEffort?: 'low' | 'medium' | 'high';
   systemPrompt: string;
   task: string;
   toolCount: number;
@@ -572,7 +656,10 @@ interface DryRunReport {
 async function dryRunReport(opts: RunCliOptions): Promise<number> {
   // Assemble the REAL prompt (Level-6 context + KLYRO.md), not the bare base —
   // otherwise dry-run shows a different prompt than production runs use.
-  const systemPromptFn = await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt);
+  const systemPromptFn = withSystemPromptOverrides(
+    await makeRunSystemPrompt(opts.cwd, opts.systemPrompt ?? defaultRunSystemPrompt),
+    { replace: opts.systemPromptText, append: opts.appendSystemPrompt },
+  );
   const { resolveSystemPrompt } = await import('../agent/runtime.js');
   const { system, suffix } = resolveSystemPrompt(systemPromptFn, { cwd: opts.cwd });
   const systemPrompt = suffix ? `${system}\n\n${suffix}` : system;
@@ -585,6 +672,7 @@ async function dryRunReport(opts: RunCliOptions): Promise<number> {
     maxSteps: opts.maxSteps,
     maxTokens: opts.maxTokens,
     temperature: opts.temperature,
+    reasoningEffort: opts.reasoningEffort,
     // Secrets must never leak into a printable report: redact both the
     // assembled system prompt and the task before printing.
     systemPrompt: redact(systemPrompt),

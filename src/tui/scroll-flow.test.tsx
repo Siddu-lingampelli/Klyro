@@ -44,7 +44,6 @@ describe('scroll flow diagnostics', () => {
     const { lastFrame } = render(<App {...PROPS} isFullscreen={true} />);
     await tick(50);
     const frame = lastFrame() ?? '';
-    // eslint-disable-next-line no-console
     console.log(`[diag] frame rows=${rowsOf(frame)} cols~${(frame.split('\n')[0] ?? '').length}`);
     expect(rowsOf(frame)).toBeLessThanOrEqual(32);
   });

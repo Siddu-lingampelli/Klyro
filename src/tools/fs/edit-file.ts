@@ -9,7 +9,7 @@ import * as crypto from 'node:crypto';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { resolveAndFollowSymlinks, assertNotSymlink } from '../../policy/path-guard.js';
-import { safe, TOOL_ERROR_CODES } from '../normalize.js';
+import { safe } from '../normalize.js';
 import { wasRead } from './read-history.js';
 
 // Extension-anchored: matches test.ts, foo.test.ts, foo-test.ts, foo.spec.js,
@@ -81,7 +81,7 @@ export const editFileTool = defineTool<z.infer<typeof InputSchema>, EditFileOutp
     return safe(async () => {
       const guard = checkRepairGuard(input.path, `${input.find}\n${input.replace}`, ctx.repairGuard?.denyTestEdits);
       if (guard) return guard as unknown as EditFileOutput;
-      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const allowed = await checkAllowedPaths(ctx.cwd, resolved, ctx.agentAllowedPaths);
       if (allowed) return allowed as unknown as EditFileOutput;
       // 4.1: staleness check via mtime+hash
@@ -172,7 +172,7 @@ export const editFileTool = defineTool<z.infer<typeof InputSchema>, EditFileOutp
       // before the write and refuse if the target moved. Compares
       // canonicalized forms (not raw strings) to avoid false positives from
       // lexical-vs-canonical spellings (e.g. `sub/../a.txt`, short names).
-      const { resolved: reResolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const { resolved: reResolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const canon = async (p: string): Promise<string> => {
         try { return await fs.realpath(p); } catch { /* missing file → try parent */ }
         try { return path.join(await fs.realpath(path.dirname(p)), path.basename(p)); } catch { return p; }
@@ -282,7 +282,6 @@ function findClosestMatch(text: string, needle: string): { snippet: string; line
   const lines = text.split('\n');
   let bestIdx = 0;
   let bestScore = -1;
-  let bestSnippet = '';
   // Simple similarity: longest common substring ratio
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? '';
@@ -296,7 +295,6 @@ function findClosestMatch(text: string, needle: string): { snippet: string; line
     if (score > bestScore) {
       bestScore = score;
       bestIdx = i;
-      bestSnippet = line;
     }
   }
   const start = Math.max(0, bestIdx - 2);

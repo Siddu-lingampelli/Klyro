@@ -18,6 +18,7 @@
  *   thinking/queue = content lines + 1 margin
  */
 
+// eslint-disable-next-line no-control-regex -- intentional: measuring visible width requires skipping SGR sequences
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
 function isWide(cp: number): boolean {

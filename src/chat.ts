@@ -22,6 +22,18 @@
 /** Default request timeout: 60s. */
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+/**
+ * Legacy output flows through the shared terminal renderer (3.1): all
+ * human output leaves via the renderer module, which also sanitizes
+ * control sequences out of model text.
+ */
+import { TerminalRenderer, writeStdoutDrained } from './renderers/terminal.js';
+
+const renderer = new TerminalRenderer();
+function frame(text: string): void {
+  renderer.handle({ type: 'stream.delta' as const, ts: Date.now(), sessionId: 'legacy-chat', text });
+}
+
 /** Max bytes of an error response body we will print. */
 const MAX_ERROR_BODY_BYTES = 4_000;
 
@@ -205,7 +217,7 @@ export async function streamToStdout(
   const reader = body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buf = '';
-  process.stdout.write('\n');
+  frame('\n');
   try {
     while (true) {
       if (signal.aborted) throw new Error('aborted');
@@ -223,7 +235,7 @@ export async function streamToStdout(
           if (!line.startsWith('data:')) continue;
           const data = line.slice(5).trim();
           if (data === '[DONE]') {
-            process.stdout.write('\n');
+            frame('\n');
             return;
           }
           // Handle case where data was split across chunks and reassembled as event
@@ -236,7 +248,7 @@ export async function streamToStdout(
           }
           const text = parsed.choices?.[0]?.delta?.content;
           if (text) {
-            if (!await writeWithBackpressure(text, signal)) {
+            if (!await writeStdoutDrained(text, signal)) {
               try { await reader.cancel(); } catch { /* ignore */ }
               return;
             }
@@ -254,7 +266,7 @@ export async function streamToStdout(
           if (!line.startsWith('data:')) continue;
           const data = line.slice(5).trim();
           if (data === '[DONE]') {
-            process.stdout.write('\n');
+            frame('\n');
             return;
           }
           if (data === '') continue;
@@ -262,7 +274,7 @@ export async function streamToStdout(
             const parsed = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }> };
             const text = parsed.choices?.[0]?.delta?.content;
             if (text) {
-              if (!await writeWithBackpressure(text, signal)) {
+              if (!await writeStdoutDrained(text, signal)) {
                 try { await reader.cancel(); } catch { /* ignore */ }
                 return;
               }
@@ -273,7 +285,7 @@ export async function streamToStdout(
         }
       }
     }
-    process.stdout.write('\n');
+    frame('\n');
   } finally {
     try {
       reader.releaseLock();
@@ -281,51 +293,6 @@ export async function streamToStdout(
       /* already released */
     }
   }
-}
-
-/**
- * Write to stdout and wait for the drain event if the buffer is full.
- * Returns false if stdout has been closed (e.g. piped to `head`).
- * Respects abort signal — resolves false if aborted while waiting.
- */
-function writeWithBackpressure(chunk: string, signal?: AbortSignal): Promise<boolean> {
-  return new Promise((resolve) => {
-    if (signal?.aborted) {
-      resolve(false);
-      return;
-    }
-    if (!process.stdout.write(chunk)) {
-      let settled = false;
-      const cleanup = () => {
-        process.stdout.off('drain', onDrain);
-        process.stdout.off('error', onError);
-        if (signal) signal.removeEventListener('abort', onAbort);
-      };
-      const onDrain = () => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(true);
-      };
-      const onError = () => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(false);
-      };
-      const onAbort = () => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(false);
-      };
-      process.stdout.once('drain', onDrain);
-      process.stdout.once('error', onError);
-      if (signal) signal.addEventListener('abort', onAbort, { once: true });
-    } else {
-      resolve(true);
-    }
-  });
 }
 
 /**

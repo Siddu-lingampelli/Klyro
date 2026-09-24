@@ -663,12 +663,13 @@ Mouse scrolling should be handled by OpenTUI.
 
 Do not implement terminal mouse escape sequences yourself unless OpenTUI requires a specific integration.
 
-> Current behavior (copy/paste fix): terminal mouse *reporting* is OFF by
-> default so native text selection (copy) and right-click paste keep working
-> — button reporting routes those gestures to the app, which cannot honor
-> them. Set `KLYRO_MOUSE=1` to opt into wheel scrolling (±3 lines); keyboard
-> scrolling (PgUp/PgDn, Ctrl+U/D) always works. Bracketed paste (keyboard
-> paste) is independent of this flag and always on.
+> Current behavior: terminal mouse *reporting* is ON by default (opencode
+> parity) so the wheel scrolls the chat out of the box. Trade-off: plain
+> selection clicks and right-clicks go to the app (clicks are dropped), so
+> use Shift+drag to select and Shift+right-click to paste, or set
+> `KLYRO_MOUSE=0` for fully native selection and scroll with PgUp/PgDn,
+> Ctrl+U/D, Shift+↑/↓, Home/End, or Space instead. Bracketed (keyboard)
+> paste is independent of this flag and always on.
 
 Desired behavior:
 

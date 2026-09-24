@@ -161,7 +161,7 @@ export async function runTask(
     };
   } finally {
     if (owned) {
-      try { await fs.rm(cwd, { recursive: true, force: true }); } catch {}
+      try { await fs.rm(cwd, { recursive: true, force: true }); } catch { /* ignore — best-effort tmp cleanup */ }
     }
   }
 }
@@ -238,7 +238,7 @@ export async function loadFileFixture(dir: string): Promise<FileFixture> {
   return { dir, task: task.trim(), checkSh, meta, ...(repo ? { repo } : {}), ...(script ? { script } : {}) };
 }
 
-export async function runFileFixture(fixture: FileFixture, opts: { runs?: number; parallel?: number } = {}): Promise<TaskResult> {
+export async function runFileFixture(fixture: FileFixture, _opts: { runs?: number; parallel?: number } = {}): Promise<TaskResult> {
   const start = Date.now();
   const tmp = path.join(os.tmpdir(), 'klyro-eval-file-' + Math.random().toString(36).slice(2));
   await fs.mkdir(tmp, { recursive: true });

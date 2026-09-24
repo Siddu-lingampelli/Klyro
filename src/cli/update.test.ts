@@ -152,4 +152,28 @@ describe('update.ts — integrity gate', () => {
     expect(compareSemver('1.0.4-beta', '1.0.4')).toBe(-1);
     expect(compareSemver('garbage', '1.0.0')).toBeNull();
   });
+
+  it('stays silent in CI unless explicitly enabled (1.5)', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('must not fetch in CI');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const savedCI = process.env.CI;
+    const savedActions = process.env.GITHUB_ACTIONS;
+    const savedOptIn = process.env.KLYRO_UPDATE_CHECK;
+    try {
+      process.env.CI = 'true';
+      delete process.env.KLYRO_UPDATE_CHECK;
+      const { checkForUpdate } = await import('./update.js');
+      expect(await checkForUpdate('1.0.0')).toBeNull();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      if (savedCI === undefined) delete process.env.CI;
+      else process.env.CI = savedCI;
+      if (savedActions === undefined) delete process.env.GITHUB_ACTIONS;
+      else process.env.GITHUB_ACTIONS = savedActions;
+      if (savedOptIn === undefined) delete process.env.KLYRO_UPDATE_CHECK;
+      else process.env.KLYRO_UPDATE_CHECK = savedOptIn;
+    }
+  });
 });

@@ -29,6 +29,26 @@ export function getModelInfo(id: string): ModelInfo {
 }
 
 /**
+ * CLI model aliases (2.2): short names resolving against the registry so
+ * they never point at retired generations. Exact registry hits and unknown
+ * ids pass through untouched (the provider reports those errors).
+ */
+const MODEL_ALIASES: Record<string, string> = {
+  sonnet: 'claude-3-5-sonnet-20240620',
+  // No opus generation is pinned in the registry; closest capable Claude.
+  opus: 'claude-3-5-sonnet-20240620',
+  haiku: 'claude-3-haiku-20240307',
+  gpt: 'gpt-4o-mini',
+  local: 'local-model',
+};
+
+export function resolveModelAlias(id: string): string {
+  if (!id || MODEL_REGISTRY[id]) return id;
+  const hit = MODEL_ALIASES[id.toLowerCase()];
+  return hit ?? id;
+}
+
+/**
  * Single-source per-1K-token rate table, derived from MODEL_REGISTRY so
  * prices live in exactly one place. Local/self-hosted entries are $0.
  */

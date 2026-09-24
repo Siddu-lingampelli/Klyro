@@ -17,7 +17,6 @@
  */
 
 import * as path from 'node:path';
-import * as os from 'node:os';
 import { execFileSync, execSync } from 'node:child_process';
 import * as fs from 'node:fs';
 

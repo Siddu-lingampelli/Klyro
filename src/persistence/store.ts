@@ -198,10 +198,10 @@ export class SessionStore {
       try {
         const pp = this.perProjectIndexPath(opts.cwd);
         let pIdx: Record<string, SessionRecord> = {};
-        try { pIdx = JSON.parse(await fs.readFile(pp, 'utf-8')); } catch {}
+        try { pIdx = JSON.parse(await fs.readFile(pp, 'utf-8')); } catch { /* missing index — start fresh */ }
         pIdx[id] = record;
         await this.writePerProjectIndex(pp, pIdx);
-      } catch {}
+      } catch { /* best-effort — the primary index above already persisted */ }
       return record;
     });
   }

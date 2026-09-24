@@ -2,8 +2,8 @@
  * 8.1 — Accounting & stable assembly
  * Live token estimate, ctx%, compactAt, reserveOutput, toolResultMax
  */
-import { estimateTokens, totalTokens } from './tokenizer.js';
 import { getModelInfo } from '../providers/model-info.js';
+import { totalTokens } from './tokenizer.js';
 import type { Message } from '../agent/message.js';
 
 export interface ContextAccounting {

@@ -3,9 +3,8 @@
  * Trigger at compactAt (80%) or /compact [focus]. Validates summary mentions every checkpointed file else fallback.
  */
 import type { Message, ContentBlock } from '../agent/message.js';
-import { compressTranscript, totalTokens } from './tokenizer.js';
+import { compressTranscript } from './tokenizer.js';
 import { capForModel, RESERVE_OUTPUT_TOKENS } from './accounting.js';
-import type { SessionStore } from '../persistence/store.js';
 
 export interface CompactionResult { messages: Message[]; summary: string; dropped: number; method: 'elide' | 'summarize' | 'fallback' }
 

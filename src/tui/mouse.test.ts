@@ -5,13 +5,13 @@ import { describe, it, expect } from 'vitest';
 import { MouseFilter, WHEEL_LINES, PasteFilter, createReadWrapper, isMouseReportingEnabled } from './mouse.js';
 
 describe('isMouseReportingEnabled', () => {
-  it('defaults OFF so native select-to-copy and right-click paste work', () => {
-    expect(isMouseReportingEnabled({})).toBe(false);
-    expect(isMouseReportingEnabled({ KLYRO_MOUSE: '0' })).toBe(false);
-    expect(isMouseReportingEnabled({ KLYRO_MOUSE: '' })).toBe(false);
-  });
-  it('opts in with KLYRO_MOUSE=1 for wheel scrolling', () => {
+  it('defaults ON so wheel scroll works out of the box (Shift+drag still selects)', () => {
+    expect(isMouseReportingEnabled({})).toBe(true);
     expect(isMouseReportingEnabled({ KLYRO_MOUSE: '1' })).toBe(true);
+    expect(isMouseReportingEnabled({ KLYRO_MOUSE: '' })).toBe(true);
+  });
+  it('opts out with KLYRO_MOUSE=0 for fully native selection', () => {
+    expect(isMouseReportingEnabled({ KLYRO_MOUSE: '0' })).toBe(false);
   });
 });
 

@@ -266,3 +266,33 @@ describe('httpChatAdapter overflow (REQUEST_TOO_LARGE)', () => {
     expect(evs[0]).toMatchObject({ kind: 'error', code: 'HTTP_400', retryable: false });
   });
 });
+
+describe('httpChatAdapter capabilities (2.1)', () => {
+  it('lists models via GET /models', async () => {
+    const seen: string[] = [];
+    const fetchImpl = (async (url: string) => {
+      seen.push(url);
+      return new Response(JSON.stringify({ data: [{ id: 'a' }, { id: 'b' }, { id: '' }] }), { status: 200 });
+    }) as typeof fetch;
+    const adapter = httpChatAdapter({ baseURL: 'https://x.example/v1/', apiKey: 'k', fetchImpl });
+    await expect(adapter.listModels!()).resolves.toEqual(['a', 'b']);
+    expect(seen[0]).toBe('https://x.example/v1/models');
+  });
+
+  it('returns [] when the endpoint has no model list', async () => {
+    const fetchImpl = (async () => new Response('nope', { status: 404 })) as typeof fetch;
+    const adapter = httpChatAdapter({ baseURL: 'https://x.example', apiKey: '', fetchImpl });
+    await expect(adapter.listModels!()).resolves.toEqual([]);
+  });
+
+  it('counts tokens locally', () => {
+    const adapter = httpChatAdapter({ baseURL: 'https://x.example', apiKey: '' });
+    expect(adapter.countTokens!('')).toBe(0);
+    expect(adapter.countTokens!('hello world, this is a longer piece of text')).toBeGreaterThan(1);
+  });
+
+  it('sends reasoning_effort only when set', () => {
+    expect(buildChatCompletionsBody({ ...baseReq, reasoningEffort: 'high' })).toMatchObject({ reasoning_effort: 'high' });
+    expect(buildChatCompletionsBody({ ...baseReq })).not.toHaveProperty('reasoning_effort');
+  });
+});

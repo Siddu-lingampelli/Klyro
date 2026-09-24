@@ -13,7 +13,6 @@
  * can act on — never the full child transcript.
  */
 
-import type { ProviderAdapter } from './provider-adapter.js';
 import type { RuntimeDeps, RunOptions, RunResult, RuntimeEvent } from './runtime.js';
 import type { ToolResult } from '../tools/types.js';
 import { run, resolveSystemPrompt } from './runtime.js';

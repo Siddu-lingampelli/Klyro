@@ -15,7 +15,7 @@
  * normalized StreamEvent shape from ProviderAdapter.
  */
 
-import type { ProviderAdapter, StreamEvent, ToolDefinition } from './provider-adapter.js';
+import type { ProviderAdapter, ToolDefinition } from './provider-adapter.js';
 import type { Message, ToolUseBlock } from './message.js';
 import { text, toolUse, toolResult as mkToolResult } from './message.js';
 import type { ToolRegistry } from '../tools/registry.js';
@@ -28,7 +28,6 @@ import { RuntimeTelemetry, emptyTelemetryBlock, summarizeToolCall } from '../con
 import * as path from 'node:path';
 import { verify, diagnosticForModel, type VerifyResult } from '../verification/engine.js';
 import { detectVerifyCommand } from '../verification/auto.js';
-import { detectVerifiers } from '../verification/registry.js';
 import { ensureBaseline, getBaseline } from '../verification/baseline.js';
 import { compressTranscript, totalTokens, calibrateEstimate, transcriptCharLength } from '../context/tokenizer.js';
 import { capForModel, RESERVE_OUTPUT_TOKENS } from '../context/accounting.js';
@@ -107,6 +106,7 @@ export interface RunOptions {
   maxTimeMs?: number;
   maxTokens?: number;
   temperature?: number;
+  reasoningEffort?: 'low' | 'medium' | 'high';
   signal?: AbortSignal;
   nonInteractive: boolean;
   /**
@@ -181,6 +181,12 @@ export interface RunOptions {
     allowedPaths?: readonly string[];
     model?: string;
   };
+  /**
+   * Root sandbox extensions (--add-dir): extra resolvable roots for file
+   * tools, merged with cwd. Child scopes (parentContext.allowedPaths) still
+   * narrow further when present.
+   */
+  allowedPaths?: readonly string[];
   /**
    * Delegation bridge (P0). Present on the root run so the model can call
    * spawn_agent / task_list / task_get. The tool layer reads it from the
@@ -436,13 +442,6 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   const sessionId = opts.persist?.sessionId;
   // 6.1 baseline cache per HEAD — capture before first edit
   let baselinePrimed = false;
-  async function primeBaseline(): Promise<void> {
-    if (baselinePrimed) return;
-    baselinePrimed = true;
-    const cmd = opts.verify?.command ?? detectVerifyCommand(opts.cwd);
-    if (!cmd) return;
-    try { await ensureBaseline(opts.cwd, cmd); } catch { /* ignore */ }
-  }
 
   async function checkpoint(msg?: Message, obs?: { toolCallId: string; toolName: string; input: unknown; output: unknown; isError: boolean }): Promise<void> {
     if (!store || !sessionId) return;
@@ -527,6 +526,11 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       // Abort cascade (fix: background shells must not outlive the run).
       const killed = killAllJobs();
       emitKlyro({ type: 'abort', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', reason: killed.length > 0 ? `aborted by operator (${killed.length} background job(s) killed)` : 'aborted by operator' });
+      // 2.4 — explicit interrupted marker: partial output stays labeled in
+      // the transcript so resume/replay never mistakes it for final text.
+      const interruptedNote: Message = { role: 'user', content: [text('[system note] Interrupted by user — output above is partial and preserved.')] };
+      transcript.push(interruptedNote);
+      await checkpoint(interruptedNote);
       if (store && sessionId) {
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
@@ -598,6 +602,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       tools: toolDefinitions(deps.registry),
       ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {}),
       ...(typeof opts.temperature === 'number' ? { temperature: opts.temperature } : {}),
+      ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
     };
 
@@ -605,17 +610,15 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     let textBuf = '';
     // Thinking is ephemeral: streamed to the UI live, never stored in the
     // transcript, and cleared when the turn's answer completes.
-    let thinkingBuf = '';
     const pendingToolCalls = new Map<string, { id: string; name: string; argsJson: string }>();
-    let lastFinishReason: string | undefined;
     // Set when this step's request must be re-issued after overflow recovery.
     let overflowRetryPending = false;
     // Set when a terminal provider error consumed a failover adapter — the
     // step is re-issued against the next adapter without consuming budget.
     let failoverPending = false;
-    let failoverFrom = '';
-    let failoverTo = '';
-    let failoverReason = '';
+    let failoverFrom: string;
+    let failoverTo: string;
+    let failoverReason: string;
 
     for await (const ev of events) {
       if (opts.signal?.aborted) break outer;
@@ -623,7 +626,6 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         textBuf += ev.text;
         emit?.({ kind: 'text_delta', text: ev.text });
       } else if (ev.kind === 'thinking_delta') {
-        thinkingBuf += ev.text;
         emit?.({ kind: 'thinking_delta', text: ev.text });
       } else if (ev.kind === 'tool_call_start') {
         pendingToolCalls.set(ev.id, { id: ev.id, name: ev.name, argsJson: '' });
@@ -635,7 +637,6 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       } else if (ev.kind === 'tool_call_end') {
         // tool_calls are accumulated; finalization happens after stream.
       } else if (ev.kind === 'message_end') {
-        lastFinishReason = ev.finishReason;
         if (ev.usage) {
           usage.input += ev.usage.input;
           usage.output += ev.usage.output;
@@ -740,9 +741,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     if (failoverPending) {
       failoverPending = false;
       textBuf = '';
-      thinkingBuf = '';
       pendingToolCalls.clear();
-      lastFinishReason = undefined;
       steps--;
       emit?.({ kind: 'step_end', step: steps + 1 });
       continue outer;
@@ -800,6 +799,10 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
       emit?.({ kind: 'aborted' });
       const killed = killAllJobs();
       emitKlyro({ type: 'abort', ts: Date.now(), sessionId: sessionId ?? 'ephemeral', reason: killed.length > 0 ? `aborted by operator (${killed.length} background job(s) killed)` : 'aborted by operator' });
+      // 2.4 — explicit interrupted marker (see loop-top abort).
+      const interruptedNote: Message = { role: 'user', content: [text('[system note] Interrupted by user — output above is partial and preserved.')] };
+      transcript.push(interruptedNote);
+      await checkpoint(interruptedNote);
       if (store && sessionId) {
         try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
       }
@@ -1069,6 +1072,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         : {}),
       agentDepth: opts.parentContext?.depth ?? 0,
       agentMaxDepth: opts.parentContext?.maxDepth ?? 1,
+      ...(opts.allowedPaths ? { agentAllowedPaths: opts.allowedPaths } : {}),
       ...(opts.parentContext?.allowedTools ? { agentAllowedTools: opts.parentContext.allowedTools } : {}),
       ...(opts.parentContext?.allowedPaths ? { agentAllowedPaths: opts.parentContext.allowedPaths } : {}),
       ...(opts.parentContext?.model ?? opts.model ? { agentModel: opts.parentContext?.model ?? opts.model } : {}),
@@ -1459,6 +1463,10 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
 
   if (opts.signal?.aborted) {
     emit?.({ kind: 'aborted' });
+    // 2.4 — explicit interrupted marker (see loop-top abort).
+    const interruptedNote: Message = { role: 'user', content: [text('[system note] Interrupted by user — output above is partial and preserved.')] };
+    transcript.push(interruptedNote);
+    await checkpoint(interruptedNote);
     if (store && sessionId) {
       try { await store.setStatus(sessionId, 'aborted', finalText); } catch { /* ignore */ }
     }

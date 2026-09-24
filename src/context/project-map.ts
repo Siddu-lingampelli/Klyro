@@ -22,6 +22,7 @@
  */
 
 import * as fs from 'node:fs/promises';
+import { statSync, readFileSync } from 'node:fs';
 import * as path from 'node:path';
 
 export const IGNORED_DIRS = new Set([
@@ -262,7 +263,7 @@ function detectPackageManager(root: string, pkg: Record<string, unknown> | null)
   for (const [lock, pm] of checks) {
     // Avoid the async cost by re-using the root listing we already do.
     // (Caller threads the listing into detectFrameworks; here we re-stat directly.)
-    try { require('node:fs').statSync(path.join(root, lock)); return pm; } catch { /* not present */ }
+    try { statSync(path.join(root, lock)); return pm; } catch { /* not present */ }
   }
   // Fall back: if package.json has a "packageManager" field, use it.
   if (pkg && typeof pkg.packageManager === 'string') {
@@ -300,9 +301,9 @@ function extractBuildCommands(pkg: Record<string, unknown> | null, root: string)
   // Makefile: pick the first `target:` block as a hint.
   // (Don't try to parse make fully — just surface the targets as a single hint.)
   try {
-    const stat = require('node:fs').statSync(path.join(root, 'Makefile'));
+    const stat = statSync(path.join(root, 'Makefile'));
     if (stat.isFile() && stat.size < MAX_BYTES) {
-      const raw = require('node:fs').readFileSync(path.join(root, 'Makefile'), 'utf-8') as string;
+      const raw = readFileSync(path.join(root, 'Makefile'), 'utf-8') as string;
       const targets = [...raw.matchAll(/^([a-zA-Z_][\w-]*)\s*:/gm)].map((m) => m[1]).slice(0, 6);
       if (targets.length) out.push(`make <target>  # targets: ${targets.join(', ')}`);
     }
@@ -362,10 +363,10 @@ async function gitHead(root: string): Promise<string> {
 }
 function lockfileHash(root: string): string {
   const candidates = ['pnpm-lock.yaml','yarn.lock','package-lock.json','bun.lockb','Cargo.lock','go.sum','poetry.lock','uv.lock'];
-  let h = crypto.createHash('sha1');
+  const h = crypto.createHash('sha1');
   let found = false;
   for (const f of candidates) {
-    try { const d = require('node:fs').readFileSync(path.join(root, f)); h.update(d); found = true; } catch { /* ignore */ }
+    try { const d = readFileSync(path.join(root, f)); h.update(d); found = true; } catch { /* ignore */ }
   }
   return found ? h.digest('hex').slice(0, 8) : 'no-lock';
 }
@@ -420,17 +421,17 @@ export async function dirtyMtime(root: string): Promise<number> {
 function detectMonorepo(root: string, rootFiles: Set<string>, rootDirs: string[]): boolean {
   if (rootFiles.has('pnpm-workspace.yaml') || rootFiles.has('lerna.json') || rootFiles.has('nx.json')) return true;
   if (rootDirs.includes('packages') || rootDirs.includes('apps')) {
-    try { const s = require('node:fs').statSync(path.join(root, 'packages')); if (s.isDirectory()) return true; } catch {}
-    try { const s2 = require('node:fs').statSync(path.join(root, 'apps')); if (s2.isDirectory()) return true; } catch {}
+    try { const s = statSync(path.join(root, 'packages')); if (s.isDirectory()) return true; } catch { /* ignore — best-effort probe */ }
+    try { const s2 = statSync(path.join(root, 'apps')); if (s2.isDirectory()) return true; } catch { /* ignore — best-effort probe */ }
   }
   return false;
 }
 async function detectRuntimeVersions(root: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
-  try { const v = await readTextSafe(path.join(root, '.nvmrc')); if (v) out['node'] = v.trim(); } catch {}
-  try { const pkg = await readJsonSafe(path.join(root, 'package.json')); const eng = (pkg as Record<string, unknown>)?.engines as Record<string,string>|undefined; if (eng?.node) out['node-eng'] = eng.node; } catch {}
-  try { const py = await readTextSafe(path.join(root, '.python-version')); if (py) out['python'] = py.trim(); } catch {}
-  try { const go = await readTextSafe(path.join(root, 'go.mod')); if (go) { const m = /go\s+(\d+\.\d+)/.exec(go); if (m?.[1]) out['go'] = m[1]; } } catch {}
+  try { const v = await readTextSafe(path.join(root, '.nvmrc')); if (v) out['node'] = v.trim(); } catch { /* ignore — best-effort probe */ }
+  try { const pkg = await readJsonSafe(path.join(root, 'package.json')); const eng = (pkg as Record<string, unknown>)?.engines as Record<string,string>|undefined; if (eng?.node) out['node-eng'] = eng.node; } catch { /* ignore — best-effort probe */ }
+  try { const py = await readTextSafe(path.join(root, '.python-version')); if (py) out['python'] = py.trim(); } catch { /* ignore — best-effort probe */ }
+  try { const go = await readTextSafe(path.join(root, 'go.mod')); if (go) { const m = /go\s+(\d+\.\d+)/.exec(go); if (m?.[1]) out['go'] = m[1]; } } catch { /* ignore — best-effort probe */ }
   return out;
 }
 async function detectEntryPoints(root: string): Promise<string[]> {

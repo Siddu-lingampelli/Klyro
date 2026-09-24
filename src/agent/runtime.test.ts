@@ -225,6 +225,70 @@ describe('runtime', () => {
       { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
     );
     expect(r.status).toBe('aborted');
+    const texts = r.transcript
+      .flatMap((m) => m.content)
+      .filter((b): b is { kind: 'text'; text: string } => (b as { kind?: string }).kind === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    expect(texts).toContain('Interrupted by user');
+  });
+
+  it('answers a package question through read_file (3.5)', async () => {
+    const dir = path.join(os.tmpdir(), 'klyro-e2e-' + Math.random().toString(36).slice(2));
+    fs.mkdirSync(dir, { recursive: true });
+    try {
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'demo-pkg', version: '9.9.9' }), 'utf-8');
+      const reg = new ToolRegistry().register(readFileTool);
+      const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+      const adapter = scriptedAdapter([
+        [
+          { kind: 'message_start' },
+          { kind: 'tool_call_start', id: 'c1', name: 'read_file' },
+          { kind: 'tool_call_delta', id: 'c1', argsJson: '{"path":"package.json"}' },
+          { kind: 'tool_call_end', id: 'c1' },
+          { kind: 'message_end', finishReason: 'tool_calls' },
+        ],
+        [
+          { kind: 'message_start' },
+          { kind: 'text_delta', text: 'demo-pkg at 9.9.9' },
+          { kind: 'message_end', finishReason: 'stop' },
+        ],
+      ]);
+      const r = await run(
+        { task: 'what is the package version', cwd: dir, model: 'mock', maxSteps: 3, nonInteractive: true },
+        { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+      );
+      expect(r.status).toBe('complete');
+      expect(r.toolCalls).toBe(1);
+      expect(r.finalText).toContain('9.9.9');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks interrupted output in the transcript on abort (2.4)', async () => {
+    const reg = new ToolRegistry().register(readFileTool).register(writeFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const ac = new AbortController();
+    const adapter: ProviderAdapter = {
+      id: 'mock',
+      async *stream() {
+        yield { kind: 'message_start' };
+        yield { kind: 'text_delta', text: 'partial answer' };
+        ac.abort();
+      },
+    };
+    const r = await run(
+      { task: 'abort', cwd, model: 'mock', maxSteps: 3, nonInteractive: true, signal: ac.signal },
+      { adapter, registry: reg, policy, approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt },
+    );
+    expect(r.status).toBe('aborted');
+    const texts = r.transcript
+      .flatMap((m) => m.content)
+      .filter((b): b is { kind: 'text'; text: string } => (b as { kind?: string }).kind === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    expect(texts).toContain('Interrupted by user');
   });
 
   it('emits onEvent for text deltas, tool call lifecycle, and final text', async () => {

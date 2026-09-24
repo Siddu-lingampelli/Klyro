@@ -14,6 +14,8 @@
 import { z } from 'zod';
 import type { Message, ToolUseBlock } from './message.js';
 import { redact } from '../policy/secret-redactor.js';
+import { estimateTokens } from '../context/tokenizer.js';
+import { proxiedFetch } from '../shared/proxy.js';
 
 export type StreamEvent =
   | { kind: 'text_delta'; text: string }
@@ -49,12 +51,18 @@ export interface CallRequest {
   tools: ToolDefinition[];
   maxTokens?: number;
   temperature?: number;
+  /** Reasoning effort for reasoning models ( OpenAI `reasoning_effort` ); adapters that lack the concept ignore it. */
+  reasoningEffort?: 'low' | 'medium' | 'high';
   signal?: AbortSignal;
 }
 
 export interface ProviderAdapter {
   readonly id: string;
   stream(req: CallRequest): AsyncIterable<StreamEvent>;
+  /** Optional capability discovery: model ids (2.1). Absent = unknown, use configured ids. */
+  listModels?(): Promise<string[]>;
+  /** Optional local token estimate (2.1). Absent = caller estimates. */
+  countTokens?(text: string): number | Promise<number>;
 }
 
 // --- OpenAI-compatible chat-completions adapter ---
@@ -164,6 +172,7 @@ interface ChatCompletionsRequest {
   tools?: Array<{ type: 'function'; function: { name: string; description: string; parameters: unknown } }>;
   max_tokens?: number;
   temperature?: number;
+  reasoning_effort?: 'low' | 'medium' | 'high';
   stream: true;
 }
 
@@ -229,6 +238,7 @@ export function buildChatCompletionsBody(req: CallRequest): ChatCompletionsReque
   const body: ChatCompletionsRequest = { model: req.model, messages, stream: true };
   if (req.maxTokens) body.max_tokens = req.maxTokens;
   if (typeof req.temperature === 'number') body.temperature = req.temperature;
+  if (req.reasoningEffort) body.reasoning_effort = req.reasoningEffort;
   if (req.tools.length) {
     body.tools = req.tools.map((t) => ({
       type: 'function' as const,
@@ -239,12 +249,31 @@ export function buildChatCompletionsBody(req: CallRequest): ChatCompletionsReque
 }
 
 export function httpChatAdapter(opts: HttpAdapterOptions): ProviderAdapter {
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  const fetchImpl = opts.fetchImpl ?? proxiedFetch;
   const url = `${opts.baseURL.replace(/\/+$/, '')}/chat/completions`;
   return {
     id: 'http-chat',
     stream(req: CallRequest): AsyncIterable<StreamEvent> {
       return streamChatCompletions(url, opts, req, fetchImpl);
+    },
+    // 2.1 — capability discovery: list model ids via OpenAI /models.
+    // Returns [] when the endpoint doesn't serve a model list (not an
+    // error: callers fall back to configured ids).
+    async listModels(): Promise<string[]> {
+      try {
+        const res = await fetchImpl(`${opts.baseURL.replace(/\/+$/, '')}/models`, {
+          headers: opts.apiKey ? { Authorization: `Bearer ${opts.apiKey}` } : {},
+        });
+        if (!res.ok) return [];
+        const json = (await res.json()) as { data?: Array<{ id?: string }> };
+        const ids = Array.isArray(json.data) ? json.data.map((m) => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0) : [];
+        return [...new Set(ids)];
+      } catch {
+        return [];
+      }
+    },
+    countTokens(text: string): number {
+      return estimateTokens(text);
     },
   };
 }

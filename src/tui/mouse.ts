@@ -87,6 +87,7 @@ export class MouseFilter {
       const tail = n - i;
       if (tail <= 5) {
         const rest = buf.subarray(i).toString('latin1');
+        // eslint-disable-next-line no-control-regex -- intentional: detecting split SGR/X10 mouse-sequence prefixes
         if (/^\x1b\[<$/.test(rest) || /^\x1b\[<[\d;]+$/.test(rest) || /^\x1b\[M.{0,2}$/.test(rest)) {
           this.pending = buf.subarray(i);
           break;
@@ -110,14 +111,16 @@ export const MOUSE_DISABLE = '\x1b[?1000l\x1b[?1006l';
 /**
  * Whether the TUI may request terminal mouse reporting (wheel scrolling).
  *
- * Default OFF: with button reporting enabled the terminal routes
- * selection clicks and right-click paste to the app (which swallows them),
- * so native select-to-copy and right-click-paste break. Native selection
- * works out of the box; set `KLYRO_MOUSE=1` to opt into wheel scrolling
- * (Shift+drag still selects natively in most terminals).
+ * Default ON (opencode parity): the wheel scrolls the chat out of the box.
+ * Trade-off, stated plainly: with button reporting enabled the terminal
+ * routes plain selection clicks and right-clicks to the app (which drops
+ * them), so select-to-copy and right-click paste need Shift+drag /
+ * Shift+right-click in most terminals instead. Set `KLYRO_MOUSE=0` to opt
+ * out (fully native selection) and scroll with PgUp/PgDn, Ctrl+U/D,
+ * Shift+↑/↓, Home/End, or Space instead.
  */
 export function isMouseReportingEnabled(env: Readonly<Record<string, string | undefined>> = process.env): boolean {
-  return env.KLYRO_MOUSE === '1';
+  return env.KLYRO_MOUSE !== '0';
 }
 
 export const PASTE_START = '\x1b[200~';

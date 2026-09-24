@@ -7,7 +7,7 @@
  * that into a ToolResult error) instead of being silently truncated.
  */
 import * as fs from 'node:fs/promises';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import type { PlanStep } from '../agent/runtime.js';
 import { redact } from '../policy/secret-redactor.js';

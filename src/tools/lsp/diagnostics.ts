@@ -17,7 +17,6 @@ import { safe } from '../normalize.js';
 import { resolveWithinCwd } from '../../policy/path-guard.js';
 import { buildRepoMap } from '../../context/repo-map.js';
 
-const OFF_NOTE = 'set KLYRO_LSP=1 to re-enable (default on)';
 function isOff(): boolean {
   return process.env.KLYRO_LSP === '0';
 }
@@ -30,7 +29,7 @@ export const lspDiagnosticsTool = defineTool({
   isConcurrencySafe: true,
   execute: async (input, ctx) => safe(async () => {
     if (isOff()) return { enabled: false, diagnostics: [], note: 'LSP off via KLYRO_LSP=0' } as const;
-    const target = input.path ? resolveWithinCwd(ctx.cwd, input.path).resolved : null;
+    const target = input.path ? resolveWithinCwd(ctx.cwd, input.path, ctx.agentAllowedPaths).resolved : null;
     // Prefer the project's own tsc; fall back to npx tsc on PATH.
     const tscArgs = ['--noEmit', '--pretty', 'false'];
     let out = '';
@@ -62,7 +61,7 @@ export const lspGotoDefinitionTool = defineTool({
   isConcurrencySafe: true,
   execute: async (input, ctx) => safe(async () => {
     if (isOff()) return { enabled: false, location: null, note: 'LSP off via KLYRO_LSP=0' } as const;
-    const { resolved } = resolveWithinCwd(ctx.cwd, input.path);
+    const { resolved } = resolveWithinCwd(ctx.cwd, input.path, ctx.agentAllowedPaths);
     let content: string;
     try {
       content = await fs.readFile(resolved, 'utf-8');

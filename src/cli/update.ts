@@ -14,6 +14,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { createHash } from 'node:crypto';
+import { proxiedFetch } from '../shared/proxy.js';
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const REGISTRY_BASE = 'https://registry.npmjs.org/klyro';
@@ -69,7 +70,7 @@ async function fetchWithTimeout(url: string, timeoutMs = FETCH_TIMEOUT_MS): Prom
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: ctrl.signal });
+    const res = await proxiedFetch(url, { signal: ctrl.signal, timeoutMs });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res;
   } finally {
@@ -96,6 +97,11 @@ async function verifyTarballIntegrity(dist: Dist): Promise<boolean> {
 
 export async function checkForUpdate(current: string): Promise<string | null> {
   if (process.env.KLYRO_NO_UPDATE_CHECK === '1') return null;
+  // Disabled in CI unless explicitly enabled (1.5): automated pipelines
+  // must never phone home or suggest interactive updates.
+  if ((process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true') && process.env.KLYRO_UPDATE_CHECK !== '1') {
+    return null;
+  }
   const cache = cachePath();
   try {
     const raw = await fs.readFile(cache, 'utf-8');

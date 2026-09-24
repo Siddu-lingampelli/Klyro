@@ -39,11 +39,6 @@ export interface VerifyResult {
 }
 
 const MAX_VERIFY_BYTES = 256 * 1024;
-function appendCapped(current: string, chunk: string): string {
-  if (current.length >= MAX_VERIFY_BYTES) return current;
-  const next = current + chunk;
-  return next.length > MAX_VERIFY_BYTES ? next.slice(0, MAX_VERIFY_BYTES) + '\n... [truncated]' : next;
-}
 
 // SEC-004: denylist for dangerous patterns in verify commands.
 // Destructive-only: the verify command comes from CLI flags, project config,

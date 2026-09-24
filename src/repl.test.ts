@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { trimHistory, type Turn } from './repl.js';
+import { trimHistory, splitContinuedLine, type Turn } from './repl.js';
 import { estimateTokens } from './context/tokenizer.js';
 
 function pair(n: number, size: number): Turn[] {
@@ -34,5 +34,20 @@ describe('legacy trimHistory (token-budgeted)', () => {
     const h = pair(4, 10);
     trimHistory(h);
     expect(h).toHaveLength(4);
+  });
+});
+
+describe('splitContinuedLine (1.4 trailing-backslash continuation)', () => {
+  it('completes plain lines immediately', () => {
+    expect(splitContinuedLine('', 'hello')).toEqual({ pending: '', complete: 'hello' });
+  });
+
+  it('continues on an odd trailing run, stripping one backslash', () => {
+    expect(splitContinuedLine('', 'first \\')).toEqual({ pending: 'first \n', complete: undefined });
+    expect(splitContinuedLine('first \n', 'second')).toEqual({ pending: '', complete: 'first \nsecond' });
+  });
+
+  it('treats even trailing runs as literal backslashes', () => {
+    expect(splitContinuedLine('', 'path\\\\')).toEqual({ pending: '', complete: 'path\\\\' });
   });
 });

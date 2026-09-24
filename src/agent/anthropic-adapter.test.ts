@@ -453,3 +453,29 @@ describe('toAnthropicMessages', () => {
     expect(out[1]?.content).toEqual([{ type: 'text', text: 'hi' }]);
   });
 });
+
+describe('anthropicAdapter listModels (2.1)', () => {
+  it('lists models with version + key headers', async () => {
+    const seen: Array<{ url: string; headers: Record<string, string> }> = [];
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      seen.push({ url, headers: { ...(init?.headers as Record<string, string>) } });
+      return new Response(JSON.stringify({ data: [{ id: 'claude-x' }] }), { status: 200 });
+    }) as typeof fetch;
+    const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl });
+    await expect(adapter.listModels!()).resolves.toEqual(['claude-x']);
+    expect(seen[0]!.url).toBe('https://api.anthropic.com/v1/models');
+    expect(seen[0]!.headers['anthropic-version']).toBeTruthy();
+    expect(seen[0]!.headers['x-api-key']).toBe('k');
+  });
+
+  it('returns [] on failure', async () => {
+    const fetchImpl = (async () => { throw new Error('down'); }) as typeof fetch;
+    const adapter = anthropicAdapter({ apiKey: 'k', fetchImpl });
+    await expect(adapter.listModels!()).resolves.toEqual([]);
+  });
+
+  it('counts tokens locally', () => {
+    const adapter = anthropicAdapter({ apiKey: 'k' });
+    expect(adapter.countTokens!('hello world, this is a longer piece of text')).toBeGreaterThan(1);
+  });
+});

@@ -66,7 +66,7 @@ export const multiEditTool = defineTool({
       const combined = input.edits.map((e) => `${e.find}\n${e.replace}`).join('\n');
       const guard = checkRepairGuard(input.path, combined, ctx.repairGuard?.denyTestEdits);
       if (guard) return guard as unknown as { path: string; edits: number; diff: string };
-      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const allowed = await checkAllowedPaths(ctx.cwd, resolved, ctx.agentAllowedPaths);
       if (allowed) return allowed as unknown as { path: string; edits: number; diff: string };
       const stat = await fs.stat(resolved);
@@ -91,7 +91,7 @@ export const multiEditTool = defineTool({
       // before the write and refuse if the target moved. Compares
       // canonicalized forms (not raw strings) to avoid false positives from
       // lexical-vs-canonical spellings (e.g. `sub/../a.txt`, short names).
-      const { resolved: reResolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const { resolved: reResolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const canon = async (p: string): Promise<string> => {
         try { return await fs.realpath(p); } catch { /* missing file → try parent */ }
         try { return path.join(await fs.realpath(path.dirname(p)), path.basename(p)); } catch { return p; }

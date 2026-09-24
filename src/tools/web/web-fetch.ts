@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { safe } from '../normalize.js';
 import { redact } from '../../policy/secret-redactor.js';
+import { proxiedFetch } from '../../shared/proxy.js';
 
 const InputSchema = z.object({
   url: z.string().min(1).describe('Absolute http(s) URL to fetch'),
@@ -221,7 +222,7 @@ export const webFetchTool = defineTool({
               },
             };
           }
-          const attempt: Response = await fetch(current, { signal: ctrl.signal, redirect: 'manual', headers });
+          const attempt: Response = await proxiedFetch(current, { signal: ctrl.signal, redirect: 'manual', headers, timeoutMs });
           const location = attempt.headers.get('location');
           if (attempt.status >= 300 && attempt.status < 400 && location) {
             try {

@@ -70,7 +70,7 @@ export const searchFilesTool = defineTool({
   inputSchema: InputSchema,
   execute: async (input, ctx) => {
     return safe(async () => {
-      const base = input.cwd ? resolveWithinCwd(ctx.cwd, input.cwd).resolved : ctx.cwd;
+      const base = input.cwd ? resolveWithinCwd(ctx.cwd, input.cwd, ctx.agentAllowedPaths).resolved : ctx.cwd;
       const max = input.maxResults ?? DEFAULT_MAX;
       const matcher = input.query ? queryToRegex(input.query) : null;
       const globRe = input.glob ? globToRegex(input.glob) : null;

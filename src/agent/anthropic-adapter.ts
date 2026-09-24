@@ -20,6 +20,8 @@ import type { Message } from './message.js';
 import type { CallRequest, ProviderAdapter, StreamEvent, ToolDefinition } from './provider-adapter.js';
 import { assertSafeBaseURL } from '../chat.js';
 import { parseRetryAfterMs } from './provider-adapter.js';
+import { estimateTokens } from '../context/tokenizer.js';
+import { proxiedFetch } from '../shared/proxy.js';
 
 export interface AnthropicAdapterOptions {
   baseURL?: string;
@@ -92,7 +94,7 @@ export function anthropicAdapter(opts: AnthropicAdapterOptions): ProviderAdapter
   const promptCache = opts.promptCache ?? true;
   const betas = [...(opts.betas ?? [])];
   if (promptCache && !betas.includes(PROMPT_CACHING_BETA)) betas.push(PROMPT_CACHING_BETA);
-  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+  const fetchImpl = opts.fetchImpl ?? proxiedFetch;
   if (!fetchImpl) {
     throw new Error('anthropicAdapter: no fetch available — pass opts.fetchImpl or run on Node 18+');
   }
@@ -104,6 +106,25 @@ export function anthropicAdapter(opts: AnthropicAdapterOptions): ProviderAdapter
         baseURL, apiKey: opts.apiKey, timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         fetchImpl, version, authHeader, betas, promptCache,
       });
+    },
+    // 2.1 — capability discovery via the Anthropic Models API.
+    // Returns [] when unavailable (callers fall back to configured ids).
+    async listModels(): Promise<string[]> {
+      try {
+        const headers: Record<string, string> = { 'anthropic-version': version };
+        if (authHeader === 'x-api-key') headers['x-api-key'] = opts.apiKey;
+        else headers['Authorization'] = `Bearer ${opts.apiKey}`;
+        const res = await fetchImpl(`${baseURL}/v1/models`, { headers });
+        if (!res.ok) return [];
+        const json = (await res.json()) as { data?: Array<{ id?: string }> };
+        const ids = Array.isArray(json.data) ? json.data.map((m) => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0) : [];
+        return [...new Set(ids)];
+      } catch {
+        return [];
+      }
+    },
+    countTokens(text: string): number {
+      return estimateTokens(text);
     },
   };
 }

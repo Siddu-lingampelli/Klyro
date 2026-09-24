@@ -50,7 +50,7 @@ export const grepTool = defineTool({
       if (/\([^)]*\+[^)]*\)\+|\(\.\*\)\*|\{[0-9]+,[0-9]*\}\s*\+/.test(input.pattern)) {
         return { ok: false, error: { code: TOOL_ERROR_CODES.INVALID_INPUT, message: 'Pattern rejected (potential ReDoS)' } } as const;
       }
-      const base = input.cwd ? resolveWithinCwd(ctx.cwd, input.cwd).resolved : ctx.cwd;
+      const base = input.cwd ? resolveWithinCwd(ctx.cwd, input.cwd, ctx.agentAllowedPaths).resolved : ctx.cwd;
       let re: RegExp;
       try {
         re = new RegExp(input.pattern, 'g');

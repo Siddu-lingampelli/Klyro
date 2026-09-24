@@ -14,6 +14,7 @@
 
 import { assertSafeBaseURL, normalizeBaseURL } from './chat.js';
 import { localProbeEndpoints } from './providers/endpoints.js';
+import { resolveModelAlias } from './providers/model-info.js';
 
 export interface ProviderConfig {
   baseURL: string;
@@ -59,7 +60,9 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
   };
   const envBaseURL = process.env.KLYRO_BASE_URL;
   const envKey = process.env.KLYRO_API_KEY;
-  const envModel = process.env.KLYRO_MODEL;
+  // Model aliases (2.2: sonnet/opus/haiku/gpt/local) resolve against the
+  // registry here so every consumer gets canonical ids.
+  const envModel = process.env.KLYRO_MODEL ? resolveModelAlias(process.env.KLYRO_MODEL) : undefined;
 
   // Persisted config loads first: it carries the allowInsecure opt-in that
   // also governs env URLs, and supplies model/key fallbacks everywhere.
@@ -71,7 +74,8 @@ export async function resolveProvider(): Promise<ProviderConfig | null> {
   const allowInsecure = cfg.allowInsecure === true;
   const cfgBase = (cfg.baseUrl ?? cfg.baseURL) as string | undefined;
   const cfgProvider = cfg.provider as string | undefined;
-  const cfgModel = (cfg.model ?? cfg['model.default']) as string | undefined;
+  const cfgModelRaw = (cfg.model ?? cfg['model.default']) as string | undefined;
+  const cfgModel = cfgModelRaw ? resolveModelAlias(cfgModelRaw) : undefined;
   const cfgKey = (cfg.apiKey ?? cfg.api_key) as string | undefined;
 
   // An explicitly configured endpoint that fails policy is a hard error —

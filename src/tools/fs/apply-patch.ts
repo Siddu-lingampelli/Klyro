@@ -22,7 +22,7 @@ import * as path from 'node:path';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { resolveAndFollowSymlinks, assertNotSymlink } from '../../policy/path-guard.js';
-import { safe, TOOL_ERROR_CODES } from '../normalize.js';
+import { safe } from '../normalize.js';
 import { wasRead } from './read-history.js';
 
 // Extension-anchored: matches test.ts, foo.test.ts, foo-test.ts, foo.spec.js,
@@ -157,8 +157,8 @@ async function guardWrite(cwd: string, relPath: string, resolved: string): Promi
 // before the write and refuse if the target moved. Compares canonicalized
 // forms (not raw strings) to avoid false positives from
 // lexical-vs-canonical spellings (e.g. `sub/../a.txt`, short names).
-async function assertSameTarget(cwd: string, relPath: string, resolved: string): Promise<void> {
-  const { resolved: reResolved } = await resolveAndFollowSymlinks(cwd, relPath);
+async function assertSameTarget(cwd: string, relPath: string, resolved: string, extraRoots?: readonly string[]): Promise<void> {
+  const { resolved: reResolved } = await resolveAndFollowSymlinks(cwd, relPath, extraRoots);
   const canon = async (p: string): Promise<string> => {
     try { return await fs.realpath(p); } catch { /* missing file → try parent */ }
     try { return path.join(await fs.realpath(path.dirname(p)), path.basename(p)); } catch { return p; }
@@ -214,7 +214,7 @@ export const applyPatchTool = defineTool({
         if (ctx.repairGuard?.denyTestEdits && repairGuardHit(sec.path, sec.body.join('\n'))) {
           throw Object.assign(new Error('repair-guard: test edits denied (denyTestEdits)'), { code: 'POLICY_DENIED' });
         }
-        const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, sec.path);
+        const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, sec.path, ctx.agentAllowedPaths);
         if (await allowedHit(ctx.cwd, resolved, ctx.agentAllowedPaths)) {
           throw Object.assign(new Error(`agent path not allowed: ${resolved} (POLICY_DENIED)`), { code: 'POLICY_DENIED' });
         }
@@ -240,7 +240,7 @@ export const applyPatchTool = defineTool({
             .map((l) => l.slice(1))
             .join('\n');
           await guardWrite(ctx.cwd, sec.path, resolved);
-          await assertSameTarget(ctx.cwd, sec.path, resolved);
+          await assertSameTarget(ctx.cwd, sec.path, resolved, ctx.agentAllowedPaths);
           await fs.mkdir(path.dirname(resolved), { recursive: true });
           // Symlink-swap guard: refuse if the final dest became a symlink
           // since the up-front resolve (lstat never follows the final link).

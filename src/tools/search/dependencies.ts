@@ -126,7 +126,7 @@ export const dependenciesTool = defineTool({
   inputSchema: InputSchema,
   execute: async (input, ctx) => {
     return safe(async () => {
-      const base = input.cwd ? resolveWithinCwd(ctx.cwd, input.cwd).resolved : ctx.cwd;
+      const base = input.cwd ? resolveWithinCwd(ctx.cwd, input.cwd, ctx.agentAllowedPaths).resolved : ctx.cwd;
       const max = input.maxResults ?? DEFAULT_MAX;
       const want = input.ecosystem ?? 'auto';
 

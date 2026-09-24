@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { runDoctor } from './doctor.js';
+import { runDoctor, describeKeyBytes } from './doctor.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -54,5 +54,45 @@ describe('doctor trust + mcp rows', () => {
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
+  });
+
+  it('includes npm/PATH/ripgrep/Terminal/Proxy rows (1.5)', async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'klyro-doctor-env-'));
+    try {
+      const { json } = await captureJson(cwd);
+      const names = (json['checks'] as { name: string }[]).map((c) => c.name);
+      for (const n of ['npm', 'PATH', 'ripgrep', 'Terminal', 'Proxy']) {
+        expect(names).toContain(n);
+      }
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+
+describe('describeKeyBytes (doctor --keys probe)', () => {
+  it('names arrows, paging, home/end', () => {
+    expect(describeKeyBytes(Buffer.from('\x1b[A', 'latin1'))).toMatch(/Up arrow/);
+    expect(describeKeyBytes(Buffer.from('\x1b[B', 'latin1'))).toMatch(/Down arrow/);
+    expect(describeKeyBytes(Buffer.from('\x1b[5~', 'latin1'))).toMatch(/PageUp/);
+    expect(describeKeyBytes(Buffer.from('\x1b[6~', 'latin1'))).toMatch(/PageDown/);
+    expect(describeKeyBytes(Buffer.from('\x1b[H', 'latin1'))).toMatch(/Home/);
+    expect(describeKeyBytes(Buffer.from('\x1b[F', 'latin1'))).toMatch(/End/);
+  });
+
+  it('names Ctrl+P/N, paste markers, and wheel events', () => {
+    expect(describeKeyBytes(Buffer.from('\x10', 'latin1'))).toMatch(/Ctrl\+P/);
+    expect(describeKeyBytes(Buffer.from('\x0e', 'latin1'))).toMatch(/Ctrl\+N/);
+    expect(describeKeyBytes(Buffer.from('\x1b[200~', 'latin1'))).toMatch(/START/);
+    expect(describeKeyBytes(Buffer.from('\x1b[201~', 'latin1'))).toMatch(/END/);
+    expect(describeKeyBytes(Buffer.from('\x1b[<64;10;20M', 'latin1'))).toMatch(/wheel up/);
+    expect(describeKeyBytes(Buffer.from('\x1b[<65;10;20M', 'latin1'))).toMatch(/wheel down/);
+    expect(describeKeyBytes(Buffer.from('\x1b[<0;10;20M', 'latin1'))).toMatch(/click\/drag/);
+  });
+
+  it('flags lone ESC as a possible split sequence', () => {
+    expect(describeKeyBytes(Buffer.from('\x1b', 'latin1'))).toMatch(/lone/);
+    expect(describeKeyBytes(Buffer.from('hello', 'utf-8'))).toMatch(/Printable/);
   });
 });

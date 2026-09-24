@@ -120,13 +120,11 @@ export async function runEval(opts: RunEvalOptions): Promise<number> {
   }
   // 5.4 — suite mode: load from evals/fixtures
   if (opts.suite) {
-    const { runHarness, loadFileFixture } = await import('../eval/harness.js');
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
-    const suiteDir = path.join(process.cwd(), 'evals', 'fixtures', opts.suite === 'smoke' ? '' : opts.suite);
     // For smoke, use the 10 fixtures directly
     const fixturesDir = path.join(process.cwd(), 'evals', 'fixtures');
-    let tasks: import('../eval/harness.js').ScriptedTask[] = [];
+    const tasks: import('../eval/harness.js').ScriptedTask[] = [];
     try {
       const entries = await fs.readdir(fixturesDir);
       for (const e of entries) {

@@ -74,18 +74,33 @@ export class RuntimeTelemetry {
       maxRecentCalls: opts.maxRecentCalls ?? DEFAULT_MAX_RECENT,
       maxChars: opts.maxChars ?? DEFAULT_MAX_CHARS,
     };
+    // KLYRO_TELEMETRY=0 disables telemetry accumulation + reporting.
+    this.muted = process.env.KLYRO_TELEMETRY === '0';
+  }
+
+  private muted = false;
+
+  /** Disable telemetry accumulation + reporting (also via KLYRO_TELEMETRY=0). */
+  mute(): void {
+    this.muted = true;
+  }
+
+  isMuted(): boolean {
+    return this.muted;
   }
 
   setMaxSteps(n: number): void { this.maxSteps = n; }
 
-  recordStepStart(step: number): void { this.step = step; }
+  recordStepStart(step: number): void { if (!this.muted) this.step = step; }
 
   recordUsage(input: number, output: number): void {
+    if (this.muted) return;
     this.inputTokens += input;
     this.outputTokens += output;
   }
 
   recordToolCall(call: ToolUseBlock, latencyMs: number, isError: boolean): void {
+    if (this.muted) return;
     this.toolCallCount++;
     if (isError) this.errorCount++;
     this.recent.push({
@@ -101,6 +116,7 @@ export class RuntimeTelemetry {
   }
 
   recordError(msg: string): void {
+    if (this.muted) return;
     this.lastError = msg;
   }
 
@@ -130,6 +146,7 @@ export class RuntimeTelemetry {
   }
 
   format(): string {
+    if (this.muted) return emptyTelemetryBlock();
     const s = this.snapshot();
     const lines: string[] = [];
     lines.push('# Runtime telemetry');

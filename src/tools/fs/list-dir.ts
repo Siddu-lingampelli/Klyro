@@ -37,7 +37,7 @@ export const listDirTool = defineTool({
   inputSchema: InputSchema,
   execute: async (input, ctx) => {
     return safe(async () => {
-      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const stat = await fs.stat(resolved);
       if (!stat.isDirectory()) {
         return {

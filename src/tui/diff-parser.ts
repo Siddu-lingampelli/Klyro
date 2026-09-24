@@ -15,7 +15,7 @@
  * Returns one DiffHunk per file. Lines are preserved in order.
  */
 
-import type { DiffHunk, DiffLine } from './diff.js';
+import type { DiffHunk } from './diff.js';
 
 export function parseUnifiedDiff(raw: string): DiffHunk[] {
   const out: DiffHunk[] = [];

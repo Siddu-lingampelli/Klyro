@@ -22,10 +22,6 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   resume: ['-m', '--model', '--max-steps'],
 };
 
-function flagsFor(cmd: string): string[] {
-  return [...GLOBAL_FLAGS, ...(COMMAND_FLAGS[cmd] ?? [])];
-}
-
 function bashScript(): string {
   const cmdCases = Object.entries(COMMAND_FLAGS)
     .map(([c, fs]) => `      ${c}) opts="${fs.join(' ')}" ;;`)

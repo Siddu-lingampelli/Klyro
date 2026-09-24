@@ -30,6 +30,17 @@ const MAX_HISTORY_TURNS = 40;
 /** Approximate char budget for the user side of history. */
 const MAX_HISTORY_CHARS = 80_000;
 
+/**
+ * Trailing-backslash continuation for the legacy REPL (1.4): a line ending
+ * in an odd run of backslashes joins the next line (one backslash removed,
+ * newline kept); anything else completes the prompt. Exported for tests.
+ */
+export function splitContinuedLine(pending: string, line: string): { pending: string; complete?: string } {
+  const m = /\\+$/.exec(line);
+  if (m && m[0].length % 2 === 1) return { pending: pending + line.slice(0, -1) + '\n' };
+  return { pending: '', complete: pending + line };
+}
+
 export async function repl(system: string): Promise<void> {
   const provider = await resolveProvider();
   if (!provider) {
@@ -41,7 +52,7 @@ export async function repl(system: string): Promise<void> {
     console.error('    ollama serve   # then KLYRO_BASE_URL=http://localhost:11434/v1 KLYRO_MODEL=llama3.2');
     exit(2);
   }
-  const { baseURL, apiKey, model, source } = provider;
+  const { baseURL, apiKey, model } = provider;
   // Legacy REPL — prefer `klyro tui`; history truncation is approximate.
   process.stderr.write('klyro: legacy REPL — prefer `klyro tui`; history truncation is approximate.\n');
 
@@ -66,23 +77,30 @@ export async function repl(system: string): Promise<void> {
   });
 
   if (isTTY) console.log(`klyro REPL — type :quit to exit, :clear to reset history  ${providerHelp(provider)}`);
+  // Trailing-backslash continuation (1.4): a line ending in an odd run of
+  // backslashes joins the next line (one backslash removed, newline kept).
+  let continued = '';
   try {
     while (true) {
       // In TTY mode, readline handles the prompt and echoes the user's typing.
       // In non-TTY mode, we write the prompt ourselves.
-      if (!isTTY) process.stdout.write('> ');
+      const tag = continued ? '... ' : (isTTY ? '> ' : '');
+      if (!isTTY) process.stdout.write(tag);
       let line: string;
       try {
         // Pass the prompt only when readline is in charge (TTY). In non-TTY
         // mode the prompt is suppressed (output: undefined) so passing '' is
         // equivalent and avoids doubling.
-        line = await rl.question(isTTY ? '> ' : '');
-      } catch (err) {
+        line = await rl.question(isTTY ? tag : '');
+      } catch {
         // EOF on stdin (Ctrl-D) or close — exit cleanly.
         break;
       }
       if (!line) break; // empty line on EOF
-      const prompt = line.trim();
+      const step = splitContinuedLine(continued, line);
+      continued = step.pending;
+      if (step.complete === undefined) continue;
+      const prompt = step.complete.trim();
       if (!prompt) continue;
       if (prompt === ':quit' || prompt === ':exit') break;
       if (prompt === ':clear') {

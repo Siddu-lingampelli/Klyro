@@ -341,12 +341,14 @@ describe('orchestrator spawn budgets and guards', () => {
       // Rejected pre-worktree: no task may have been created.
       expect(orch.taskManager.list()).toHaveLength(0);
     } finally {
+      // Best-effort cleanup: never throw from `finally` (it would mask the
+      // test body's own failure — no-unsafe-finally). Leftover tmp dirs are
+      // reaped by the OS temp cleaner.
       for (let i = 0; i < 5; i++) {
         try {
           await fs.rm(dir, { recursive: true, force: true });
           break;
         } catch {
-          if (i === 4) throw new Error(`cleanup failed for ${dir}`);
           await new Promise((r) => setTimeout(r, 100 * (i + 1)));
         }
       }

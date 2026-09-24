@@ -79,6 +79,14 @@ const BUILTINS: ProviderEndpoint[] = [
     defaultModel: 'local-model',
     probePath: '/models',
   },
+  {
+    id: 'openrouter',
+    label: 'OpenRouter',
+    kind: 'openai-compatible',
+    baseURL: 'https://openrouter.ai/api/v1',
+    defaultModel: 'openai/gpt-4o-mini',
+    apiKeyEnv: ['KLYRO_API_KEY', 'OPENROUTER_API_KEY'],
+  },
 ];
 
 const custom = new Map<string, ProviderEndpoint>();

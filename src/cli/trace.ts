@@ -4,7 +4,6 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { getDefaultSessionStore, resolveSessionId } from '../persistence/session.js';
 
 async function readTraceFile(sessionId: string): Promise<unknown[]> {
   // Try trace writer path first: .klyro/traces/<id>.jsonl

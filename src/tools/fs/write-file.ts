@@ -71,7 +71,7 @@ export const writeFileTool = defineTool<z.infer<typeof InputSchema>, WriteFileOu
     return safe(async () => {
       const guard = checkRepairGuard(input.path, input.content, ctx.repairGuard?.denyTestEdits);
       if (guard) return guard as unknown as WriteFileOutput;
-      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const { resolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const allowed = await checkAllowedPaths(ctx.cwd, resolved, ctx.agentAllowedPaths);
       if (allowed) return allowed as unknown as WriteFileOutput;
       const parent = path.dirname(resolved);
@@ -99,7 +99,7 @@ export const writeFileTool = defineTool<z.infer<typeof InputSchema>, WriteFileOu
       // the re-resolution is canonical (parent now exists), so compare
       // canonicalized forms — not raw strings — to avoid false positives
       // (e.g. Windows 8.3 short-name expansion after mkdir).
-      const { resolved: reResolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path);
+      const { resolved: reResolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const canon = async (p: string): Promise<string> => {
         try { return await fs.realpath(p); } catch { /* missing file → try parent */ }
         try { return path.join(await fs.realpath(path.dirname(p)), path.basename(p)); } catch { return p; }

@@ -7,7 +7,7 @@ import { KlyroError } from '../shared/errors.js';
 export function handleFatal(err: unknown): never {
   const isDebug = !!process.env.KLYRO_LOG_LEVEL || !!process.env.DEBUG || process.argv.includes('--debug');
   let code = 1;
-  let message = err instanceof Error ? err.message : String(err);
+  const message = err instanceof Error ? err.message : String(err);
   let hint: string | undefined;
 
   if (err instanceof KlyroError) {

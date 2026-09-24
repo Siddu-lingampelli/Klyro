@@ -49,8 +49,11 @@ export interface ApprovalPrompt {
  */
 export function sanitizeForPrompt(s: string): string {
   const noAnsi = s
+    // eslint-disable-next-line no-control-regex -- intentional: stripping CSI + OSC sequences
     .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+    // eslint-disable-next-line no-control-regex -- intentional: stripping OSC sequences
     .replace(/\x1b\][^\x07]*\x07/g, '');
+  // eslint-disable-next-line no-control-regex -- intentional: stripping C0 controls
   const clean = noAnsi.replace(/[\x00-\x08\x0b-\x0d\x0e-\x1f\x7f]/g, '');
   const LIMIT = 500;
   if (clean.length > LIMIT) {
