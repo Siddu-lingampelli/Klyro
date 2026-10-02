@@ -2,12 +2,12 @@
   "model": "mock",
   "node": "v26.3.0",
   "platform": "win32",
-  "commit": "2fa60a368569d5b5936f1e5b10c1ed3afbf79e49",
-  "timestamp": "2026-10-02T06:57:24.621Z",
+  "commit": "867fa46dbb2bc3a1f560c818b62e6285c30fb4ae",
+  "timestamp": "2026-10-02T11:42:38.252Z",
   "suite": "smoke",
   "total": 12,
   "passed": 12,
   "failed": 0,
   "passRate": 1,
-  "durationMs": 2312
+  "durationMs": 3438
 }
