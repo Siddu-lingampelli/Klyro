@@ -5,8 +5,10 @@
  * project has one and filters the output to the requested path (or returns
  * a capped full-project list). Other languages report "unsupported".
  * `lsp_goto_definition` resolves the identifier under (line, character) to
- * its definition via the regex repo-map symbol index. Set KLYRO_LSP=0 to
- * force both tools off.
+ * its definition via the regex repo-map symbol index.
+ * `lsp_references` finds all references to the identifier under (line, character).
+ * `lsp_outline` returns a hierarchical symbol outline for a file.
+ * Set KLYRO_LSP=0 to force all tools off.
  */
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs/promises';
@@ -15,7 +17,7 @@ import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { safe } from '../normalize.js';
 import { resolveWithinCwd } from '../../policy/path-guard.js';
-import { buildRepoMap } from '../../context/repo-map.js';
+import { buildRepoMap, extractSymbols } from '../../context/repo-map.js';
 
 function isOff(): boolean {
   return process.env.KLYRO_LSP === '0';
@@ -94,5 +96,100 @@ export const lspGotoDefinitionTool = defineTool({
     const other = hits.filter((h) => h.file !== rel);
     const best = other[0] ?? hits[0] ?? null;
     return { enabled: true, location: best, candidates: hits.length } as const;
+  }),
+});
+
+export const lspReferencesTool = defineTool({
+  name: 'lsp_references',
+  description: 'Find all references to the identifier under (line, character) via the repo symbol index',
+  inputSchema: z.object({ path: z.string().min(1), line: z.number().int().min(1), character: z.number().int().min(0).optional() }),
+  permission: 'read',
+  isConcurrencySafe: true,
+  execute: async (input, ctx) => safe(async () => {
+    if (isOff()) return { enabled: false, references: [], note: 'LSP off via KLYRO_LSP=0' } as const;
+    const { resolved } = resolveWithinCwd(ctx.cwd, input.path, ctx.agentAllowedPaths);
+    let content: string;
+    try {
+      content = await fs.readFile(resolved, 'utf-8');
+    } catch {
+      return { enabled: true, references: [], note: `unreadable file: ${input.path}` } as const;
+    }
+    const lines = content.split('\n');
+    const lineText = lines[input.line - 1] ?? '';
+    const col = Math.min(input.character ?? 0, lineText.length);
+    const wordAt = ((): string | null => {
+      const isWord = (c: string) => /[A-Za-z0-9_$]/.test(c);
+      let s = col;
+      let e = col;
+      while (s > 0 && isWord(lineText[s - 1]!)) s--;
+      while (e < lineText.length && isWord(lineText[e]!)) e++;
+      const w = lineText.slice(s, e);
+      return w || null;
+    })();
+    if (!wordAt) return { enabled: true, references: [], note: 'no identifier under cursor' } as const;
+    const files = await buildRepoMap({ cwd: ctx.cwd, maxFiles: 300 });
+    const refs: Array<{ file: string; line: number; kind: string; name: string }> = [];
+    const seen = new Set<string>();
+    for (const f of files) {
+      for (const s of f.symbols) {
+        if (s.name === wordAt) {
+          const key = `${f.path}:${s.line}:${s.name}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            refs.push({ file: f.path, line: s.line, kind: s.kind, name: s.name });
+          }
+        }
+      }
+    }
+    return { enabled: true, references: refs.slice(0, 100) } as const;
+  }),
+});
+
+export const lspOutlineTool = defineTool({
+  name: 'lsp_outline',
+  description: 'Hierarchical symbol outline for a file via the repo symbol index',
+  inputSchema: z.object({ path: z.string().min(1) }),
+  permission: 'read',
+  isConcurrencySafe: true,
+  execute: async (input, ctx) => safe(async () => {
+    if (isOff()) return { enabled: false, outline: [], note: 'LSP off via KLYRO_LSP=0' } as const;
+    const { resolved } = resolveWithinCwd(ctx.cwd, input.path, ctx.agentAllowedPaths);
+    // Symbol-extract this file directly rather than via buildRepoMap: the repo
+    // map is a whole-tree walk capped by maxFiles, so a single-file query can
+    // never be served from it (it would return whichever file the walk reached
+    // first, and the caller's path would usually be absent).
+    let content: string;
+    try {
+      content = await fs.readFile(resolved, 'utf-8');
+    } catch {
+      return { enabled: true, outline: [], note: `unreadable file: ${input.path}` } as const;
+    }
+    const symbols = extractSymbols(content, path.extname(resolved).toLowerCase());
+    // Build simple hierarchy: classes/interfaces as parents, methods/fields as children
+    const outline: Array<{ name: string; kind: string; line: number; children: Array<{ name: string; kind: string; line: number }> }> = [];
+    for (const sym of symbols) {
+      if (['class', 'interface', 'type'].includes(sym.kind)) {
+        outline.push({ name: sym.name, kind: sym.kind, line: sym.line, children: [] });
+      }
+    }
+    for (const sym of symbols) {
+      if (['method', 'function', 'property', 'field', 'const'].includes(sym.kind)) {
+        // Assign to the nearest preceding class/interface
+        let parentIdx = -1;
+        for (let i = outline.length - 1; i >= 0; i--) {
+          const parent = outline[i];
+          if (parent && parent.line < sym.line) { parentIdx = i; break; }
+        }
+        if (parentIdx >= 0) {
+          const parentEntry = outline[parentIdx];
+          if (parentEntry) {
+            parentEntry.children.push({ name: sym.name, kind: sym.kind, line: sym.line });
+          }
+        } else {
+          outline.push({ name: sym.name, kind: sym.kind, line: sym.line, children: [] });
+        }
+      }
+    }
+    return { enabled: true, outline } as const;
   }),
 });

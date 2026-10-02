@@ -60,3 +60,6 @@ evals/results/*
 .cache/
 tmp/
 temp/
+
+# Generated brag launch videos (timestamped artifacts)
+brag-output-*/

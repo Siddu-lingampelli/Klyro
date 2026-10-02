@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { snapshot, listCheckpoints, listCheckpointInfo, snapshotFiles, undo } from './store.js';
+import { snapshot, listCheckpoints, listCheckpointInfo, snapshotFiles, undo, readSnapshotTranscript } from './store.js';
 
 describe('checkpoints', () => {
   let tmp: string;
@@ -130,14 +130,17 @@ describe('checkpoints', () => {
     expect(await listCheckpoints(tmp)).not.toContain(`${id}.diff`);
   });
 
-  it('persists sessionId/eventId into .meta.json when provided', async () => {
+  it('persists sessionId/eventId + transcript into .meta.json when provided', async () => {
     await fs.writeFile(path.join(tmp, 'a.txt'), 'v1', 'utf-8');
-    const id = await snapshot(tmp, ['a.txt'], { sessionId: 'sess-1', eventId: 'evt-9' });
+    const transcript = [{ role: 'user', content: [{ kind: 'text', text: 'hi' }] }];
+    const id = await snapshot(tmp, ['a.txt'], { sessionId: 'sess-1', eventId: 'evt-9', transcript });
     const meta = JSON.parse(
       await fs.readFile(path.join(tmp, '.klyro', 'checkpoints', id, '.meta.json'), 'utf-8'),
-    ) as { sessionId?: string; eventId?: string };
+    ) as { sessionId?: string; eventId?: string; transcriptHash?: string };
     expect(meta.sessionId).toBe('sess-1');
     expect(meta.eventId).toBe('evt-9');
+    expect(typeof meta.transcriptHash).toBe('string');
+    await expect(fs.readFile(path.join(tmp, '.klyro', 'checkpoints', id, 'transcript.json'), 'utf-8')).resolves.toBeTruthy();
   });
 
   it('old metas without ids still load (undo/list/snapshotFiles)', async () => {
@@ -170,5 +173,47 @@ describe('checkpoints', () => {
     expect(await modeOf(path.join(tmp, '.klyro', 'checkpoints'))).toBe(0o700);
     expect(await modeOf(path.join(tmp, '.klyro', 'checkpoints', id, 'a.txt'))).toBe(0o600);
     expect(await modeOf(path.join(tmp, '.klyro', 'checkpoints', id, '.meta.json'))).toBe(0o600);
+  });
+
+  it('readSnapshotTranscript round-trips a captured transcript', async () => {
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'v1', 'utf-8');
+    const transcript = [
+      { role: 'user', content: [{ kind: 'text', text: 'first' }] },
+      { role: 'assistant', content: [{ kind: 'text', text: 'second' }] },
+    ];
+    const id = await snapshot(tmp, ['a.txt'], { transcript });
+    expect(await readSnapshotTranscript(tmp, id)).toEqual(transcript);
+  });
+
+  it('readSnapshotTranscript returns null when the transcript is tampered with', async () => {
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'v1', 'utf-8');
+    const id = await snapshot(tmp, ['a.txt'], {
+      transcript: [{ role: 'user', content: [{ kind: 'text', text: 'honest' }] }],
+    });
+    // Rewrite the payload without updating .meta.json's transcriptHash.
+    await fs.writeFile(
+      path.join(tmp, '.klyro', 'checkpoints', id, 'transcript.json'),
+      JSON.stringify([{ role: 'user', content: [{ kind: 'text', text: 'injected' }] }]),
+      'utf-8',
+    );
+    expect(await readSnapshotTranscript(tmp, id)).toBeNull();
+  });
+
+  it('readSnapshotTranscript returns null when no transcript was captured', async () => {
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'v1', 'utf-8');
+    const id = await snapshot(tmp, ['a.txt']);
+    expect(await readSnapshotTranscript(tmp, id)).toBeNull();
+    expect(await readSnapshotTranscript(tmp, 'no-such-id')).toBeNull();
+  });
+
+  it('transcript.json is not mistaken for an undo target file', async () => {
+    await fs.writeFile(path.join(tmp, 'a.txt'), 'v1', 'utf-8');
+    const id = await snapshot(tmp, ['a.txt'], {
+      transcript: [{ role: 'user', content: [{ kind: 'text', text: 'x' }] }],
+    });
+    // transcript.json lives inside the checkpoint dir and must never be restored
+    // into the working tree as if it were a snapshotted source file.
+    const restored = await snapshotFiles(tmp, id);
+    expect(restored).not.toContain('transcript.json');
   });
 });

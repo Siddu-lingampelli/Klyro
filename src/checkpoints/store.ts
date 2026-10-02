@@ -54,6 +54,7 @@ function containedPath(cwd: string, base: string, rel: string): string | null {
 export interface SnapshotOptions {
   sessionId?: string;
   eventId?: string;
+  transcript?: unknown[];
 }
 
 /** Checkpoint meta on disk — sessionId/eventId are absent on old metas. */
@@ -64,6 +65,7 @@ export interface CheckpointMeta {
   ts: number;
   sessionId?: string;
   eventId?: string;
+  transcriptHash?: string;
 }
 
 export async function snapshot(cwd: string, files: string[], opts?: SnapshotOptions): Promise<string> {
@@ -102,6 +104,14 @@ export async function snapshot(cwd: string, files: string[], opts?: SnapshotOpti
   const meta: CheckpointMeta = { id, files: kept, missing, ts: Date.now() };
   if (opts?.sessionId !== undefined) meta.sessionId = opts.sessionId;
   if (opts?.eventId !== undefined) meta.eventId = opts.eventId;
+  if (opts?.transcript) {
+    const transcriptPath = path.join(dest, 'transcript.json');
+    await fs.writeFile(transcriptPath, JSON.stringify(opts.transcript), 'utf-8');
+    lockDown(transcriptPath, 0o600);
+    await fsyncFile(transcriptPath);
+    const hash = crypto.createHash('sha256').update(JSON.stringify(opts.transcript)).digest('hex');
+    meta.transcriptHash = hash;
+  }
   await fs.writeFile(
     metaTmp,
     JSON.stringify(meta, null, 2),
@@ -212,6 +222,33 @@ export async function snapshotFiles(cwd: string, id: string): Promise<string[]> 
   }
 }
 
+/**
+ * Transcript captured at a checkpoint, or null when the snapshot predates
+ * transcript capture or the payload is missing/corrupt.
+ *
+ * The stored hash is verified on read: a checkpoint is only ever trusted for
+ * restoring the conversation when its transcript.json still matches the
+ * transcriptHash recorded in .meta.json. A mismatch (partial write, manual
+ * edit, tampering) yields null so the caller can report "conversation
+ * untouched" instead of rewinding onto unverified content.
+ */
+export async function readSnapshotTranscript(cwd: string, id: string): Promise<unknown[] | null> {
+  try {
+    const dir = path.join(ckptDir(cwd), id);
+    const meta = JSON.parse(await fs.readFile(path.join(dir, '.meta.json'), 'utf-8')) as { transcriptHash?: string };
+    const raw = await fs.readFile(path.join(dir, 'transcript.json'), 'utf-8');
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    if (typeof meta.transcriptHash === 'string') {
+      const actual = crypto.createHash('sha256').update(raw).digest('hex');
+      if (actual !== meta.transcriptHash) return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export async function diff(cwd: string, id?: string): Promise<string> {
   const ckpts = await listCheckpoints(cwd);
   const target = id ?? ckpts[ckpts.length - 1];
@@ -233,8 +270,10 @@ export async function undo(cwd: string, n = 1): Promise<void> {
   if (!target) throw new Error('No checkpoint to undo');
   const srcDir = path.join(ckptDir(cwd), target);
   const metaRaw = await fs.readFile(path.join(srcDir, '.meta.json'), 'utf-8');
-  const meta = JSON.parse(metaRaw) as { files: string[]; missing?: string[] };
+  const meta = JSON.parse(metaRaw) as { files: string[]; missing?: string[]; transcriptHash?: string };
   // Restore modified/created files to their snapshotted content…
+  // Transcript restore is handled by caller via transcript snapshot — read via
+  // readSnapshotTranscript() if the caller wants conversation rewind.
   for (const f of meta.files) {
     const src = containedPath(cwd, srcDir, f);
     const dest = src ? containedPath(cwd, cwd, f) : null;

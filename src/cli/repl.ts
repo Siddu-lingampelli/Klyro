@@ -1197,6 +1197,20 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           }
           await undo(cwd, n);
           let text = `Rewound to checkpoint ${n} (${target.id.slice(0, 12)}, ${target.files} file(s))`;
+
+          // If transcript was captured for this checkpoint, restore it into the
+          // active REPL session so /rewind full also reverts the conversation.
+          const { readSnapshotTranscript } = await import('../checkpoints/store.js');
+          const raw = await readSnapshotTranscript(cwd, target.id);
+          // readSnapshotTranscript returns `unknown[]`; verify minimal Message shape
+          // before giving it to adoptTranscript to avoid runtime type errors.
+          const isMessage = (v: unknown) => !!v && typeof v === 'object' && 'role' in v && 'content' in v;
+          if (Array.isArray(raw) && raw.length > 0 && raw.every(isMessage)) {
+            sessionMessages = adoptTranscript(raw as Message[]);
+            text += '\nConversation restored from checkpoint transcript.';
+          } else if (mode === 'full') {
+            text += '\nConversation rewind skipped — no transcript captured for this checkpoint.';
+          }
           if (mode === 'summary' || mode === 'full') {
             const files = before.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 20);
             text += files.length > 0 ? `\nReverted working-tree changes:\n${files.map((f) => `  ${f}`).join('\n')}` : '\nWorking tree was clean before restore.';
@@ -1942,8 +1956,8 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
           if (files.length === 0) {
             queuedAppend({ id: `ckpt-${Date.now()}`, kind: 'text', text: 'Working tree clean — nothing to checkpoint.', role: 'assistant' });
           } else {
-            const id = await snapshot(cwd, files.slice(0, 50));
-            queuedAppend({ id: `ckpt2-${Date.now()}`, kind: 'text', text: `checkpoint ${String(id).slice(0, 8)} — ${files.length} file(s)`, role: 'assistant' });
+            const id = await snapshot(cwd, files.slice(0, 50), { transcript: sessionMessages });
+            queuedAppend({ id: `ckpt2-${Date.now()}`, kind: 'text', text: `checkpoint ${String(id).slice(0, 8)} — ${files.length} file(s)` + ` (conversation archived)`, role: 'assistant' });
           }
         } catch (err) {
           queuedAppend({ id: `ckpt-err-${Date.now()}`, kind: 'error', message: `checkpoint failed: ${err instanceof Error ? err.message : String(err)}` });

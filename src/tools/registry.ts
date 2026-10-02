@@ -25,7 +25,7 @@ import { askUserTool } from './plan/ask-user.js';
 import { repoMapTool } from './repo-map.js';
 import { importsOfTool, importersOfTool } from './search/imports.js';
 import { findSymbolTool } from './symbols/find-symbol.js';
-import { lspDiagnosticsTool, lspGotoDefinitionTool } from './lsp/diagnostics.js';
+import { lspDiagnosticsTool, lspGotoDefinitionTool, lspReferencesTool, lspOutlineTool } from './lsp/diagnostics.js';
 import { expandResultTool } from './expand-result.js';
 import { memoryWriteTool } from './memory-write.js';
 import { webFetchTool } from './web/web-fetch.js';
@@ -127,6 +127,8 @@ export const builtinRegistry = (): ToolRegistry => {
   r.register(findSymbolTool);
   r.register(lspDiagnosticsTool);
   r.register(lspGotoDefinitionTool);
+  r.register(lspReferencesTool);
+  r.register(lspOutlineTool);
   r.register(expandResultTool);
   r.register(memoryWriteTool);
   r.register(webFetchTool);

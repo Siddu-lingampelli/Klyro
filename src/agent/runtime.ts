@@ -1263,6 +1263,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
           await snapshot(opts.cwd, [...fileEditCounts.keys()].slice(-20), {
             ...(sessionId !== undefined ? { sessionId } : {}),
             eventId: call.id,
+            transcript,
           });
         } catch { /* ignore */ }
       }
@@ -1358,6 +1359,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
             await snapshot(opts.cwd, [fileChanged.path], {
               ...(sessionId !== undefined ? { sessionId } : {}),
               eventId: call.id,
+              transcript,
             });
           } catch { /* ignore */ }
           // 5.2 file edit count
