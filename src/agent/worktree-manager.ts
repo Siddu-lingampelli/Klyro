@@ -40,6 +40,8 @@ export interface WorktreeInfo {
 export interface MergeResult {
   merged: boolean;
   conflictFiles: string[];
+  /** Present when the merge failed for a non-conflict reason (bad branch, dirty tree, git error). */
+  error?: string;
 }
 
 async function git(repoCwd: string, args: readonly string[]): Promise<{ stdout: string; stderr: string }> {
@@ -103,14 +105,21 @@ export async function mergeWorktree(opts: { repoCwd: string; branch: string }): 
   try {
     await git(opts.repoCwd, ['merge', '--no-ff', '--no-edit', opts.branch]);
     return { merged: true, conflictFiles: [] };
-  } catch {
+  } catch (err) {
+    const errText = err instanceof Error ? err.message : String(err);
     const conflictFiles = await unmergedFiles(opts.repoCwd);
     try {
       await git(opts.repoCwd, ['merge', '--abort']);
     } catch {
       /* best-effort: leave the repo as-is if abort itself fails */
     }
-    return { merged: false, conflictFiles };
+    // Only call it a conflict when unmerged paths exist; anything else
+    // (unknown branch, dirty tree, git missing) is a hard error, not an
+    // empty MERGE_CONFLICT the caller can't act on.
+    if (conflictFiles.length > 0 || /CONFLICT/i.test(errText)) {
+      return { merged: false, conflictFiles };
+    }
+    return { merged: false, conflictFiles, error: errText };
   }
 }
 

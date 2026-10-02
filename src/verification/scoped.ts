@@ -32,12 +32,25 @@ export function findRelatedTests(cwd: string, editedFiles: string[]): string[] {
     const dir = path.dirname(edited);
     for (const t of allTests) {
       const tb = path.basename(t);
+      const stripped = path.basename(t, path.extname(t)).replace(/\.test|\.spec|test_/g, '');
       // name match: foo.ts -> foo.test.ts, test_foo.py, foo_spec.ts, etc.
-      if (tb.includes(base) || base.includes(path.basename(t, path.extname(t)).replace(/\.test|\.spec|test_/g, ''))) {
+      // Substring arms need a substantive core (>=4 chars): without the
+      // floor, `a.ts` matches nearly every test basename globally, and
+      // `catalog.ts` matches unrelated `cat.test.ts`. Exact stem equality
+      // always counts (covers single-char stems like `a.ts` -> `a.test.ts`).
+      if (stripped === base ||
+          (base.length >= 4 && tb.includes(base)) ||
+          (stripped.length >= 4 && base.includes(stripped))) {
         related.add(path.relative(cwd, t));
       }
-      // same directory prefix also counts
-      if (t.startsWith(dir) && tb.includes(base.slice(0, 4))) related.add(path.relative(cwd, t));
+      // same-directory similarity (not a raw string prefix: `/repo/foo2/…`
+      // must not match edited dir `/repo/foo`). The 4-char slice needs a
+      // real core name behind it, same floor as above.
+      const rel = path.relative(dir, t);
+      const inDir = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+      if (inDir && base.length >= 4 && tb.toLowerCase().includes(base.slice(0, 4).toLowerCase())) {
+        related.add(path.relative(cwd, t));
+      }
     }
   }
   return [...related];
@@ -181,15 +194,18 @@ export async function syntaxCheck(cwd: string, file: string): Promise<{ ok: bool
     }
   }
   if (ext === '.py') {
+    let spawnFailed = false;
     const ok = await new Promise<boolean>((resolve) => {
       // S2: verify commands run with filtered env; servers needing keys must use explicit config.
       const child = spawn('python', ['-m', 'py_compile', full], { cwd, shell: false, env: filteredVerifyEnv() });
       let done = false;
       const t = setTimeout(() => { if (!done) { done = true; try { child.kill(); } catch { /* ignore — best-effort kill */ } resolve(false); } }, 5000);
       child.on('close', (code) => { if (done) return; done = true; clearTimeout(t); resolve(code === 0); });
-      child.on('error', () => { if (done) return; done = true; clearTimeout(t); resolve(true); });
+      // A missing interpreter must not read as "syntax OK" — that false
+      // negative lets broken files pass scoped verification.
+      child.on('error', () => { if (done) return; done = true; clearTimeout(t); spawnFailed = true; resolve(false); });
     });
-    if (!ok) return { ok: false, error: `syntax error in ${file} (py_compile)` };
+    if (!ok) return { ok: false, error: spawnFailed ? `python unavailable for py_compile (${file})` : `syntax error in ${file} (py_compile)` };
   }
   return { ok: true };
 }

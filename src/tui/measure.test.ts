@@ -62,6 +62,13 @@ describe('blockHeight mirrors app.tsx render', () => {
       blockSig({ kind: 'reasoning', text: 'a much longer thinking trace here' }),
     );
   });
+  it('diff lines measure with the 2-col +/- prefix the render prepends', () => {
+    // cw = termWidth - 10 = 90 here. A 89-char line fits bare but needs two
+    // rows once the render prepends '+ ' — the old cw measure said 1 row.
+    const line = 'x'.repeat(89);
+    const h = blockHeight({ kind: 'diff', hunks: [{ path: 'f', lines: [line] }] }, 100);
+    expect(h).toBe(1 + 1 + 2 + 1); // summary + path + 2 wrapped rows + margin
+  });
 });
 
 describe('blockSig changes when content changes (I6)', () => {

@@ -100,4 +100,14 @@ describe('annotateFileLinks (R4)', () => {
     expect(links).toHaveLength(1);
     expect(links[0]!.href).toBeUndefined();
   });
+  it('does not linkify host:port inside URLs', () => {
+    const links = annotateFileLinks([{ text: 'open https://x.example:8080/path now' }]);
+    expect(links.every((p) => p.href === undefined)).toBe(true);
+  });
+  it('still linkifies a bare file:line after the URL guard', () => {
+    const links = annotateFileLinks([{ text: 'see src/a.ts:12 and https://x.example:8080/y' }]);
+    const hits = links.filter((p) => p.href);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.href).toBe('file://src/a.ts#L12');
+  });
 });

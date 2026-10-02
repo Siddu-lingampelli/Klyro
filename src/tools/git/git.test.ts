@@ -51,4 +51,12 @@ describe('git tools', () => {
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.value.content).toContain('hello');
   });
+
+  it('runGit resolves (instead of hanging) when the cwd does not exist', async () => {
+    const { runGit } = await import('./run-git.js');
+    const missing = path.join(tmp, 'does-not-exist');
+    const r = await runGit(['status'], missing, 5_000);
+    expect(r.code).toBe(1);
+    expect(r.err.length).toBeGreaterThan(0);
+  });
 });

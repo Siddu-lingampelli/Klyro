@@ -82,6 +82,20 @@ describe('forkChild — wire protocol', () => {
     await expect(forkChild(entry, TRIVIAL_PAYLOAD)).rejects.toThrow(/without a ChildResult|boom/);
   });
 
+  it('resolves when progress logs precede the JSON result line', async () => {
+    // Regression: the parser used the FIRST non-empty stdout line, so any
+    // log printed before the result rejected a healthy exit-0 worker.
+    const entry = writeStubWorker(`
+      process.stdout.write('starting up\\n');
+      process.stdout.write('step 1/2\\n');
+      process.stdout.write(JSON.stringify({ status: 'complete', steps: 2, toolCalls: 0, finalText: 'logged', hasEdits: false, usage: { input: 1, output: 1 } }));
+      process.exit(0);
+    `);
+    const r = await forkChild(entry, TRIVIAL_PAYLOAD);
+    expect(r.status).toBe('complete');
+    expect(r.finalText).toBe('logged');
+  });
+
   it('rejects with ChildCrashError on malformed stdout (exit 0 but unparseable line)', async () => {
     const entry = writeStubWorker(`process.stdout.write('not-json'); process.exit(0);`);
     const e = await forkChild(entry, TRIVIAL_PAYLOAD).catch((err: unknown) => err);

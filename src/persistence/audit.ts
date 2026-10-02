@@ -87,9 +87,9 @@ export const AUDIT_ROTATE_KEEP = 5;
  * Rotate an audit log once it exceeds `maxBytes`: shift the newest segment
  * over the oldest (deleted), leave a fresh live file. Each segment carries
  * its own GENESIS-rooted chain, so rotation is tamper-evident per segment.
- * Returns true when a rotation actually happened (the caller must reset its
- * in-memory chain tip to GENESIS — the next live record starts a fresh
- * chain). Best-effort — rotation failures never break appends.
+ * Callers re-read the tail after rotating, so the next live record starts
+ * a fresh chain with no in-memory state to reset. Best-effort — rotation
+ * failures never break appends.
  */
 async function rotateAuditLog(filePath: string, maxBytes: number, keep: number): Promise<boolean> {
   try {
@@ -110,12 +110,6 @@ async function rotateAuditLog(filePath: string, maxBytes: number, keep: number):
 export class AuditLog {
   /** Serializes chained appends so concurrent writes can't fork the chain. */
   private chain: Promise<void> = Promise.resolve();
-  /**
-   * Cached last-written hash: avoids re-reading the whole file (O(n) per
-   * write) on every append. Null = not loaded yet — first append reads the
-   * file (picks up an existing chain), then the cache takes over.
-   */
-  private lastHash: string | null = null;
 
   constructor(
     private readonly filePath: string,
@@ -131,15 +125,16 @@ export class AuditLog {
   }
 
   private async appendChained(event: AuditEvent): Promise<void> {
-    // Rotation leaves a fresh live file and resets the in-memory tip: the
-    // next live record restarts at GENESIS (each segment is its own chain).
-    const rotated = await rotateAuditLog(this.filePath, this.maxBytes, this.keepSegments);
-    if (rotated) this.lastHash = AUDIT_GENESIS;
-    if (this.lastHash === null) this.lastHash = await prevHashFor(this.filePath);
-    const prevHash = this.lastHash;
+    // Rotation leaves a fresh live file; the tail read below then naturally
+    // restarts at GENESIS (each segment is its own chain).
+    await rotateAuditLog(this.filePath, this.maxBytes, this.keepSegments);
+    // Always re-read the tail instead of caching the tip: a cached tip forks
+    // the chain whenever another instance or process appends in between
+    // (e.g. a long-lived TUI plus a one-shot CLI on the same project).
+    // Audit volume is low and segments are size-bounded, so the read is cheap.
+    const prevHash = await prevHashFor(this.filePath);
     const body: Record<string, unknown> = { ...(event as unknown as Record<string, unknown>), prevHash };
     const record: ChainedAuditRecord = { ...body, prevHash, hash: sha256Hex(canonicalJson(body)) };
-    this.lastHash = record.hash;
     await SessionStore.appendJsonl(this.filePath, record);
   }
 }

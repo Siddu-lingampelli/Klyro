@@ -170,7 +170,6 @@ export class SseMcpClient implements McpClientLike {
     if (!p) return;
     this.pending.delete(m.id);
     clearTimeout(p.timer);
-    clearTimeout(p.timer);
     if (m.error) p.reject(new McpError(`mcp server "${this.name}" error: ${m.error.message ?? 'unknown'}`, 'SERVER_ERROR', m.error));
     else p.resolve(m.result ?? {});
   }

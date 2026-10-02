@@ -258,9 +258,27 @@ export async function diff(cwd: string, id?: string): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn('git', ['diff', '--stat'], { cwd, shell: false, windowsHide: true });
     const sink = cappedOutput(64 * 1024);
+    let done = false;
+    // A wedged git (locked index) must not hang undo diagnostics forever.
+    const t = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      resolve('No diff (git timed out)');
+    }, 10_000);
     child.stdout.on('data', (b: Buffer) => sink.push(b));
-    child.on('close', () => resolve(sink.text() || 'No diff'));
-    child.on('error', () => resolve('No git diff available'));
+    child.on('close', () => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolve(sink.text() || 'No diff');
+    });
+    child.on('error', () => {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      resolve('No git diff available');
+    });
   });
 }
 

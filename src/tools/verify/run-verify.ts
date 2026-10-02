@@ -11,6 +11,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { z } from 'zod';
 import { defineTool } from '../types.js';
 import { safe, TOOL_ERROR_CODES } from '../normalize.js';
+import { resolveWithinCwd } from '../../policy/path-guard.js';
 import { filteredVerifyEnv } from '../../verification/registry.js';
 
 const InputSchema = z.object({
@@ -41,7 +42,15 @@ export const runVerifyTool = defineTool({
   inputSchema: InputSchema,
   execute: async (input, ctx) => {
     return safe(async () => {
-      const cwd = input.cwd ?? ctx.cwd;
+      // Contain the model-supplied cwd to the workspace (mirrors shell_exec):
+      // without this the verify command could run in /etc, ~/.ssh, or any
+      // other directory outside the sandbox roots.
+      let cwd: string;
+      try {
+        cwd = resolveWithinCwd(ctx.cwd, input.cwd ?? '.').resolved;
+      } catch {
+        throw Object.assign(new Error('run_verify cwd escapes workspace (POLICY_DENIED)'), { code: TOOL_ERROR_CODES.PATH_ESCAPE });
+      }
       const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
       // S2: verify commands run with filtered env; servers needing keys must use explicit config.
       const env = filteredVerifyEnv();

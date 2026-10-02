@@ -156,3 +156,14 @@ describe('REFLOW keeps anchor on resize', () => {
     expect(resolveTopRow(s, c).topRow).toBe(3);
   });
 });
+
+describe('PRUNE on compacted anchor', () => {
+  it('re-sticks to bottom with a zeroed badge counter', () => {
+    const c = ctx5();
+    const pinned = { anchor: { mode: 'pinned' as const, itemId: 'gone', lineInItem: 0 }, userScrolled: true, newSinceUnstick: 7 };
+    const s = scrollReducer(pinned, { type: 'PRUNE' }, c);
+    expect(s.anchor).toEqual({ mode: 'bottom' });
+    expect(s.newSinceUnstick).toBe(0);
+    expect(resolveTopRow(s, c).atBottom).toBe(true);
+  });
+});

@@ -138,6 +138,24 @@ describe('retryingAdapter', () => {
     expect(events.map((e) => e.kind)).toEqual(['message_start', 'message_end']);
   });
 
+  it('caps server Retry-After at maxMs', async () => {
+    const inner = scripted([
+      [{ kind: 'error', code: 'HTTP_429', message: 'slow', retryable: true, retryAfterMs: 3_600_000 } as StreamEvent],
+      [
+        { kind: 'message_start' } as StreamEvent,
+        { kind: 'text_delta', text: 'ok' } as StreamEvent,
+        { kind: 'message_end', finishReason: 'stop' } as StreamEvent,
+      ],
+    ]);
+    const slept: number[] = [];
+    const out = retryingAdapter(inner, { maxMs: 100, sleep: async (ms: number) => { slept.push(ms); } });
+    const events: StreamEvent[] = [];
+    for await (const ev of out.stream({} as CallRequest)) events.push(ev);
+    expect(events.map((e) => e.kind)).toContain('text_delta');
+    expect(slept).toHaveLength(1);
+    expect(slept[0]).toBeLessThanOrEqual(100);
+  });
+
   it('sleepAbortable wakes early on abort (no stall)', async () => {
     const ctrl = new AbortController();
     let slept = 0;

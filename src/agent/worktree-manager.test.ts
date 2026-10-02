@@ -50,15 +50,48 @@ async function rmRetry(dir: string, attempts = 5): Promise<void> {
 }
 
 /**
- * Create a temp dir OUTSIDE any repo ancestry. os.tmpdir() cannot be used
- * for "not a repo" cases: an ancestor of the temp dir may itself be a git
- * repo (and 8.3 short-name aliases defeat GIT_CEILING_DIRECTORIES string
- * matching), so every temp dir would correctly report as inside a work
- * tree. The drive root of the cwd is verified repo-free instead.
+ * Create a temp dir OUTSIDE any repo ancestry. os.tmpdir() alone cannot be
+ * trusted for "not a repo" cases: an ancestor of the temp dir may itself be
+ * a git repo (and 8.3 short-name aliases defeat GIT_CEILING_DIRECTORIES
+ * string matching). Prefer the filesystem root of the cwd, verified
+ * repo-free; the root is not writable everywhere (Linux `/` for non-root
+ * CI users → EACCES), so fall back to os.tmpdir() candidates that are
+ * likewise verified repo-free before use.
  */
 async function mkHermitDir(prefix: string): Promise<string> {
-  const root = path.parse(process.cwd()).root;
-  return fs.mkdtemp(path.join(root, prefix));
+  const candidates = [path.parse(process.cwd()).root, os.tmpdir()];
+  for (const base of candidates) {
+    let dir: string;
+    try {
+      dir = await fs.mkdtemp(path.join(base, prefix));
+    } catch {
+      continue; // EACCES/EROFS/ENOENT — try the next base
+    }
+    try {
+      if (await hasRepoAncestor(dir)) {
+        await rmRetry(dir);
+        continue;
+      }
+      return dir;
+    } catch {
+      await rmRetry(dir).catch(() => undefined);
+    }
+  }
+  throw new Error('mkHermitDir: no writable repo-free temp base');
+}
+
+/** Lexical walk-up for a `.git` dir or worktree gitfile (no git binary needed). */
+async function hasRepoAncestor(dir: string): Promise<boolean> {
+  let cur = path.resolve(dir);
+  for (;;) {
+    try {
+      await fs.stat(path.join(cur, '.git'));
+      return true;
+    } catch { /* no .git here — keep climbing */ }
+    const parent = path.dirname(cur);
+    if (parent === cur) return false;
+    cur = parent;
+  }
 }
 
 async function initRepo(): Promise<string> {
@@ -150,6 +183,12 @@ maybe('worktree lifecycle', () => {
     const wt = await createWorktree({ repoCwd: repoDir, taskId });
     await removeWorktree({ repoCwd: repoDir, worktreePath: wt.worktreePath });
     await expect(fs.stat(wt.worktreePath)).rejects.toThrow();
+  });
+
+  it('a merge failure with no conflicts reports error instead of empty conflictFiles', async () => {
+    const m = await mergeWorktree({ repoCwd: repoDir, branch: 'klyro/does-not-exist' });
+    expect(m.merged).toBe(false);
+    expect(m.error).toBeDefined();
   });
 
   it('pruneStaleWorktrees removes only inactive task worktrees', async () => {

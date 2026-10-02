@@ -135,6 +135,18 @@ export class PolicyEngine {
       ) {
         return { action: 'deny', reason: 'plan mode: writes blocked — use /permissions to allow or switch mode' };
       }
+      // plan mode is read-only investigation: shells run only allowlisted
+      // read-only commands, and nothing may escape to subagents or MCP
+      // servers (both can write through their own tool surfaces).
+      if (call.name === 'shell_exec' || call.name === 'run_verify') {
+        const cmd = asString(call.input.command);
+        if (!cmd || !startsWithAny(cmd, ctx.config.shellAllow)) {
+          return { action: 'deny', reason: 'plan mode: only allowlisted read-only commands — use /permissions to allow or switch mode' };
+        }
+      }
+      if (call.name === 'spawn_agent' || call.name.startsWith('mcp__')) {
+        return { action: 'deny', reason: 'plan mode: subagents and MCP tools blocked — use /permissions to allow or switch mode' };
+      }
     } else if (ctx.config.mode === 'accept-edits') {
       // accept-edits: auto-allow edit tools
       if (call.name === 'write_file' || call.name === 'edit_file') {
@@ -253,7 +265,8 @@ function isEnvPath(p: string): boolean {
   // Sample/template carve-out: `.env.example`-style files are documentation,
   // not secrets — reads AND writes are allowed.
   if (/[.](example|sample|template|dist)$/.test(lower)) return false;
-  return /(^|\/)\.env(\.|$)/.test(lower) || lower.endsWith('.env');
+  // Separator class covers POSIX and Windows paths (C:\proj\.env.local).
+  return /(^|[/\\])\.env(\.|$)/.test(lower) || lower.endsWith('.env');
 }
 
 function extractPatchPaths(patch: string): string[] {
@@ -293,9 +306,23 @@ export function matchesGlobRule(call: ToolCallLike, rule: string): boolean {
 
 function startsWithAny(haystack: string, needles: string[]): boolean {
   const h = haystack.trim().toLowerCase();
+  // Quote-stripped variant: `rm -rf "/"` is `rm -rf /` with camouflage.
+  // Stripping quotes can only add deny matches at position 0, never remove.
+  const variants = [h, h.replace(/['"]/g, '')];
   return needles.some((n) => {
     const nl = n.toLowerCase().replace(/\s+$/, ''); // strip trailing ws from needle
-    return h === nl || h.startsWith(nl + ' ') || h.startsWith(nl + '\t');
+    return variants.some((hv) => {
+      if (hv === nl) return true;
+      if (!hv.startsWith(nl)) return false;
+      // Boundary after the needle: end, whitespace, quote, or a path
+      // separator/glob/chain char. Without the separator class, `rm -rf /*`,
+      // `rm -rf ~/*`, `rm -rf ./*` and `rm -rf ./` all slip past the deny
+      // list. Note this intentionally also matches scoped forms like
+      // `rm -rf ./build` — destructive-prefix commands stay denied and the
+      // caller allowlists (or uses a bare relative path).
+      const c = hv[nl.length];
+      return c === undefined || /[\s/'"`*?\[\\;&|]/.test(c);
+    });
   });
 }
 
@@ -460,13 +487,19 @@ export const writeFileCwdRule: PolicyRule = {
     const p = asString(call.input.path);
     if (!p) return null;
     if (p.includes('..') || path.isAbsolute(p)) {
-      // Check if absolute is inside additionalDirs
+      // Absolute paths are fine inside the workspace roots (cwd or
+      // additionalDirs) — only true escapes are denied.
       if (path.isAbsolute(p)) {
-        const allowed = (ctx.config.additionalDirs ?? []).some((dir) => {
-          const rel = path.relative(path.resolve(dir), path.resolve(p));
-          return !rel.startsWith('..') && !path.isAbsolute(rel);
+        const roots = [ctx.cwd, ...(ctx.config.additionalDirs ?? [])];
+        const inside = roots.some((dir) => {
+          try {
+            const rel = path.relative(path.resolve(dir), path.resolve(p));
+            return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+          } catch {
+            return false; // different drive on Windows: not inside
+          }
         });
-        if (allowed) return null;
+        if (inside) return null;
       }
       return { action: 'deny', reason: 'path traversal or absolute path not allowed' };
     }

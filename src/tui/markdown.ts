@@ -156,7 +156,7 @@ export function highlightCodeLine(line: string, lang: string): MdPart[] {
 }
 
 /** Detect `file:line` / `file:line:col` references and attach OSC-8 hrefs. */
-export const FILE_LINE_RE = /((?:\.{0,2}\/)?[\w./-]+\.[a-zA-Z]+\w*):(\d+)(?::(\d+))?/g;
+export const FILE_LINE_RE = /(?<![:/\w])((?:\.{0,2}\/)?[\w./-]+\.[a-zA-Z]+\w*):(\d+)(?::(\d+))?/g;
 
 export function annotateFileLinks(parts: MdPart[]): MdPart[] {
   const out: MdPart[] = [];

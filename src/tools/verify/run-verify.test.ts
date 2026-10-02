@@ -51,4 +51,19 @@ describe('runVerifyTool', () => {
       delete process.env[key];
     }
   });
+
+  it('rejects a model-supplied cwd that escapes the workspace', async () => {
+    const outside = process.platform === 'win32' ? 'C:\\Windows' : '/etc';
+    const r = await runVerifyTool.execute({ command: 'echo hi', cwd: outside }, ctx);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error.code).toBe('PATH_ESCAPE');
+  });
+
+  it('accepts a cwd inside the workspace', async () => {
+    const r = await runVerifyTool.execute({ command: 'echo hi', cwd: '.' }, ctx);
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error('unreachable');
+    expect(r.value.ok).toBe(true);
+  });
 });

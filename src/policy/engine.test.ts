@@ -9,10 +9,37 @@ import {
 const cwd = process.cwd();
 
 describe('PolicyEngine', () => {
-  it('denies known destructive shell patterns', async () => {
+  it('denies slash-suffixed and quoted variants of destructive patterns', async () => {
     const e = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
-    const d = await e.evaluate({ name: 'shell_exec', input: { command: 'rm -rf /' } }, { cwd, nonInteractive: false });
-    expect(d.action).toBe('deny');
+    // Bypass forms that slipped past the old space/tab-only boundary.
+    for (const command of [
+      'rm -rf /',
+      'rm -rf /*',
+      'rm -rf ~/*',
+      'rm -rf ./*',
+      'rm -rf ./',
+      'rm -rf "/"',
+      'rm -rf ~',
+      'rm -rf .',
+      'del /f /s /q C:\\*',
+    ]) {
+      const d = await e.evaluate({ name: 'shell_exec', input: { command } }, { cwd, nonInteractive: false });
+      expect(d.action).toBe('deny');
+    }
+    // A scoped system path still routes to ask (human confirms), not deny.
+    const scoped = await e.evaluate(
+      { name: 'shell_exec', input: { command: 'del /f /s /q C:\\Windows' } },
+      { cwd, nonInteractive: false },
+    );
+    expect(scoped.action).toBe('ask');
+  });
+
+  it('still routes scoped relative rm -rf targets to ask, not deny', async () => {
+    const e = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    for (const command of ['rm -rf dist', 'rm -rf build/out']) {
+      const d = await e.evaluate({ name: 'shell_exec', input: { command } }, { cwd, nonInteractive: false });
+      expect(d.action).toBe('ask');
+    }
   });
 
   it('allows whitelisted shell commands', async () => {
@@ -37,6 +64,25 @@ describe('PolicyEngine', () => {
     const e = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
     const d = await e.evaluate({ name: 'write_file', input: { path: 'C:/Windows/System32/x' } }, { cwd, nonInteractive: false });
     expect(d.action).toBe('deny');
+  });
+
+  it('allows absolute paths inside the workspace', async () => {
+    const e = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const inside = await e.evaluate(
+      { name: 'write_file', input: { path: `${cwd}/sub/file.txt`, content: 'hi' } },
+      { cwd, nonInteractive: false },
+    );
+    expect(inside.action).not.toBe('deny');
+  });
+
+  it('plan mode gates shells to the allowlist and blocks agents/MCP', async () => {
+    const e = new PolicyEngine(builtinRules(), { ...DEFAULT_POLICY_CONFIG, mode: 'plan' });
+    const np = (name: string, input: object) => e.evaluate({ name, input }, { cwd, nonInteractive: false });
+    expect((await np('shell_exec', { command: 'git status' })).action).not.toBe('deny');
+    expect((await np('shell_exec', { command: 'rm -rf ./dist' })).action).toBe('deny');
+    expect((await np('run_verify', { command: 'npx vitest run x' })).action).not.toBe('deny');
+    expect((await np('spawn_agent', { task: 'explore' })).action).toBe('deny');
+    expect((await np('mcp__srv__tool', {})).action).toBe('deny');
   });
 
   it('denies write_file with path traversal', async () => {
@@ -135,6 +181,12 @@ describe('PolicyEngine', () => {
     expect(d.action).toBe('deny');
     const d2 = await e.evaluate({ name: 'read_file', input: { path: 'sub/.Env.local' } }, { cwd, nonInteractive: false });
     expect(d2.action).toBe('deny');
+  });
+
+  it('denies Windows-style .env paths', async () => {
+    const e = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const d = await e.evaluate({ name: 'write_file', input: { path: 'C:\\proj\\.env.local' } }, { cwd, nonInteractive: false });
+    expect(d.action).toBe('deny');
   });
 
   it('denies shell redirection into .env', async () => {

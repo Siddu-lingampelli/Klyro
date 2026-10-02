@@ -25,7 +25,7 @@ import { globTool } from '../tools/search/glob.js';
 import { grepTool } from '../tools/search/grep.js';
 import { gitStatusTool } from '../tools/git/git-status.js';
 import { gitDiffTool } from '../tools/git/git-diff.js';
-import { PolicyEngine, builtinRules, DEFAULT_POLICY_CONFIG } from '../policy/engine.js';
+import { PolicyEngine, builtinRules, clonePolicyConfig } from '../policy/engine.js';
 import { DenyAllApprovalPrompt } from '../policy/approval.js';
 import { defaultSystemPrompt } from '../agent/runtime.js';
 import { verify } from '../verification/engine.js';
@@ -95,7 +95,9 @@ export async function runTask(
     .register(listDirTool).register(globTool).register(grepTool)
     .register(shellExecTool).register(runVerifyTool)
     .register(gitStatusTool).register(gitDiffTool);
-  const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+  // Clone: registerMcpServers mutates the config via addAsk — sharing the
+  // global DEFAULT_POLICY_CONFIG would leak ask-rules across tasks/runs.
+  const policy = new PolicyEngine(builtinRules(), clonePolicyConfig());
 
   try {
     const result = await run(
@@ -114,7 +116,10 @@ export async function runTask(
     }
 
     let details = '';
-    let pass = result.status === t.expectStatus;
+    // Grade the *observed* status (agent result possibly overridden by the
+    // verify step above) — a failed verifyCommand must fail the task even
+    // when the agent itself reported 'complete'.
+    let pass = observedStatus === t.expectStatus;
     if (t.expectToolCalls !== undefined && result.toolCalls !== t.expectToolCalls) {
       details += ` toolCalls=${result.toolCalls} expected=${t.expectToolCalls};`;
       pass = false;

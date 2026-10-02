@@ -8,7 +8,7 @@
  * structured Failure (and the model has had up to N attempts to fix).
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { detect, summarize, type Failure, type FailureType } from './detect.js';
 import { filteredVerifyEnv } from './registry.js';
 import { redact } from '../policy/secret-redactor.js';
@@ -102,9 +102,20 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
     const outCap = cappedOutput(MAX_VERIFY_BYTES);
     const errCap = cappedOutput(MAX_VERIFY_BYTES);
     let done = false;
+    const killTree = () => {
+      // Match run_verify/shell_exec: tree-kill so grandchildren die too.
+      // child.kill() alone only takes the /bin/sh (or cmd) wrapper.
+      if (process.platform === 'win32') {
+        try {
+          spawnSync('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true });
+        } catch { /* already gone */ }
+      } else {
+        try { child.kill('SIGKILL'); } catch { /* noop */ }
+      }
+    };
     const timer = setTimeout(() => {
       if (done) return;
-      child.kill();
+      killTree();
       done = true;
       const so = outCap.text();
       const se = errCap.text();
@@ -121,6 +132,22 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
 
     child.stdout.on('data', (b: Buffer) => outCap.push(b));
     child.stderr.on('data', (b: Buffer) => errCap.push(b));
+    // A bad cwd (or missing shell) emits 'error' with no 'close' — without
+    // this the promise never settles and the run hangs to its own timeout.
+    child.on('error', (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const raw = `verify spawn failed: ${err instanceof Error ? err.message : String(err)}`;
+      emitFailed('runtime');
+      resolve({
+        ok: false,
+        exitCode: -1,
+        stdout: outCap.text(),
+        stderr: raw,
+        failure: { type: 'runtime' as FailureType, files: [], raw, exitCode: -1 },
+      });
+    });
     child.on('close', (code) => {
       if (done) return;
       done = true;

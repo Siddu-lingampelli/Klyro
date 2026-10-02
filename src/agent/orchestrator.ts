@@ -857,13 +857,34 @@ export class AgentOrchestrator {
         return {
           ok: false,
           error: {
-            code: 'MERGE_CONFLICT',
-            message: `merge of ${meta.worktree.branch} conflicted`,
-            details: { conflictFiles: merged.conflictFiles },
+            code: merged.error ? 'MERGE_FAILED' : 'MERGE_CONFLICT',
+            message: merged.error
+              ? `merge of ${meta.worktree.branch} failed: ${merged.error}`
+              : `merge of ${meta.worktree.branch} conflicted`,
+            details: { conflictFiles: merged.conflictFiles, ...(merged.error ? { error: merged.error } : {}) },
           },
         };
       }
-      await removeWorktree({ repoCwd: meta.repoCwd, worktreePath: meta.worktree.worktreePath }).catch(() => undefined);
+      // Post-merge the branch content is committed, so a dirty worktree must
+      // not strand it: try a clean remove first, fall back to force, and
+      // only delete the branch once the worktree is really gone. Never
+      // report success while orphaning `.klyro/worktrees/<taskId>`.
+      try {
+        await removeWorktree({ repoCwd: meta.repoCwd, worktreePath: meta.worktree.worktreePath });
+      } catch {
+        try {
+          await removeWorktree({ repoCwd: meta.repoCwd, worktreePath: meta.worktree.worktreePath, force: true });
+        } catch (err) {
+          return {
+            ok: false,
+            error: {
+              code: 'WORKTREE_CLEANUP',
+              message: `merged ${meta.worktree.branch} but could not remove worktree ${meta.worktree.worktreePath}`,
+              details: { worktreePath: meta.worktree.worktreePath, error: err instanceof Error ? err.message : String(err) },
+            },
+          };
+        }
+      }
       await deleteBranch({ repoCwd: meta.repoCwd, branch: meta.worktree.branch });
       didMerge = true;
     }

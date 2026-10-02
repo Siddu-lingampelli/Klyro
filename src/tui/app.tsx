@@ -11,6 +11,7 @@ import * as path from 'node:path';
 import type { StatusSnapshot } from './status.js';
 import type { TranscriptItem, ToolResultPatch } from './transcript.js';
 import { TuiApprovalBridge, ApprovalModal } from './approval.js';
+import { approvalChoiceForKey } from '../policy/approval.js';
 import type { PlanStep } from '../agent/runtime.js';
 import { parse as parseSlash, suggestCommands } from '../cli/slash/parser.js';
 import { loadCustomCommands, listCompletableFiles } from '../cli/slash/custom.js';
@@ -175,10 +176,10 @@ function InputWithCursor({ input, cursor }: { input: string; cursor: number | nu
   if (cursor === null) {
     return <Text wrap="wrap">{safe}|</Text>;
   }
-  const pos = Math.max(0, Math.min(cursor, safe.length));
-  const before = safe.slice(0, pos);
-  const ch = safe.slice(pos, pos + 1) || ' ';
-  const after = safe.slice(pos + 1);
+  const pos = Math.max(0, Math.min(cursor, gLength(safe)));
+  const before = gSlice(safe, 0, pos);
+  const ch = gSlice(safe, pos, pos + 1) || ' ';
+  const after = gSlice(safe, pos + 1);
   return (
     <Text wrap="wrap">
       {before}
@@ -235,6 +236,56 @@ function MarkdownText({ text, dim, width }: { text: string; dim?: boolean; width
 // Position is an Anchor ({itemId, lineInItem}), never a raw row index (I4),
 // resolved per frame against measured *display lines* (I3, see measure.ts).
 // While anchored to 'bottom', new output follows; scrolling up pins to an
+// Display-state bound: the transcript array never grows without limit.
+// Beyond MAX_TRANSCRIPT_ITEMS the oldest non-user items go first (tool
+// rows, thinking, policy), then oldest-first. Pinned scroll anchors
+// survive via PRUNE re-stick (scroll-model); persistence is unaffected.
+const MAX_TRANSCRIPT_ITEMS = 500;
+export { MAX_TRANSCRIPT_ITEMS as TRANSCRIPT_ITEM_CAP };
+export function capTranscript<T extends { kind: string }>(prev: T[]): T[] {
+  const over = prev.length - MAX_TRANSCRIPT_ITEMS;
+  if (over <= 0) return prev;
+  const isUser = (x: T): boolean => x.kind === 'text' && (x as { role?: string }).role === 'user';
+  // Shed the oldest non-user items wherever they sit (a contiguous splice
+  // from the first drop point would also eat the user rows between them).
+  let toDrop = over;
+  const next = prev.filter((x) => {
+    if (toDrop > 0 && !isUser(x)) {
+      toDrop--;
+      return false;
+    }
+    return true;
+  });
+  // All-user transcript: oldest-first.
+  return next.length > MAX_TRANSCRIPT_ITEMS ? next.slice(next.length - MAX_TRANSCRIPT_ITEMS) : next;
+}
+
+// Grapheme-cluster cursor math: vimCursor/input positions are GRAPHEME
+// indices, never UTF-16 offsets — slicing a surrogate pair or ZWJ cluster
+// renders lone surrogates and corrupts emoji/CJK on h/l/x. Intl.Segmenter
+// with an Array.from fallback (splits pairs correctly, not clusters).
+let segmenterCache: { segment(s: string): Iterable<{ segment: string }> } | null | undefined;
+function graphemes(s: string): string[] {
+  try {
+    if (segmenterCache === undefined) {
+      const Seg = (Intl as unknown as {
+        Segmenter?: new (locales: string | undefined, o: { granularity: string }) => {
+          segment(x: string): Iterable<{ segment: string }>;
+        };
+      }).Segmenter;
+      segmenterCache = Seg ? new Seg(undefined, { granularity: 'grapheme' }) : null;
+    }
+    if (segmenterCache) return [...segmenterCache.segment(s)].map((x) => x.segment);
+  } catch { /* fall through to code points */ }
+  return Array.from(s);
+}
+function gLength(s: string): number {
+  return graphemes(s).length;
+}
+function gSlice(s: string, start: number, end?: number): string {
+  return graphemes(s).slice(start, end).join('');
+}
+
 // item and freezes, accumulating newSinceUnstick lines for the `↓ N new` pill.
 //
 // Deviation from §7.1: Ink cannot overlay rows, so the badge renders as a
@@ -263,6 +314,8 @@ function useChatScroll(opts: {
 
   // Auto-follow wiring (§6): measured total deltas → CONTENT_GREW;
   // width change → REFLOW (§12). Initial anchor is 'bottom' → follow-tail.
+  // A pinned anchor whose item vanished (transcript pruning) re-sticks via
+  // PRUNE with a zeroed badge counter instead of inheriting stale counts.
   const prevTotalRef = useRef(index.total);
   const prevWidthRef = useRef(width);
   useEffect(() => {
@@ -270,6 +323,11 @@ function useChatScroll(opts: {
     const prevWidth = prevWidthRef.current;
     prevTotalRef.current = index.total;
     prevWidthRef.current = width;
+    const st = stateRef.current;
+    if (st.anchor.mode === 'pinned' && !keys.includes(st.anchor.itemId)) {
+      setState((s) => scrollReducer(s, { type: 'PRUNE' }, ctxRef.current));
+      return;
+    }
     if (width !== prevWidth) {
       setState((s) => scrollReducer(s, { type: 'REFLOW' }, ctxRef.current));
       return;
@@ -392,24 +450,25 @@ export function App(props: AppProps): React.JSX.Element {
   useEffect(() => { inputRef.current = input; }, [input]);
   useEffect(() => { vimCursorRef.current = vimCursor; }, [vimCursor]);
   const clampCursor = (v: string, c: number | null): number =>
-    c === null ? v.length : Math.max(0, Math.min(c, v.length));
+    c === null ? gLength(v) : Math.max(0, Math.min(c, gLength(v)));
   const insertAtCursor = useCallback((text: string) => {
     const t = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     if (!t) return;
     const v = inputRef.current;
     const pos = clampCursor(v, vimCursorRef.current);
-    const nv = v.slice(0, pos) + t + v.slice(pos);
+    const nv = gSlice(v, 0, pos) + t + gSlice(v, pos);
     setInput(nv);
-    setVimCursor(pos + t.length >= nv.length ? null : pos + t.length);
+    const npos = pos + gLength(t);
+    setVimCursor(npos >= gLength(nv) ? null : npos);
     setHistIdx(null);
   }, []);
   const deleteBeforeCursor = useCallback(() => {
     const v = inputRef.current;
     const pos = clampCursor(v, vimCursorRef.current);
     if (pos === 0) return;
-    const nv = v.slice(0, pos - 1) + v.slice(pos);
+    const nv = gSlice(v, 0, pos - 1) + gSlice(v, pos);
     setInput(nv);
-    setVimCursor(pos - 1 >= nv.length ? null : pos - 1);
+    setVimCursor(pos - 1 >= gLength(nv) ? null : pos - 1);
     setHistIdx(null);
   }, []);
   // Shift+Enter intent: explicit shift+return, kitty/CSI-u sequence, legacy
@@ -634,7 +693,7 @@ export function App(props: AppProps): React.JSX.Element {
     if (queuedInputs.length > 0 && status.status !== 'running' && !awaitingApproval) {
       const toSend = queuedInputs[0]!;
       setQueuedInputs((prev) => prev.slice(1));
-      setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: toSend, role: 'user' } as TranscriptItem]);
+      setTranscript((prev) => [...capTranscript(prev), { id: nextId('user'), kind: 'text', text: toSend, role: 'user' } as TranscriptItem]);
       resetStream();
       const cmd = parseSlash(toSend.trim());
       if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd);
@@ -644,7 +703,7 @@ export function App(props: AppProps): React.JSX.Element {
 
   const append = useCallback((item: TranscriptItem) => {
     if (item.kind !== 'text' || item.role !== 'assistant') { flushStream(); resetStream(); }
-    setTranscript((prev) => [...prev, item]);
+    setTranscript((prev) => [...capTranscript(prev), item]);
   }, [flushStream, resetStream]);
   const appendDelta = useCallback((text: string) => {
     if (!text) return;
@@ -808,7 +867,7 @@ export function App(props: AppProps): React.JSX.Element {
       // preserving the message prefix (`look at @ut` → `look at @util.ts`).
       const m = /(?:^|\s)@(\S*)$/.exec(input);
       if (m && m[1] !== undefined) {
-        setInput(input.slice(0, input.length - m[1].length) + top.name.slice(1) + ' ');
+        setInput(gSlice(input, 0, gLength(input) - gLength(m[1])) + top.name.slice(1) + ' ');
       } else {
         setInput(`${top.name} `);
       }
@@ -873,7 +932,28 @@ export function App(props: AppProps): React.JSX.Element {
       if (key.upArrow && (key.shift || key.ctrl)) { commands.lineUp(); return; }
       if (key.downArrow && (key.shift || key.ctrl)) { commands.lineDown(); return; }
     }
-    if (awaitingApproval) return;
+    // Approval gate: keys must never leak into the input while a prompt is
+    // pending. Decisive keys are routed straight through the bridge instead
+    // of being swallowed: the modal subscribes async, so a fast y/n landing
+    // between ask() and the modal's first render used to vanish and hang
+    // the run on a visibly-pending modal. bridge.resolve() is a no-op when
+    // nothing is pending, and the modal's own handler ignores the duplicate
+    // via the same guard — either order is safe. 'e' is deliberately NOT
+    // routed (it enters the modal's inline edit mode, not a decision).
+    if (awaitingApproval) {
+      if (key.return) {
+        bridge.resolve('deny');
+        return;
+      }
+      const choice = approvalChoiceForKey(inputStr);
+      if (
+        (choice === 'allow' || choice === 'always' || choice === 'always-persist' || choice === 'deny') &&
+        inputStr !== 'e'
+      ) {
+        bridge.resolve(choice);
+      }
+      return;
+    }
     if (key.ctrl && inputStr === 'o') { const groups = grouped.filter((x): x is Group => typeof (x as Group).verb === 'string'); const last = groups[groups.length - 1]; if (last) toggleGroup(last.id); return; }
     // design.md §18: Shift+Enter → newline (never submit). Detect explicit
     // shift+return, CSI-u / ESC+CR sequences, or Esc→Return within 75ms.
@@ -901,24 +981,43 @@ export function App(props: AppProps): React.JSX.Element {
         setVimMode('insert');
         return;
       }
-      const cur = vimCursor === null ? input.length : Math.max(0, Math.min(vimCursor, input.length));
-      const move = (d: number): boolean => { setVimCursor(Math.max(0, Math.min(cur + d, input.length))); return true; };
+      // All positions below are grapheme indices (see graphemes()): cursor
+      // math, word motions, and deletions never split a cluster.
+      const gs = graphemes(input);
+      const cur = vimCursor === null ? gs.length : Math.max(0, Math.min(vimCursor, gs.length));
+      const move = (d: number): boolean => { setVimCursor(Math.max(0, Math.min(cur + d, gs.length))); return true; };
       const isWord = (c: string): boolean => /[A-Za-z0-9_]/.test(c);
       const wordFwd = (pos: number, n: number): number => {
         let p = pos;
-        for (let k = 0; k < n && p < input.length; k++) {
-          while (p < input.length && isWord(input[p]!)) p++;
-          while (p < input.length && !isWord(input[p]!)) p++;
+        for (let k = 0; k < n && p < gs.length; k++) {
+          while (p < gs.length && isWord(gs[p]!)) p++;
+          while (p < gs.length && !isWord(gs[p]!)) p++;
         }
-        return Math.min(p, input.length);
+        return Math.min(p, gs.length);
       };
       const wordBack = (pos: number, n: number): number => {
         let p = pos;
         for (let k = 0; k < n && p > 0; k++) {
-          while (p > 0 && !isWord(input[p - 1]!)) p--;
-          while (p > 0 && isWord(input[p - 1]!)) p--;
+          while (p > 0 && !isWord(gs[p - 1]!)) p--;
+          while (p > 0 && isWord(gs[p - 1]!)) p--;
         }
         return Math.max(0, p);
+      };
+      const lineStart = (pos: number): number => {
+        for (let i = pos - 1; i >= 0; i--) {
+          if (gs[i] === '\n') return i + 1;
+        }
+        return 0;
+      };
+      const endOfNthLine = (from: number, n: number, keepNewline: boolean): number => {
+        let seen = 0;
+        for (let i = from; i < gs.length; i++) {
+          if (gs[i] === '\n') {
+            seen++;
+            if (seen === n) return keepNewline ? i : i + 1;
+          }
+        }
+        return gs.length;
       };
       const takeCount = (): number => {
         const n = vimCountRef.current <= 1 ? 1 : vimCountRef.current;
@@ -926,45 +1025,49 @@ export function App(props: AppProps): React.JSX.Element {
         return n;
       };
       if (!key.ctrl && !key.meta && !key.return && !key.tab && !key.upArrow && !key.downArrow && !key.leftArrow && !key.rightArrow) {
-        // Pending `d` operator: second `d` deletes the current line.
+        // Pending `d` operator: second `d` deletes whole lines (count-aware).
         if (vimPendingOp.current === 'd') {
           vimPendingOp.current = null;
           if (inputStr === 'd') {
-            const start = input.lastIndexOf('\n', cur - 1) + 1;
-            const nl = input.indexOf('\n', cur);
-            const end = nl === -1 ? input.length : nl + 1;
-            setInput(input.slice(0, start) + input.slice(end));
-            setVimCursor(Math.min(start, Math.max(0, input.slice(0, start).length)));
+            const n = takeCount();
+            const start = lineStart(cur);
+            const end = endOfNthLine(start, n, false);
+            const nv = gs.slice(0, start).join('') + gs.slice(end).join('');
+            setInput(nv);
+            setVimCursor(Math.min(start, gLength(nv)) >= gLength(nv) ? null : Math.min(start, gLength(nv)));
             setHistIdx(null);
-            vimCountRef.current = 0;
             return;
           }
           // Only dd is supported — anything else cancels the operator.
           vimCountRef.current = 0;
         }
         if (inputStr === 'i') { setVimMode('insert'); setVimCursor(null); vimCountRef.current = 0; return; }
-        if (inputStr === 'a') { setVimCursor(Math.min(cur + 1, input.length)); setVimMode('insert'); vimCountRef.current = 0; return; }
+        if (inputStr === 'a') { setVimCursor(Math.min(cur + 1, gs.length)); setVimMode('insert'); vimCountRef.current = 0; return; }
         if (/^[1-9]$/.test(inputStr)) { vimCountRef.current = vimCountRef.current * 10 + Number(inputStr); return; }
         if (inputStr === 'h') { const n = takeCount(); move(-n); return; }
         if (inputStr === 'l') { const n = takeCount(); move(n); return; }
-        if (inputStr === '0' && vimCountRef.current === 0) { setVimCursor(0); return; }
-        if (inputStr === '0') { const n = takeCount(); move(-n); return; }
-        if (inputStr === '$') { takeCount(); setVimCursor(input.length); return; }
-        if (inputStr === 'x') { const n = takeCount(); if (cur < input.length) setInput(input.slice(0, cur) + input.slice(cur + n)); setHistIdx(null); return; }
+        // `0` alone goes to line start; after digits it extends the count
+        // (`10` + `0` = 100, matching vim — the old code moved left by N).
+        if (inputStr === '0') {
+          if (vimCountRef.current === 0) setVimCursor(lineStart(cur));
+          else vimCountRef.current = vimCountRef.current * 10;
+          return;
+        }
+        if (inputStr === '$') { takeCount(); setVimCursor(gs.length); return; }
+        if (inputStr === 'x') { const n = takeCount(); if (cur < gs.length) setInput(gSlice(input, 0, cur) + gSlice(input, cur + n)); setHistIdx(null); return; }
         if (inputStr === 'w') { const n = takeCount(); setVimCursor(wordFwd(cur, n)); return; }
         if (inputStr === 'b') { const n = takeCount(); setVimCursor(wordBack(cur, n)); return; }
         if (inputStr === 'd') { vimPendingOp.current = 'd'; vimCountRef.current = 0; return; }
         if (inputStr === 'D') {
-          // Delete to end of current line (keep the newline).
-          const nl = input.indexOf('\n', cur);
-          const end = nl === -1 ? input.length : nl;
-          setInput(input.slice(0, cur) + input.slice(end));
+          // Delete to end of line, count-aware (2D spans two lines).
+          const n = takeCount();
+          const end = endOfNthLine(cur, n, true);
+          setInput(gSlice(input, 0, cur) + gSlice(input, end));
           setHistIdx(null);
-          vimCountRef.current = 0;
           return;
         }
-        if (inputStr === 'j') { if (isFullscreen && maxTop > 0) commands.lineDown(); vimCountRef.current = 0; return; }
-        if (inputStr === 'k') { if (isFullscreen && maxTop > 0) commands.lineUp(); vimCountRef.current = 0; return; }
+        if (inputStr === 'j') { const n = takeCount(); if (isFullscreen && maxTop > 0) for (let i = 0; i < n; i++) commands.lineDown(); return; }
+        if (inputStr === 'k') { const n = takeCount(); if (isFullscreen && maxTop > 0) for (let i = 0; i < n; i++) commands.lineUp(); return; }
         if (key.backspace || key.delete) { move(-1); vimCountRef.current = 0; return; }
         if (key.escape) { vimCountRef.current = 0; vimPendingOp.current = null; return; } // already normal
         if (inputStr) { vimCountRef.current = 0; vimPendingOp.current = null; return; } // swallow everything else printable
@@ -994,6 +1097,11 @@ export function App(props: AppProps): React.JSX.Element {
       // one; otherwise the first Esc arms and the second (≤1500ms) cancels.
       if (key.escape) {
         if (queuedInputs.length > 0) { setQueuedInputs((prev) => prev.slice(1)); disarmEsc(); return; }
+        // This Esc is a cancel gesture, not half of an ESC+CR newline pair:
+        // disarm the 75ms Esc→Return heuristic so a fast follow-up Return
+        // submits instead of inserting a newline. (The vim-normal-mode
+        // partner below is intentionally untouched — it owns that meaning.)
+        escReturnAt.current = 0;
         const t = Date.now();
         if (t - escArmedAt.current < 1500) {
           disarmEsc();
@@ -1040,18 +1148,23 @@ export function App(props: AppProps): React.JSX.Element {
       return;
     }
     // Enter on empty input dismisses the badge (jump to bottom, §7.2)
-    if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } setInput(''); setVimCursor(null); setHistIdx(null); pushHistory(v); setTranscript((prev) => [...prev, { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); resetStream(); setSubmitKey((k) => k + 1); const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
+    if (key.return) { const v = input.trim(); if (!v) { if (pinned) commands.jumpBottom(); return; } setInput(''); setVimCursor(null); setHistIdx(null); pushHistory(v); setTranscript((prev) => [...capTranscript(prev), { id: nextId('user'), kind: 'text', text: v, role: 'user' } as TranscriptItem]); resetStream(); setSubmitKey((k) => k + 1); const cmd = parseSlash(v); if (cmd.kind === 'prompt') void props.onPrompt(cmd.text); else void props.onSlash(cmd); return; }
     if (key.backspace || key.delete) { deleteBeforeCursor(); return; }
     if (!key.ctrl && !key.meta) { insertAtCursor(inputStr); }
     // Idle Esc enters vim normal mode (vimLive parity for keyboard-only users).
-    if (key.escape && vimMode === 'insert') { setVimMode('normal'); setVimCursor(inputRef.current.length); return; }
+    if (key.escape && vimMode === 'insert') { setVimMode('normal'); setVimCursor(gLength(inputRef.current)); return; }
   });
 
   // Single source of truth: package.json via version.ts — never hardcoded.
   const ver = props.version ?? readVersion();
   // Single cost/context source: model-aware registry rates + window.
-  const cost = estimateCost(status.model, status.usageInput, status.usageOutput);
-  const totalTokens = status.usageInput + status.usageOutput;
+  // Cache counters included: Anthropic bills them and they consume context.
+  const cost = estimateCost(status.model, status.usageInput, status.usageOutput, {
+    read: status.usageCacheRead,
+    write: status.usageCacheWrite,
+  });
+  const totalTokens =
+    status.usageInput + status.usageOutput + (status.usageCacheRead ?? 0) + (status.usageCacheWrite ?? 0);
   const ctxWindow = getModelInfo(status.model).contextWindow;
   const ctxPct = totalTokens > 0 ? Math.round((totalTokens / ctxWindow) * 100) : 0;
   // Narrow terminals: compact hints so the status bar never wraps mid-word.

@@ -167,20 +167,34 @@ export async function forkChild(
     });
     child.on('close', (code, signal) => {
       cleanup();
-      const first = stdoutCap.text().split('\n').find((l) => l.trim().length > 0);
-      if (code === 0 && first) {
+      // The child may print progress/log lines before the JSON result —
+      // scan from the LAST non-empty line back so an early log line can't
+      // mask the result (previously the first line was parsed instead).
+      const lines = stdoutCap.text().split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+      let parsed: ChildResult | null = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
         try {
-          resolve(JSON.parse(first) as ChildResult);
-        } catch {
-          reject(new ChildCrashError('child exited 0 but emitted malformed ChildResult', 'exit', stderr.slice(-1000)));
-        }
+          const cand = JSON.parse(lines[i]!) as ChildResult;
+          if (cand && typeof cand === 'object' && typeof (cand as { status?: unknown }).status === 'string') {
+            parsed = cand;
+            break;
+          }
+        } catch { /* not JSON — keep scanning */ }
+      }
+      if (code === 0 && parsed) {
+        resolve(parsed);
         return;
       }
       const cause = signal === 'SIGKILL' || signal === 'SIGTERM'
         ? (killedForTimeout ? 'timeout' : 'oom')
         : 'exit';
+      // Exit 0 with no parseable result keeps the historical "malformed"
+      // message (pinned by forkChild tests); other exits name the cause.
+      const what = code === 0
+        ? 'child exited 0 but emitted malformed ChildResult'
+        : `child exited ${code ?? signal ?? '??'} without a ChildResult`;
       reject(new ChildCrashError(
-        `child exited ${code ?? signal ?? '??'} without a ChildResult` + (stderr ? `: ${stderr.slice(-500)}` : ''),
+        what + (stderr ? `: ${stderr.slice(-500)}` : ''),
         cause,
         stderr.slice(-1000),
       ));

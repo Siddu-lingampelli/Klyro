@@ -27,15 +27,37 @@ export function isLoopback(url: string): boolean {
 /** Parse a Streamable-HTTP SSE body (`data: {...}` lines) into JSON payloads. */
 export function parseSseBody(text: string): unknown[] {
   const out: unknown[] = [];
+  // Consecutive data: lines belong to ONE event per the SSE spec (joined
+  // with \n). Parse the joined chunk first; if that fails, fall back to
+  // per-line parsing so servers that (against spec) emit bare JSON per
+  // line without blank separators keep working.
+  let parts: string[] = [];
+  const flush = (): void => {
+    if (parts.length === 0) return;
+    const joined = parts.join('\n').trim();
+    parts = [];
+    if (joined === '[DONE]') return;
+    try {
+      out.push(JSON.parse(joined) as unknown);
+      return;
+    } catch { /* try per-line below */ }
+    for (const part of joined.split('\n')) {
+      const t = part.trim();
+      if (!t || t === '[DONE]') continue;
+      try {
+        out.push(JSON.parse(t) as unknown);
+      } catch { /* ignore malformed lines */ }
+    }
+  };
   for (const line of text.split('\n')) {
     const t = line.trim();
-    if (!t.startsWith('data:')) continue;
-    const payload = t.slice(5).trim();
-    if (payload === '[DONE]') continue;
-    try {
-      out.push(JSON.parse(payload) as unknown);
-    } catch { /* ignore malformed lines */ }
+    if (!t.startsWith('data:')) {
+      flush();
+      continue;
+    }
+    parts.push(t.slice(5).trim());
   }
+  flush();
   return out;
 }
 

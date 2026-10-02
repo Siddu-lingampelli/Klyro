@@ -217,9 +217,12 @@ export function retryingAdapter(inner: ProviderAdapter, opts: Partial<RetryOptio
             ? retryAfterRaw
             : undefined;
         opts.onRetry?.({ attempt: attempt + 1, status, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) });
-        // Honor a server-provided Retry-After delay when present; otherwise
-        // fall back to exponential backoff with jitter.
-        const delay = retryAfterMs ?? computeBackoff(attempt, cfg.baseMs, cfg.maxMs);
+        // Honor a server-provided Retry-After delay when present, capped at
+        // maxMs: an unbounded server delay (malicious or buggy endpoint)
+        // could otherwise park the agent for hours per attempt.
+        const delay = retryAfterMs !== undefined
+          ? Math.min(retryAfterMs, cfg.maxMs)
+          : computeBackoff(attempt, cfg.baseMs, cfg.maxMs);
         // Abort-aware backoff: Ctrl+C during the sleep must stop promptly
         // instead of stalling up to maxMs before noticing.
         if (delay > 0) await sleepAbortable(delay, sleep, effectiveSignal);

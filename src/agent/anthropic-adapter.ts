@@ -20,6 +20,7 @@ import type { Message } from './message.js';
 import type { CallRequest, ProviderAdapter, StreamEvent, ToolDefinition } from './provider-adapter.js';
 import { assertSafeBaseURL } from '../chat.js';
 import { parseRetryAfterMs } from './provider-adapter.js';
+import { redact } from '../policy/secret-redactor.js';
 import { estimateTokens } from '../context/tokenizer.js';
 import { proxiedFetch } from '../shared/proxy.js';
 
@@ -239,7 +240,9 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
     yield {
       kind: 'error',
       code: isOverflow ? 'REQUEST_TOO_LARGE' : `http_${resp.status}`,
-      message: `Anthropic API returned ${resp.status}: ${text.slice(0, 500)}`,
+      // Redact before slicing (mirrors the OpenAI adapter): a 400 body can
+      // echo the prompt, leaking secrets into transcript/logs/trace.
+      message: `Anthropic API returned ${resp.status}: ${redact(text).slice(0, 500)}`,
       retryable,
       status: String(resp.status),
       ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
@@ -270,6 +273,10 @@ async function* streamAnthropic(req: CallRequest, opts: InternalOpts): AsyncIter
       const { value, done } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
+      // SSE spec: CRLF/CR line endings normalize to LF (same as the
+      // OpenAI adapter) — otherwise '\n\n' never matches and the stream
+      // stalls to timeout.
+      if (buf.includes('\r')) buf = buf.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
       // Split on SSE event boundary.
       const events: Array<{ event: string; data: string }> = [];

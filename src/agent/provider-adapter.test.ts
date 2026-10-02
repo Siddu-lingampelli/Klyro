@@ -295,4 +295,20 @@ describe('httpChatAdapter capabilities (2.1)', () => {
     expect(buildChatCompletionsBody({ ...baseReq, reasoningEffort: 'high' })).toMatchObject({ reasoning_effort: 'high' });
     expect(buildChatCompletionsBody({ ...baseReq })).not.toHaveProperty('reasoning_effort');
   });
+
+  it('parses CRLF-delimited SSE the same as LF', async () => {
+    const lf =
+      dataLine({ choices: [{ index: 0, delta: { content: 'answer' }, finish_reason: null }] }) +
+      dataLine({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) +
+      'data: [DONE]\n\n';
+    const collect = async (body: string): Promise<string[]> => {
+      const adapter = httpChatAdapter({ baseURL: 'https://x.example', apiKey: '', fetchImpl: sseFetch(body) });
+      const kinds: string[] = [];
+      for await (const ev of adapter.stream(baseReq)) kinds.push(ev.kind);
+      return kinds;
+    };
+    const expected = await collect(lf);
+    expect(expected).toContain('text_delta');
+    expect(await collect(lf.replace(/\n/g, '\r\n'))).toEqual(expected);
+  });
 });

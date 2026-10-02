@@ -89,7 +89,7 @@ const BLOCKED_DOTENV_SECURITY_RELAXATIONS = new Set([
 ]);
 
 /** npm reads `npm_config_*` from the environment — a repo must not pick the registry. */
-const BLOCKED_DOTENV_PREFIXES = ['NPM_CONFIG_'];
+const BLOCKED_DOTENV_PREFIXES = ['NPM_CONFIG_', 'KLYRO_SANDBOX']; // KLYRO_SANDBOX=0 / KLYRO_SANDBOX_NET=1 de-harden the shell sandbox (see shell-exec.ts)
 
 /** True when a `.env` key would change process behaviour or loosen a boundary. */
 export function isBlockedDotenvKey(key: string): boolean {

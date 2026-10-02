@@ -92,9 +92,22 @@ export function isAnthropicModel(modelId: string): boolean {
   return /anthropic|claude/i.test(modelId);
 }
 
-export function estimateCost(modelId: string, inputTokens: number, outputTokens: number): number {
+export function estimateCost(
+  modelId: string,
+  inputTokens: number,
+  outputTokens: number,
+  cache?: { read?: number; write?: number },
+): number {
   // Single source: delegate to ratesFor so registry, family fallbacks, and
   // local-$0 rules live in exactly one place (no split-brain with getModelInfo).
   const { input, output } = ratesFor(modelId);
-  return (inputTokens / 1000) * input + (outputTokens / 1000) * output;
+  let cost = (inputTokens / 1000) * input + (outputTokens / 1000) * output;
+  // Cache-aware (Anthropic billing): cacheRead at 0.1x input, cacheWrite at
+  // 1.25x input. Other families ignore cache counters. Mirrors the
+  // runtime's estimateCost — keep the two in sync.
+  if (isAnthropicModel(modelId)) {
+    cost += ((cache?.read ?? 0) / 1000) * input * 0.1;
+    cost += ((cache?.write ?? 0) / 1000) * input * 1.25;
+  }
+  return cost;
 }

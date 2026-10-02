@@ -96,7 +96,9 @@ export async function repl(system: string): Promise<void> {
         // EOF on stdin (Ctrl-D) or close — exit cleanly.
         break;
       }
-      if (!line) break; // empty line on EOF
+      // EOF on stdin (Ctrl-D) rejects the question and exits via the
+      // catch above. An empty line is just a stray Enter — keep going.
+      if (line === '') continue;
       const step = splitContinuedLine(continued, line);
       continued = step.pending;
       if (step.complete === undefined) continue;

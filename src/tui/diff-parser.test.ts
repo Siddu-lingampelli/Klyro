@@ -52,4 +52,23 @@ describe('parseUnifiedDiff', () => {
   it('returns empty array for empty input', () => {
     expect(parseUnifiedDiff('')).toEqual([]);
   });
+
+  it('keeps the real path for a deleted file (+++ /dev/null)', () => {
+    const hunks = parseUnifiedDiff(
+      'diff --git a/src/gone.ts b/src/gone.ts\n--- a/src/gone.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n',
+    );
+    expect(hunks).toHaveLength(1);
+    expect(hunks[0]!.path).toBe('src/gone.ts');
+  });
+
+  it('flushes the previous file when a new +++ arrives without a diff header', () => {
+    const hunks = parseUnifiedDiff(
+      '+++ b/src/a.ts\n@@ -1 +1 @@\n-old-a\n+new-a\n+++ b/src/b.ts\n@@ -1 +1 @@\n-old-b\n+new-b\n',
+    );
+    expect(hunks).toHaveLength(2);
+    expect(hunks[0]!.path).toBe('src/a.ts');
+    expect(hunks[0]!.lines.map((l) => l.text)).toContain('new-a');
+    expect(hunks[1]!.path).toBe('src/b.ts');
+    expect(hunks[1]!.lines.map((l) => l.text)).toContain('new-b');
+  });
 });

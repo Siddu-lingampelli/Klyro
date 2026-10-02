@@ -108,7 +108,10 @@ export function blockHeight(b: BlockDesc, termWidth: number): number {
       return 1 + 1;
     case 'diff': {
       let n = 1; // summary
-      for (const h of b.hunks) n += 1 + h.lines.reduce((s, l) => s + wrapCount(l, cw), 0);
+      // Render prepends a 2-col `+ `/`- `/`  ` prefix per line (app.tsx),
+      // so measure against cw-2 — a bare-text wrap at full cw under-counts
+      // borderline lines by a row each and drifts the scroll anchor.
+      for (const h of b.hunks) n += 1 + h.lines.reduce((s, l) => s + wrapCount(l, cw - 2), 0);
       return n + 1;
     }
     case 'plan':

@@ -1006,6 +1006,35 @@ describe('App', () => {
     await waitForMatch(lastFrame, /Message Klyro/);
   });
 
+  it('vim motions never split emoji graphemes', async () => {
+    let hooks: { setVimMode: (m: 'insert' | 'normal') => void } | null = null;
+    const { stdin, lastFrame } = render(
+      <App
+        initialModel="m" maxSteps={10} cwd="/test"
+        onPrompt={async () => {}} onSlash={async () => {}}
+        isFullscreen={false}
+        onMounted={(h) => {
+          hooks = { setVimMode: h.setVimMode };
+        }}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    stdin.write('a🎉b');
+    await waitForMatch(lastFrame, /a🎉b/);
+    hooks!.setVimMode('normal');
+    await waitForMatch(lastFrame, /--NORMAL--/);
+    // h/l move whole graphemes; x deletes the whole emoji, never a half.
+    stdin.write('0');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('l');
+    await new Promise((r) => setTimeout(r, 30));
+    stdin.write('x');
+    await waitForMatch(lastFrame, /ab/);
+    const frame = lastFrame() ?? '';
+    expect(frame).not.toMatch(/🎉/);
+    expect(frame).not.toMatch(/\uFFFD/); // no replacement char from split surrogates
+  });
+
   it('vim normal mode swallows typing, shows mode, i returns to insert', async () => {    let hooks: { setVimMode: (m: 'insert' | 'normal') => void } | null = null;
     const { stdin, lastFrame } = render(
       <App

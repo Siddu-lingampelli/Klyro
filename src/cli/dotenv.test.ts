@@ -98,5 +98,9 @@ describe('isBlockedDotenvKey', () => {
     expect(isBlockedDotenvKey('ANTHROPIC_API_KEY')).toBe(false);
     expect(isBlockedDotenvKey('ENV')).toBe(false); // too generic: app-level setting
     expect(isBlockedDotenvKey('MY_APP_FLAG')).toBe(false);
+    // Sandbox de-hardeners must never come from a repo .env file.
+    expect(isBlockedDotenvKey('KLYRO_SANDBOX')).toBe(true);
+    expect(isBlockedDotenvKey('KLYRO_SANDBOX_NET')).toBe(true);
+    expect(isBlockedDotenvKey('klyro_sandbox_net')).toBe(true);
   });
 });

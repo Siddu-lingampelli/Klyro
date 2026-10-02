@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { runHarness, formatReport, runAgentFixture, runFileFixture, loadFileFixture, sanitizedFixtureEnv, assertTmpWorkdir } from './harness.js';
+import { runHarness, runTask, formatReport, runAgentFixture, runFileFixture, loadFileFixture, sanitizedFixtureEnv, assertTmpWorkdir } from './harness.js';
+import type { ScriptedTask } from './harness.js';
 import { MVP_TASKS } from './tasks.js';
 
 describe('harness', () => {
@@ -129,5 +130,43 @@ describe('harness', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('runTask verify grading', () => {
+  const script = [
+    [
+      { kind: 'message_start' },
+      { kind: 'text_delta', text: 'done' },
+      { kind: 'message_end', finishReason: 'stop' },
+    ],
+  ] as unknown as ScriptedTask['script'];
+
+  it('fails a task whose verifyCommand fails, even when the agent completes', async () => {
+    const r = await runTask({
+      id: 't-verify-fail', description: 'verify fails', task: 'do it',
+      script, verifyCommand: 'node -e "process.exit(1)"', expectStatus: 'complete',
+    });
+    expect(r.status).toBe('fail');
+    expect(r.observedStatus).toBe('verify_failed');
+    expect(r.details).toContain('verifyFailure');
+  });
+
+  it('passes a task whose verifyCommand succeeds', async () => {
+    const r = await runTask({
+      id: 't-verify-pass', description: 'verify passes', task: 'do it',
+      script, verifyCommand: 'node -e "process.exit(0)"', expectStatus: 'complete',
+    });
+    expect(r.status).toBe('pass');
+    expect(r.observedStatus).toBe('complete');
+  });
+
+  it('passes a task that expects verify_failed when verification fails', async () => {
+    const r = await runTask({
+      id: 't-verify-expected', description: 'verify expected to fail', task: 'do it',
+      script, verifyCommand: 'node -e "process.exit(1)"', expectStatus: 'verify_failed',
+    });
+    expect(r.status).toBe('pass');
+    expect(r.observedStatus).toBe('verify_failed');
   });
 });

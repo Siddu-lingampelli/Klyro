@@ -108,6 +108,20 @@ describe('AuditLog hash chain', () => {
     expect(res).toEqual({ ok: true, events: 3 });
   });
 
+  it('interleaved instances on one file keep a single chain (no fork)', async () => {
+    const p = path.join(dir, 's2b.jsonl');
+    const a = new AuditLog(p);
+    const b = new AuditLog(p);
+    // A stale in-memory tip here forks the chain: a's second write would
+    // point at its own first record instead of b's. Each append must chain
+    // off the live tail.
+    await a.write({ kind: 'session_created', sessionId: 's2b', task: 't', cwd: '/x', ts: 1 });
+    await b.write({ kind: 'step_started', sessionId: 's2b', step: 1, ts: 2 });
+    await a.write({ kind: 'step_completed', sessionId: 's2b', step: 1, ts: 3 });
+    const res = await verifyAuditChain(dir, 's2b');
+    expect(res).toEqual({ ok: true, events: 3 });
+  });
+
   it('rotation bounds live file under maxBytes and segments verify', async () => {
     const p = path.join(dir, 's3.jsonl');
     // keep=10 so no record is evicted across the 40 writes: the count then

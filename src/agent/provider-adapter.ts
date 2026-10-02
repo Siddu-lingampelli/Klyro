@@ -374,6 +374,10 @@ async function* streamChatCompletions(
       const { value, done } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
+      // SSE spec: CRLF/CR line endings normalize to LF. Without this a
+      // CRLF stream never contains '\n\n', so no event boundary splits
+      // and the stream stalls to timeout.
+      if (buf.includes('\r')) buf = buf.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
       // SSE: events separated by \n\n
       let idx: number;
       while ((idx = buf.indexOf('\n\n')) !== -1) {

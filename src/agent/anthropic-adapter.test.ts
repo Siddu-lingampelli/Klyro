@@ -478,4 +478,43 @@ describe('anthropicAdapter listModels (2.1)', () => {
     const adapter = anthropicAdapter({ apiKey: 'k' });
     expect(adapter.countTokens!('hello world, this is a longer piece of text')).toBeGreaterThan(1);
   });
+
+  it('redacts secrets echoed in HTTP error bodies', async () => {
+    const secret = 'sk-ant-abcdefghij1234567890XY';
+    const fetchImpl = makeFetch(JSON.stringify({ error: { message: `bad key ${secret} rejected` } }), 400);
+    const adapter = anthropicAdapter({ apiKey: 'k', baseURL: 'https://api.example.com', fetchImpl });
+    const req: CallRequest = {
+      model: 'claude-3-5-sonnet-20241022',
+      system: '', messages: [{ role: 'user', content: [{ kind: 'text', text: 'hi' }] }],
+      tools: [], maxTokens: 16,
+    };
+    const events = [];
+    for await (const ev of adapter.stream(req)) events.push(ev);
+    const err = events.find((e) => e.kind === 'error') as { message?: string } | undefined;
+    expect(err).toBeDefined();
+    expect(err!.message).not.toContain(secret);
+  });
+
+  it('parses CRLF-delimited SSE the same as LF', async () => {
+    const lf = sse([
+      ['message_start', { type: 'message_start', message: { id: 'm', role: 'assistant', content: [], model: 'c', stop_reason: null, usage: { input_tokens: 1, output_tokens: 1 } } }],
+      ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+      ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hey' } }],
+      ['message_stop', { type: 'message_stop' }],
+    ]);
+    const collect = async (body: string): Promise<string[]> => {
+      const adapter = anthropicAdapter({ apiKey: 'k', baseURL: 'https://api.example.com', fetchImpl: makeFetch(body) });
+      const req: CallRequest = {
+        model: 'c', system: '', messages: [{ role: 'user', content: [{ kind: 'text', text: 'hi' }] }],
+        tools: [], maxTokens: 16,
+      };
+      const kinds: string[] = [];
+      for await (const ev of adapter.stream(req)) kinds.push(ev.kind);
+      return kinds;
+    };
+    const expected = await collect(lf);
+    expect(expected).toContain('text_delta');
+    const crlf = await collect(lf.replace(/\n/g, '\r\n'));
+    expect(crlf).toEqual(expected);
+  });
 });

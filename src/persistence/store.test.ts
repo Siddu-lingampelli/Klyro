@@ -226,4 +226,19 @@ describe('SessionStore', () => {
     await store.setStatus(r2.id, 'complete', 'all done, remember the plan');
     expect((await store.get(r2.id))?.finalText).toContain('remember the plan');
   });
+
+  it('concurrent appends on different sessions keep every index entry', async () => {
+    const a = await store.create({ cwd: '/x', task: 'a', config: { model: 'm', maxSteps: 10 } });
+    const b = await store.create({ cwd: '/x', task: 'b', config: { model: 'm', maxSteps: 10 } });
+    // Interleave appends across sessions: without the shared index lock the
+    // read-modify-write index update last-writer-wins and drops an entry.
+    await Promise.all([
+      ...Array.from({ length: 10 }, (_, i) => store.appendMessage(a.id, { role: 'user', content: `a${i}`, ts: i })),
+      ...Array.from({ length: 10 }, (_, i) => store.appendMessage(b.id, { role: 'user', content: `b${i}`, ts: i })),
+    ]);
+    expect(await store.get(a.id)).not.toBeNull();
+    expect(await store.get(b.id)).not.toBeNull();
+    expect((await store.loadMessages(a.id)).length).toBe(10);
+    expect((await store.loadMessages(b.id)).length).toBe(10);
+  });
 });

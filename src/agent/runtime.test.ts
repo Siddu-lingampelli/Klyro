@@ -1085,6 +1085,39 @@ describe('runtime: level-7 telemetry', () => {
     expect(seen).toEqual([{ kind: 'a->b' }]);
   });
 
+  it('never fails over on repeated context overflow (no transcript spray)', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const overflowing: ProviderAdapter = {
+      id: 'big',
+      async *stream() {
+        yield { kind: 'message_start' };
+        yield { kind: 'error', code: 'REQUEST_TOO_LARGE', message: 'too big', retryable: false };
+      },
+    };
+    const fallback: ProviderAdapter = {
+      id: 'fallback',
+      async *stream() {
+        yield { kind: 'message_start' };
+        yield { kind: 'text_delta', text: 'should never send here' };
+        yield { kind: 'message_end', finishReason: 'stop' };
+      },
+    };
+    const seen: string[] = [];
+    const r = await run(
+      {
+        task: 'overflow twice', cwd, model: 'mock', maxSteps: 3, nonInteractive: true,
+        onEvent: (ev) => { seen.push(ev.kind); },
+      },
+      {
+        adapter: overflowing, failoverAdapters: [fallback], registry: reg, policy,
+        approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt,
+      },
+    );
+    expect(r.status).toBe('no_final');
+    expect(seen).not.toContain('provider_failover');
+  });
+
   it('caps parallel fan-out at MAX_PARALLEL_TOOLS and preserves commit order', async () => {
     expect(MAX_PARALLEL_TOOLS).toBe(8);
     const { z } = await import('zod');
@@ -1169,6 +1202,34 @@ describe('runtime: level-7 telemetry', () => {
     // All three thresholds fire exactly once when the ratio jumps past them.
     expect(warnings.map((w) => w.threshold)).toEqual([0.4, 0.7, 0.9]);
     for (const w of warnings) expect(w.ratio).toBeGreaterThanOrEqual(w.threshold);
+    expect(r.status).toBe('complete');
+  });
+
+  it('rates budget warnings against the parentContext model override', async () => {
+    const reg = new ToolRegistry().register(readFileTool);
+    const policy = new PolicyEngine(builtinRules(), DEFAULT_POLICY_CONFIG);
+    const pricey = scriptedAdapter([
+      [
+        { kind: 'message_start' },
+        { kind: 'text_delta', text: 'pricey' },
+        // 10000 in on gpt-4o-mini = $0.0015 ≥ maxCost $0.001 — but only when
+        // rated against the override; opts.model 'mock' rates $0.
+        { kind: 'message_end', finishReason: 'stop', usage: { input: 10000, output: 0 } },
+      ],
+    ]);
+    const warnings: unknown[] = [];
+    const r = await run(
+      {
+        task: 'spend', cwd, model: 'mock', maxSteps: 2, maxCost: 0.001, nonInteractive: true,
+        parentContext: { sessionId: 's', depth: 1, maxDepth: 3, model: 'gpt-4o-mini' },
+        onEvent: (ev) => { if (ev.kind === 'budget_warning') warnings.push(ev); },
+      },
+      {
+        adapter: pricey, registry: reg, policy,
+        approval: new DenyAllApprovalPrompt(), systemPrompt: defaultSystemPrompt,
+      },
+    );
+    expect(warnings.length).toBeGreaterThan(0);
     expect(r.status).toBe('complete');
   });
 });

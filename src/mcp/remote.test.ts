@@ -96,4 +96,14 @@ describe('parseSseBody', () => {
     const out = parseSseBody(': ping\n\ndata: {"a":1}\n\ndata: [DONE]\n\nnot-a-line\n');
     expect(out).toEqual([{ a: 1 }]);
   });
+
+  it('joins spec-compliant multi-line data chunks', () => {
+    const out = parseSseBody('data: {"a":\ndata: 1}\n\n');
+    expect(out).toEqual([{ a: 1 }]);
+  });
+
+  it('still parses back-to-back JSON lines without a blank separator', () => {
+    const out = parseSseBody('data: {"a":1}\ndata: {"b":2}\n\n');
+    expect(out).toEqual([{ a: 1 }, { b: 2 }]);
+  });
 });

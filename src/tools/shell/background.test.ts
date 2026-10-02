@@ -36,6 +36,15 @@ describe('background shell', () => {
     expect(() => startBackgroundArgv([], process.cwd())).toThrow();
   });
 
+  it('a failed spawn records the error instead of crashing the process', async () => {
+    const missing = process.platform === 'win32' ? 'Z:\\no-such-dir-xyz' : '/no-such-dir-xyz';
+    const id = startBackground('echo hello', missing);
+    // The 'error' event fires async; without a listener Node would throw.
+    await new Promise((r) => setTimeout(r, 500));
+    expect(getOutput(id)).toMatch(/spawn failed/);
+    try { killJob(id); } catch { /* already reaped */ }
+  });
+
   it('killAllJobs kills every tracked job and reports ids', () => {
     const a = startBackground('echo one', process.cwd());
     const b = startBackground('echo two', process.cwd());

@@ -297,18 +297,24 @@ export class SessionStore {
       await fs.unlink(tmp).catch(() => undefined);
       throw new Error(`Failed to write session ${id}`);
     }
-    // Update index with simple retry for concurrent writers (optimistic)
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const idx = await this.readIndex();
-        idx[id] = data.record;
-        await this.writeIndex(idx);
-        return;
-      } catch (err) {
-        if (attempt === 2) throw err;
-        await new Promise((r) => setTimeout(r, 10 * (attempt + 1)));
+    // Update index under the shared 'index' lock (same key create/delete
+    // use): the read-modify-write below races under concurrent writers on
+    // different sessions, and last-writer-wins would silently drop entries.
+    // Deadlock-free: no caller holds 'index' while calling writeSession
+    // (create/delete write the index inline instead).
+    await this.withLock('index', async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const idx = await this.readIndex();
+          idx[id] = data.record;
+          await this.writeIndex(idx);
+          return;
+        } catch (err) {
+          if (attempt === 2) throw err;
+          await new Promise((r) => setTimeout(r, 10 * (attempt + 1)));
+        }
       }
-    }
+    });
   }
 
   async appendMessage(id: string, message: StoredMessage): Promise<void> {

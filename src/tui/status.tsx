@@ -12,6 +12,9 @@ export interface StatusSnapshot {
   maxSteps: number;
   usageInput: number;
   usageOutput: number;
+  /** Prompt-cache counters (Anthropic-family): billed and context-consuming. */
+  usageCacheRead?: number;
+  usageCacheWrite?: number;
   repairs: number;
   status: 'idle' | 'running' | 'done' | 'error' | 'aborted';
   errorMessage?: string;

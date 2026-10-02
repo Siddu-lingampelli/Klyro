@@ -697,7 +697,6 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
   function queuedClear(): void {
     if (isMounted && directHooks) directHooks.clearTranscript();
     else pendingQueue.length = 0;
-    if (isMounted && directHooks) directHooks.clearTranscript();
   }
 
   // Update nudge (best-effort, cached 24h, silent fail): a single stderr
@@ -915,7 +914,12 @@ export async function startRepl(opts: ReplOptions = {}): Promise<number> {
               clearThinking();
               // streamingId is closed by status change; no extra handling needed
             } else if (ev.kind === 'usage') {
-              queuedStatus({ usageInput: ev.input, usageOutput: ev.output });
+              queuedStatus({
+                usageInput: ev.input,
+                usageOutput: ev.output,
+                usageCacheRead: ev.cacheRead ?? 0,
+                usageCacheWrite: ev.cacheWrite ?? 0,
+              });
             } else if (ev.kind === 'plan_update') {
               queuedPlan(ev.plan);
             } else if (ev.kind === 'file_changed') {

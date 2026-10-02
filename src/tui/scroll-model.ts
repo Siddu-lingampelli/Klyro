@@ -34,6 +34,7 @@ export type ScrollAction =
   | { type: 'TO_TOP' }
   | { type: 'TO_BOTTOM' }
   | { type: 'CONTENT_GREW'; lines: number }
+  | { type: 'PRUNE' }
   | { type: 'REFLOW' };
 
 /** Index abstraction over measured display lines (§4.3). */
@@ -106,6 +107,11 @@ export function scrollReducer(s: ScrollState, a: ScrollAction, ctx: ScrollCtx): 
       }
       void maxTop;
       return { ...s, newSinceUnstick: s.newSinceUnstick + a.lines };
+    case 'PRUNE':
+      // Anchored item was compacted away: re-stick to bottom with a clean
+      // counter. Without the reset, a stale newSinceUnstick inflates the
+      // `↓ N new` badge after the re-stick.
+      return stickBottom();
     case 'REFLOW':
       return { ...s };
   }

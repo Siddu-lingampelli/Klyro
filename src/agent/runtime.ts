@@ -325,10 +325,15 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
     return [{ role: 'user', content: [text(opts.task)] }];
   })();
   const usage: { input: number; output: number; estimated?: boolean; cacheRead?: number; cacheWrite?: number } = { input: 0, output: 0 };
+  // Effective model for cost accounting: the request actually sends
+  // parentContext.model when an orchestrator overrides it, so budget
+  // warnings and the max-cost guard must rate against the same model —
+  // otherwise a cheap-model budget supervises expensive-model spend.
+  const effectiveModel = opts.parentContext?.model ?? opts.model;
   /** Emit one `budget_warning` per threshold the cost ratio has crossed. */
   const checkBudgetWarnings = (): void => {
     if (maxCost === undefined || maxCost <= 0) return;
-    const ratio = estimateCost(opts.model, usage) / maxCost;
+    const ratio = estimateCost(effectiveModel, usage) / maxCost;
     for (const threshold of BUDGET_WARNING_THRESHOLDS) {
       if (ratio >= threshold && !firedBudgetWarnings.has(threshold)) {
         firedBudgetWarnings.add(threshold);
@@ -530,7 +535,7 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
   outer: while (steps < maxSteps) {
     // 5.1 limits: max-cost, max-time
     if (maxCost !== undefined) {
-      const cost = estimateCost(opts.model, usage);
+      const cost = estimateCost(effectiveModel, usage);
       if (cost >= maxCost) {
         setPhase('limit');
         await closeTracer();
@@ -713,10 +718,12 @@ export async function run(opts: RunOptions, deps: RuntimeDeps): Promise<RunResul
         }
         // L15 failover: a terminal provider error swaps to the next chained
         // adapter and re-issues the step (bounded by chain length). Context
-        // overflow is excluded — it owns its own recovery above. By the time
-        // an error reaches the runtime, per-adapter retries are exhausted,
-        // so any provider error here is terminal for the active adapter.
-        if (failoverQueue.length > 0) {
+        // overflow is excluded — it owns its own recovery above, and a
+        // second overflow must abort, not re-spray the oversized transcript
+        // at the next provider. By the time an error reaches the runtime,
+        // per-adapter retries are exhausted, so any provider error here is
+        // terminal for the active adapter.
+        if (failoverQueue.length > 0 && ev.code !== 'REQUEST_TOO_LARGE') {
           const next = failoverQueue.shift()!;
           failoverPending = true;
           failoverFrom = activeAdapter.id;
