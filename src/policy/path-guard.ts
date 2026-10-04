@@ -98,6 +98,15 @@ export async function resolveAndFollowSymlinks(cwd: string, requested: string, e
   const { resolved, root } = resolveWithinRoots(cwd, requested, extraRoots);
   let real: string;
   let realParent: string;
+  // Re-resolve immediately before use to shrink TOCTOU window
+  const { resolved: reResolved } = resolveWithinRoots(cwd, requested, extraRoots);
+  if (resolved !== reResolved) {
+    // Path moved between checks; treat as escape
+    throw new PathGuardError(
+      TOOL_ERROR_CODES.PATH_ESCAPE,
+      `Path changed between checks: ${requested}`,
+    );
+  }
   try {
     real = await fs.realpath(resolved);
     realParent = path.dirname(real);

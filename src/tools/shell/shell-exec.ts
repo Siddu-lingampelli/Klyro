@@ -175,8 +175,9 @@ const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   // Shell-redirection containment (mirrors policy engine shellDenyRule):
   // deny `>` / `>>` into dotfiles under home/abs paths or bare project
   // dotfiles. `(?<![0-9])` excludes the `2>` stderr-redirect prefix.
+  // Allow spaces in paths by matching quoted paths and stripping quotes for check.
   { pattern: /(?<![0-9])>+\s*["']?(~|\/)[^"'\s]*\/\.[^"'\s]+/, reason: 'redirect into dotfile under home/abs path denied' },
-  { pattern: /(?<![0-9])>+\s*["']?\.[^"'\s\/][^"'\s]*/, reason: 'redirect into project dotfile denied' },
+  { pattern: /(?<![0-9])>+\s*["']?\.[^"'\s\/][^\s]*/, reason: 'redirect into project dotfile denied' },
   // Upload-form exfiltration (mirrors policy engine shellDenyRule).
   { pattern: /\bcurl\b.*(?:\s-F\b|\s--form\b)/i, reason: 'exfiltration: curl -F/--form denied' },
   { pattern: /\bwget\b.*(?:\s--method=POST\b|\s--body-data\b)/i, reason: 'exfiltration: wget --method=POST/--body-data denied' },

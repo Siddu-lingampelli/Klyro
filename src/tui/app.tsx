@@ -639,9 +639,16 @@ export function App(props: AppProps): React.JSX.Element {
 
   // Slice *display lines* [topRow, topRow+viewportH): intersecting blocks only
   // (§6.1 virtualization — only visible items are composed).
+  // RowShift: groups render from their own row 0, so when the window starts
+  // mid-group (a text block taller than the viewport — e.g. a long streaming
+  // answer), composing from the group top would pin the view to stale rows
+  // while the scrollbar advances. rowSkip counts those hidden head rows;
+  // the render shifts the transcript up by -rowSkip under the clipped
+  // column, so composed rows [0..] always mean display rows [topRow..].
   const endRow = topRow + viewportH;
   let gi0 = grouped.length;
   let gi1 = -1;
+  let firstGroupStart: number | null = null;
   let showPlan = false;
   let showThinking = false;
   let showQueued = false;
@@ -658,6 +665,9 @@ export function App(props: AppProps): React.JSX.Element {
       const bStart = row;
       const bEnd = row + h;
       row = bEnd;
+      if (firstGroupStart === null && bEnd > topRow && blocks[bi]!.groupIndex !== null) {
+        firstGroupStart = bStart;
+      }
       if (bEnd <= topRow || bStart >= endRow || h === 0) continue;
       const b = blocks[bi]!;
       if (b.groupIndex !== null) {
@@ -670,6 +680,9 @@ export function App(props: AppProps): React.JSX.Element {
     if (gi1 < gi0) { gi0 = 0; gi1 = -1; }
   }
   const visibleGrouped = isFullscreen && !tiny ? grouped.slice(gi0, gi1 + 1) : grouped;
+  // Rows of the first visible group hidden above the window (0 when the
+  // window starts on a group boundary, or outside fullscreen windowing).
+  const rowSkip = isFullscreen && !tiny && firstGroupStart !== null ? Math.max(0, topRow - firstGroupStart) : 0;
   // Publish live scroll control for the mouse-wheel tap (stable callbacks, latest ctx).
   scrollCmdsRef.current = {
     line: (d: number) => {
@@ -745,8 +758,7 @@ export function App(props: AppProps): React.JSX.Element {
       setTranscript((prev) => (prev.some((x) => x.kind === 'thinking') ? prev.filter((x) => x.kind !== 'thinking') : prev));
     }
   }, [status.status, flushStream, resetStream, resetThinking, disarmEsc]);
-  const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);
-  const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
+  const updateStatus = useCallback((s: Partial<StatusSnapshot>) => setStatus((p) => ({ ...p, ...s })), []);  const updatePlan = useCallback((p: PlanStep[]) => setPlan(p), []);
   // Tool results patch the running start-item IN PLACE (no second item, so a
   // group never stays 'running' forever showing a ticking elapsed timer).
   const updateTool = useCallback((idCall: string, patch: ToolResultPatch) => {
@@ -807,7 +819,8 @@ export function App(props: AppProps): React.JSX.Element {
   const pasteText = useCallback((text: string) => {
     insertAtCursor(text);
   }, [insertAtCursor]);
-  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle, updateTool, appendThinkingDelta, clearThinking, pasteText, setVimMode: setVimModeLive }); (globalThis as unknown as Record<string, unknown>).__klyroAppAppend = append; (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta = appendDelta; (globalThis as unknown as Record<string, unknown>).__klyroAppStatus = updateStatus; (globalThis as unknown as Record<string, unknown>).__klyroAppPlan = updatePlan; (globalThis as unknown as Record<string, unknown>).__klyroAppendThinking = appendThinkingDelta; (globalThis as unknown as Record<string, unknown>).__klyroClearThinking = clearThinking; return () => { delete (globalThis as unknown as Record<string, unknown>).__klyroAppAppend; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendDelta; delete (globalThis as unknown as Record<string, unknown>).__klyroAppStatus; delete (globalThis as unknown as Record<string, unknown>).__klyroAppPlan; delete (globalThis as unknown as Record<string, unknown>).__klyroAppendThinking; delete (globalThis as unknown as Record<string, unknown>).__klyroClearThinking; }; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle, updateTool, appendThinkingDelta, clearThinking, pasteText, setVimModeLive]);
+  useEffect(() => { onMountedRef.current?.({ append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcript: transcriptHandle, updateTool, appendThinkingDelta, clearThinking, pasteText, setVimMode: setVimModeLive }); // globalThis hooks removed for security; tests should use onMounted callbacks
+  return () => {}; }, [append, appendDelta, updateStatus, updatePlan, clearTranscript, scrollLines, scrollToBottom, scrollHalfPage, scrollToTop, transcriptHandle, updateTool, appendThinkingDelta, clearThinking, pasteText, setVimModeLive]);
 
   const toggleGroup = (id: string) => setExpandedGroups((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
@@ -1190,9 +1203,11 @@ export function App(props: AppProps): React.JSX.Element {
           {tiny ? (
             <Text color={tokens.colors.warn as string}>⚠ terminal too small ({width}x{height}) — transcript hidden</Text>
           ) : null}
-          {!tiny && grouped.length === 0 ? (
+          {!tiny && grouped.length === 0 && !showThinking && !showPlan && !showQueued ? (
             <Text color={tokens.colors.dim as string}>Message Klyro...</Text>
-          ) : !tiny ? visibleGrouped.map((item) => {
+          ) : !tiny ? (
+            <Box flexDirection="column" marginTop={-rowSkip}>
+              {visibleGrouped.map((item) => {
             if ((item as Group).verb) {
               const gr = item as Group;
               const isExpanded = expandedGroups.has(gr.id);
@@ -1263,7 +1278,7 @@ export function App(props: AppProps): React.JSX.Element {
               </Box>
             );
             return null;
-          }) : null}
+          })}
           {showThinking && status.status === 'running' && !streamingIdRef.current ? (
             <Box paddingLeft={2} marginBottom={1}><Text color={tokens.colors.guide as string}>  {g('guide')}   </Text><Text color={tokens.colors.accent as string}><Spinner type="dots" /> </Text><Text color={tokens.colors.dim as string}>Thinking... (esc ×2 to cancel)</Text><Text color={tokens.colors.dim as string}>  {(elapsed / 1000).toFixed(1)}s</Text></Box>
           ) : null}
@@ -1273,6 +1288,8 @@ export function App(props: AppProps): React.JSX.Element {
               {queuedInputs.map((q, i) => (
                 <Text key={i} color={tokens.colors.dim as string}>queued: {redact(q.slice(0, 60))}{i === 0 ? '  esc to drop' : ''}</Text>
               ))}
+            </Box>
+          ) : null}
             </Box>
           ) : null}
         </Box>

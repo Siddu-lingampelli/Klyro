@@ -56,13 +56,19 @@ describe('App', () => {
     expect(out).toMatch(/running|auto mode|ctrl\+c|step/i);
   });
 
-  it('installs and tears down the global bridge hooks', () => {
+  it('exposes mount hooks via onMounted and pollutes no globals', async () => {
     const g = globalThis as unknown as { __klyroAppAppend?: unknown; __klyroAppStatus?: unknown };
+    let mounted: unknown = null;
     const { unmount } = render(
-      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
+      <App
+        initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}}
+        onMounted={(h) => { mounted = h; }}
+      />,
     );
-    expect(g.__klyroAppAppend).toBeTypeOf('function');
-    expect(g.__klyroAppStatus).toBeTypeOf('function');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mounted).toBeTypeOf('object');
+    expect(g.__klyroAppAppend).toBeUndefined();
+    expect(g.__klyroAppStatus).toBeUndefined();
     unmount();
     expect(g.__klyroAppAppend).toBeUndefined();
     expect(g.__klyroAppStatus).toBeUndefined();
@@ -106,12 +112,17 @@ describe('App', () => {
         initialStatus={{ status: 'running' }}
       />,
     );
+    // Settle: stdin written before Ink subscribes is lost in the mock's
+    // single-slot buffer, so wait for mount before the first keystroke.
+    // Then poll: React commits test-mock keystrokes on its own schedule
+    // (no discrete-event flushing outside a real terminal), so fixed
+    // sleeps flake under load — waitForMatch instead.
+    await waitForMatch(lastFrame, /Message Klyro/);
     stdin.write('hello');
-    await new Promise((r) => setTimeout(r, 20));
+    await waitForMatch(lastFrame, /hello/);
     stdin.write('\x0d');
-    await new Promise((r) => setTimeout(r, 50));
     // Per TUI_DESIGN.md §5.2 queued message while running, not immediate
-    expect(lastFrame()).toMatch(/queued|hello/);
+    await waitForMatch(lastFrame, /queued/);
     expect(onPrompt).not.toHaveBeenCalled(); // not yet, queued
   });
 
@@ -264,6 +275,7 @@ describe('App', () => {
   });
 
   it('pins to top: new content does NOT auto-scroll when user has scrolled up', async () => {
+    let hooks: { append: (i: TranscriptItem) => void } | null = null;
     const { stdin, lastFrame } = render(
       <App
         initialModel="m"
@@ -273,6 +285,7 @@ describe('App', () => {
         onSlash={async () => {}}
         isFullscreen={true}
         initialTranscript={makeInitialTranscript(25)}
+        onMounted={(h) => { hooks = { append: h.append }; }}
       />,
     );
     await new Promise((r) => setTimeout(r, 100));
@@ -283,20 +296,19 @@ describe('App', () => {
     expect(before).toMatch(/MSG-00-tag/);
     expect(before).not.toMatch(/MSG-24-tag/);
     // New content arrives while pinned.
-    const g = globalThis as unknown as { __klyroAppAppend?: (i: TranscriptItem) => void };
-    g.__klyroAppAppend!({
+    hooks!.append({
       id: 'late-1',
       kind: 'text',
       text: 'LATE-1-tag',
       role: 'assistant',
     });
-    g.__klyroAppAppend!({
+    hooks!.append({
       id: 'late-2',
       kind: 'text',
       text: 'LATE-2-tag',
       role: 'assistant',
     });
-    g.__klyroAppAppend!({
+    hooks!.append({
       id: 'late-3',
       kind: 'text',
       text: 'LATE-3-tag',
@@ -310,6 +322,7 @@ describe('App', () => {
   });
 
   it('pressing End re-engages follow-tail and reveals new content', async () => {
+    let hooks: { append: (i: TranscriptItem) => void } | null = null;
     const { stdin, lastFrame } = render(
       <App
         initialModel="m"
@@ -319,13 +332,13 @@ describe('App', () => {
         onSlash={async () => {}}
         isFullscreen={true}
         initialTranscript={makeInitialTranscript(25)}
+        onMounted={(h) => { hooks = { append: h.append }; }}
       />,
     );
     await new Promise((r) => setTimeout(r, 200));
     stdin.write(KEY_HOME);
     await new Promise((r) => setTimeout(r, 200));
-    const g = globalThis as unknown as { __klyroAppAppend?: (i: TranscriptItem) => void };
-    g.__klyroAppAppend!({
+    hooks!.append({
       id: 'late-1',
       kind: 'text',
       text: 'LATE-1-tag',
@@ -540,6 +553,7 @@ describe('App', () => {
   });
 
   it('Enter on empty input while pinned jumps back to bottom (§7.2)', async () => {
+    let hooks: { append: (i: TranscriptItem) => void } | null = null;
     const { stdin, lastFrame } = render(
       <App
         initialModel="m"
@@ -549,13 +563,13 @@ describe('App', () => {
         onSlash={async () => {}}
         isFullscreen={true}
         initialTranscript={makeInitialTranscript(25)}
+        onMounted={(h) => { hooks = { append: h.append }; }}
       />,
     );
     await new Promise((r) => setTimeout(r, 100));
     stdin.write(KEY_HOME);
     await new Promise((r) => setTimeout(r, 100));
-    const g = globalThis as unknown as { __klyroAppAppend?: (i: TranscriptItem) => void };
-    g.__klyroAppAppend!({ id: 'late-1', kind: 'text', text: 'LATE-1-tag', role: 'assistant' });
+    hooks!.append({ id: 'late-1', kind: 'text', text: 'LATE-1-tag', role: 'assistant' });
     await new Promise((r) => setTimeout(r, 200));
     expect(lastFrame() ?? '').not.toMatch(/LATE-1-tag/);
     // Empty input + Enter → dismiss badge, follow tail.
@@ -826,10 +840,11 @@ describe('App', () => {
         initialStatus={{ status: 'running' }}
       />,
     );
-    await new Promise((r) => setTimeout(r, 120));
-    const frame = lastFrame() ?? '';
+    // Poll, don't sleep: the thinking tail renders after mount effects
+    // flush, which fixed sleeps miss under load.
+    const frame = await waitForMatch(lastFrame, /Thinking/, 8000);
     // Animated dots spinner (any braille frame) or its labels must show.
-    expect(frame).toMatch(/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Thinking|working/);
+    expect(frame).toMatch(/Thinking|working/);
     expect(frame).toContain('Thinking');
     expect(frame).toContain('working');
   });
@@ -1160,13 +1175,14 @@ describe('App', () => {
   });
 
   it('shows the todo checklist when plan updates arrive (5.5c)', async () => {
+    let hooks: { updatePlan: (p: PlanStep[]) => void } | null = null;
     const { lastFrame } = render(
-      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}} />,
+      <App initialModel="m" maxSteps={10} cwd="/test" onPrompt={async () => {}} onSlash={async () => {}}
+        onMounted={(h) => { hooks = { updatePlan: h.updatePlan }; }} />,
     );
-    const g = globalThis as unknown as { __klyroAppPlan?: (p: PlanStep[]) => void };
-    for (let i = 0; i < 40 && !g.__klyroAppPlan; i++) await new Promise((r) => setTimeout(r, 25));
-    expect(g.__klyroAppPlan).toBeDefined();
-    g.__klyroAppPlan?.([
+    for (let i = 0; i < 40 && !hooks; i++) await new Promise((r) => setTimeout(r, 25));
+    expect(hooks).not.toBeNull();
+    hooks!.updatePlan([
       { id: '1', title: 'Read files', status: 'done' },
       { id: '2', title: 'Edit code', status: 'in_progress' },
     ]);

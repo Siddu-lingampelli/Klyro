@@ -95,10 +95,11 @@ export const writeFileTool = defineTool<z.infer<typeof InputSchema>, WriteFileOu
       // TOCTOU shrink (not elimination): re-resolve symlinks immediately
       // before the write and refuse if the target moved. A racing swap
       // between this check and rename can still occur.
-      // NOTE: the pre-check resolution may be lexical (parent missing) while
-      // the re-resolution is canonical (parent now exists), so compare
-      // canonicalized forms — not raw strings — to avoid false positives
-      // (e.g. Windows 8.3 short-name expansion after mkdir).
+      // NOTE: compare canonicalized forms — not raw strings. The pre-check
+      // resolution may be lexical (parent missing) while the re-resolution
+      // is canonical (parent now exists after mkdir), so raw/normalized
+      // string comparison false-positives on ordinary writes (e.g. Windows
+      // 8.3 short-name expansion or case differences after mkdir).
       const { resolved: reResolved } = await resolveAndFollowSymlinks(ctx.cwd, input.path, ctx.agentAllowedPaths);
       const canon = async (p: string): Promise<string> => {
         try { return await fs.realpath(p); } catch { /* missing file → try parent */ }

@@ -65,18 +65,19 @@ describe('App visual snapshot', () => {
   });
 
   it('renders plan view when plan is populated via mounted hooks', async () => {
+    let hooks: { updatePlan: (p: import('../agent/runtime.js').PlanStep[]) => void } | null = null;
     const { lastFrame } = render(
       <App {...DEFAULT_PROPS}
         initialModel="gpt-4o-mini"
         maxSteps={30}
         initialStatus={{ status: 'idle', model: 'gpt-4o-mini', step: 0, maxSteps: 30, usageInput: 0, usageOutput: 0, repairs: 0 }}
+        onMounted={(h) => { hooks = { updatePlan: h.updatePlan }; }}
       />
     );
-    const g = globalThis as unknown as { __klyroAppPlan?: (p: import('../agent/runtime.js').PlanStep[]) => void };
     // Poll for hooks installed by useEffect (new App uses batched Static, needs longer)
-    for (let i = 0; i < 20 && !g.__klyroAppPlan; i++) await new Promise((r) => setTimeout(r, 20));
-    expect(g.__klyroAppPlan).toBeDefined();
-    g.__klyroAppPlan?.([
+    for (let i = 0; i < 40 && !hooks; i++) await new Promise((r) => setTimeout(r, 25));
+    expect(hooks).not.toBeNull();
+    hooks!.updatePlan([
       { id: '1', title: 'Read files', status: 'done' },
       { id: '2', title: 'Edit code', status: 'in_progress', files: ['src/x.ts'] },
     ]);

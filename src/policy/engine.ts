@@ -181,7 +181,9 @@ export class PolicyEngine {
     // Shell redirection into .env (e.g. `echo x > .env`, `cmd >> .env.local`).
     if (call.name === 'shell_exec' && typeof call.input.command === 'string') {
       const cmd = String(call.input.command);
-      if (/>+\s*['"]?[^'"\s]*\.env/i.test(cmd)) {
+      // Normalise quotes so quote-stripping or escaped spaces don't bypass the check
+      const norm = cmd.replace(/['"]/g, '');
+      if (/>+\s*[^&\s]*\.env/i.test(norm)) {
         return { action: 'deny', reason: 'write to .env via shell redirection denied' };
       }
     }
